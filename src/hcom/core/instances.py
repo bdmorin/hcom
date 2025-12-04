@@ -10,10 +10,38 @@ from ..shared import format_age
 # Configuration
 SKIP_HISTORY = True  # New instances start at current log position (skip old messages)
 
+def parse_running_tasks(json_str: str) -> dict[str, Any]:
+    """Parse running_tasks JSON with safe defaults
+
+    Returns dict with structure: {'active': bool, 'subagents': list}
+    """
+    import json
+
+    if not json_str:
+        return {'active': False, 'subagents': []}
+
+    try:
+        rt = json.loads(json_str)
+        if not isinstance(rt, dict):
+            return {'active': False, 'subagents': []}
+        rt.setdefault('active', False)
+        rt.setdefault('subagents', [])
+        return rt
+    except json.JSONDecodeError:
+        return {'active': False, 'subagents': []}
+
+def is_remote_instance(instance_data: dict[str, Any]) -> bool:
+    """Check if instance is synced from another device (has origin_device_id)."""
+    return bool(instance_data.get('origin_device_id'))
+
+
 def is_external_sender(instance_data: dict[str, Any]) -> bool:
-    """Check if instance is an external sender (created via --from).
+    """Check if instance is an external sender (created via --from --wait).
     External senders have empty/null session_id and mapid (no Claude hooks).
+    Remote instances (synced from other devices) are NOT external.
     Subagents have parent_session_id, so are not external even without session_id/mapid."""
+    if is_remote_instance(instance_data):
+        return False
     if instance_data.get('parent_session_id'):
         return False
     return not instance_data.get('session_id') and not instance_data.get('mapid')
@@ -35,7 +63,7 @@ def update_instance_position(instance_name: str, update_fields: dict[str, Any]) 
     from ..hooks.utils import log_hook_error
 
     try:
-        # Auto-vivify if needed - capture session_id/MAPID for Windows compatibility
+        # Auto-vivify if needed - capture session_id/MAPID for Windows compatibility TODO: probably should remove this defensive bollocks but not sure if its needed in some cases
         if not get_instance(instance_name):
             from ..shared import MAPID
             import os
@@ -44,7 +72,7 @@ def update_instance_position(instance_name: str, update_fields: dict[str, Any]) 
 
         # Convert booleans to integers for SQLite
         update_copy = update_fields.copy()
-        for bool_field in ['enabled', 'previously_enabled', 'tcp_mode', 'background',
+        for bool_field in ['enabled', 'tcp_mode', 'background',
                            'alias_announced', 'launch_context_announced',
                            'external_stop_pending', 'session_ended']:
             if bool_field in update_copy and isinstance(update_copy[bool_field], bool):
@@ -71,24 +99,6 @@ def is_subagent_instance(instance_data: dict[str, Any] | None) -> bool:
         return False
     return bool(instance_data.get('parent_session_id'))
 
-def in_subagent_context(instance_name: str) -> bool:
-    """Check if parent has active Task running.
-
-    Returns True when parent is in Task context:
-    - Parent's status_context is 'Task' (set immediately when Task tool runs)
-    - Used for security guards and functional behavior (message delivery)
-
-    This activates immediately in PreToolUse, before any subagent commands execute.
-    """
-    from ..core.db import get_db
-
-    conn = get_db()
-    row = conn.execute(
-        "SELECT status_context FROM instances WHERE name = ? LIMIT 1",
-        (instance_name,)
-    ).fetchone()
-    return bool(row and row['status_context'] == 'Task')
-
 # ==================== Status Functions ====================
 
 def get_instance_status(pos_data: dict[str, Any]) -> tuple[bool, str, str, str, int]:
@@ -106,19 +116,35 @@ def get_instance_status(pos_data: dict[str, Any]) -> tuple[bool, str, str, str, 
     status_time = pos_data.get('status_time', 0)
     status_context = pos_data.get('status_context', '')
 
+    # Handle string status_time (can happen with remote instances from sync)
+    if isinstance(status_time, str):
+        try:
+            status_time = int(float(status_time))
+        except (ValueError, TypeError):
+            status_time = 0
+
     now = int(time.time())
     age = now - status_time if status_time else 0
+    # Fallback to created_at for never-started instances (status_time=0)
+    if not age:
+        created_at = pos_data.get('created_at', 0)
+        if created_at:
+            age = now - int(created_at)
 
     # Heartbeat timeout check: instance was idle but heartbeat died
     # This detects terminated instances (closed window/crashed) that were idle
     if status == 'idle':
-        heartbeat_age = now - pos_data.get('last_stop', 0)
-        tcp_mode = pos_data.get('tcp_mode', False)
-        threshold = 40 if tcp_mode else 2
-        if heartbeat_age > threshold:
-            status = 'inactive'
-            status_context = 'stale:idle'
-            age = heartbeat_age
+        last_stop = pos_data.get('last_stop', 0)
+        if last_stop:  # Only check heartbeat if last_stop is set
+            heartbeat_age = now - last_stop
+            tcp_mode = pos_data.get('tcp_mode', False)
+            is_remote = bool(pos_data.get('origin_device_id'))
+            # Remote instances use 40s threshold (sync interval), local depends on tcp_mode
+            threshold = 40 if (tcp_mode or is_remote) else 2
+            if heartbeat_age > threshold:
+                status = 'inactive'
+                status_context = 'stale:idle'
+                age = heartbeat_age
     # Activity timeout check: no status updates for extended period
     # This detects terminated instances that were active/blocked/etc when closed
     elif status not in ['inactive']:
@@ -130,6 +156,14 @@ def get_instance_status(pos_data: dict[str, Any]) -> tuple[bool, str, str, str, 
             status = 'inactive'
             status_context = f'stale:{prev_status}'
             age = status_age
+
+    # Auto-disable instances inactive for >24hr (lazy cleanup on status read)
+    # Moves them to collapsed "stopped" section in TUI, reduces clutter
+    if status == 'inactive' and enabled and age > 86400:  # 24 hours
+        instance_name = pos_data.get('name')
+        if instance_name:
+            update_instance_position(instance_name, {'enabled': False})
+            enabled = False
 
     # Build description from status and context
     description = get_status_description(status, status_context)
@@ -154,7 +188,7 @@ def get_status_description(status: str, context: str = '') -> str:
             return f"active: msg from {sender}"
         elif context.startswith('tool:'):
             tool = context[5:]  # "tool:Bash" → "Bash"
-            return f"{tool} executing"
+            return f"active: {tool}"
         return context if context else "active"
     elif status == 'idle':
         return "idle"
@@ -162,22 +196,25 @@ def get_status_description(status: str, context: str = '') -> str:
         return context if context else "permission needed"
     elif status == 'inactive':
         if context.startswith('stale:'):
-            prev = context[6:]  # "stale:idle" → "idle"
-            return f"{prev} [stale]" if prev else "stale"
+            return "inactive: stale"
         elif context.startswith('exit:'):
             reason = context[5:]  # "exit:timeout" → "timeout"
-            return f"exited: {reason}"
+            return f"inactive: {reason}"
         elif context == 'unknown':
-            return "unknown"
-        return context if context else "inactive"
+            return "inactive: unknown"
+        return f"inactive: {context}" if context else "inactive"
     return "unknown"
 
-def set_status(instance_name: str, status: str, context: str = ''):
-    """Set instance status with timestamp and log status change event"""
+def set_status(instance_name: str, status: str, context: str = '', msg_ts: str = ''):
+    """Set instance status with timestamp and log status change event.
+
+    Args:
+        msg_ts: Timestamp of last message read (for cross-device read receipts)
+    """
     from .db import log_event
-    # Check if transitioning from unknown (for ready event)
+    # Check if this is first status update (for ready event / launcher notification)
     current_data = load_instance_position(instance_name)
-    was_unknown = current_data.get('status', 'unknown') == 'unknown' if current_data else True
+    is_new = current_data.get('status_context') == 'new' if current_data else True
 
     # Update instance file
     update_instance_position(instance_name, {
@@ -186,7 +223,7 @@ def set_status(instance_name: str, status: str, context: str = ''):
         'status_context': context
     })
 
-    if was_unknown and status != 'unknown':
+    if is_new:
         try:
             launcher = os.environ.get('HCOM_LAUNCHED_BY', 'unknown')
             batch_id = os.environ.get('HCOM_LAUNCH_BATCH_ID')
@@ -261,25 +298,77 @@ def set_status(instance_name: str, status: str, context: str = ''):
 
                                 send_system_message(
                                     '[hcom-launcher]',
-                                    f"@{launcher} All {expected_count} instances ready: {instances_list} (| batch: {batch_id})"
+                                    f"@{launcher} All {expected_count} instances ready: {instances_list} (batch: {batch_id})"
                                 )
-        except Exception:
-            pass  # Silent - don't break hooks on notification failure
+        except Exception as e:
+            from ..hooks.utils import log_hook_error
+            log_hook_error('set_status:batch_notification', e)
 
     # Log status change event (best-effort, non-blocking)
+    # Include position + msg_ts for cross-device read receipt sync
     try:
-        log_event(
-            event_type='status',
-            instance=instance_name,
-            data={
-                'status': status,
-                'context': context
-            }
-        )
+        position = current_data.get('last_event_id', 0) if current_data else 0
+        data = {'status': status, 'context': context, 'position': position}
+        if msg_ts:
+            data['msg_ts'] = msg_ts
+        log_event(event_type='status', instance=instance_name, data=data)
+        # Push immediately on exit so remote devices see final state
+        if status == 'inactive':
+            from ..relay import push
+            push(force=True)
     except Exception:
         pass  # Don't break hooks if event logging fails
 
 # ==================== Identity Management ====================
+
+# Shared wordlist for deterministic name generation
+NAME_WORDS = [
+    'ace', 'air', 'ant', 'arm', 'art', 'axe', 'bad', 'bag', 'bar', 'bat',
+    'bed', 'bee', 'big', 'box', 'boy', 'bug', 'bus', 'cab', 'can', 'cap',
+    'car', 'cat', 'cop', 'cow', 'cry', 'cup', 'cut', 'day', 'dog', 'dry',
+    'ear', 'egg', 'eye', 'fan', 'pig', 'fly', 'fox', 'fun', 'gem', 'gun',
+    'hat', 'hit', 'hot', 'ice', 'ink', 'jet', 'key', 'law', 'map', 'mix',
+    'man', 'bob', 'noo', 'yes', 'poo', 'sue', 'tom', 'the', 'and', 'but',
+    'age', 'aim', 'bro', 'bid', 'shi', 'buy', 'den', 'dig', 'dot', 'dye',
+    'end', 'era', 'eve', 'few', 'fix', 'gap', 'gas', 'god', 'gym', 'nob',
+    'hip', 'hub', 'hug', 'ivy', 'jab', 'jam', 'jay', 'jog', 'joy', 'lab',
+    'lag', 'lap', 'leg', 'lid', 'lie', 'log', 'lot', 'mat', 'mop', 'mud',
+    'net', 'new', 'nod', 'now', 'oak', 'odd', 'off', 'oil', 'old', 'one',
+    'lol', 'owe', 'own', 'pad', 'pan', 'pat', 'pay', 'pea', 'pen', 'pet',
+    'pie', 'pig', 'pin', 'pit', 'pot', 'pub', 'nah', 'rag', 'ran', 'rap',
+    'rat', 'raw', 'red', 'rib', 'rid', 'rip', 'rod', 'row', 'rub', 'rug',
+    'run', 'sad', 'sap', 'sat', 'saw', 'say', 'sea', 'set', 'wii', 'she',
+    'shy', 'sin', 'sip', 'sir', 'sit', 'six', 'ski', 'sky', 'sly', 'son',
+    'boo', 'soy', 'spa', 'spy', 'rat', 'sun', 'tab', 'tag', 'tan', 'tap',
+    'pls', 'tax', 'tea', 'ten', 'tie', 'tip', 'toe', 'ton', 'top', 'toy',
+    'try', 'tub', 'two', 'use', 'van', 'bum', 'war', 'wax', 'way', 'web',
+    'wed', 'wet', 'who', 'why', 'wig', 'win', 'moo', 'won', 'wow', 'yak',
+    'too', 'gay', 'yet', 'you', 'zip', 'zoo', 'ann', 'brb', 'wtf', 'hey',
+    'bro', 'sus', 'meh', 'ass', 'pee', 'omg', 'nob', 'noo', 'yes', 'hmm'
+]
+
+
+def hash_to_name(input_str: str, collision_attempt: int = 0) -> str:
+    """Hash any string to a pronounceable name (word + suffix).
+
+    Args:
+        input_str: String to hash
+        collision_attempt: Increment to generate different name variant
+
+    Returns:
+        4-char name like 'boxe', 'cata', 'dogi'
+    """
+    hash_val = sum(ord(c) * (i + collision_attempt) for i, c in enumerate(input_str))
+    word = NAME_WORDS[hash_val % len(NAME_WORDS)]
+
+    # Add letter suffix for pronounceability
+    last_char = word[-1]
+    suffix_options = 'snrl' if last_char in 'aeiou' else 'aeiouy'
+    letter_hash = sum(ord(c) for c in input_str[1:]) if len(input_str) > 1 else hash_val
+    suffix = suffix_options[letter_hash % len(suffix_options)]
+
+    return f"{word}{suffix}"
+
 
 def get_display_name(session_id: str | None, tag: str | None = None, collision_attempt: int = 0) -> str:
     """Get display name for instance using session_id deterministically.
@@ -295,51 +384,12 @@ def get_display_name(session_id: str | None, tag: str | None = None, collision_a
     if not session_id:
         raise ValueError("session_id required for instance naming")
 
-    # ~90 recognizable 3-letter words
-    words = [
-        'ace', 'air', 'ant', 'arm', 'art', 'axe', 'bad', 'bag', 'bar', 'bat',
-        'bed', 'bee', 'big', 'box', 'boy', 'bug', 'bus', 'cab', 'can', 'cap',
-        'car', 'cat', 'cop', 'cow', 'cry', 'cup', 'cut', 'day', 'dog', 'dry',
-        'ear', 'egg', 'eye', 'fan', 'pig', 'fly', 'fox', 'fun', 'gem', 'gun',
-        'hat', 'hit', 'hot', 'ice', 'ink', 'jet', 'key', 'law', 'map', 'mix',
-        'man', 'bob', 'noo', 'yes', 'poo', 'sue', 'tom', 'the', 'and', 'but',
-        'age', 'aim', 'bro', 'bid', 'shi', 'buy', 'den', 'dig', 'dot', 'dye',
-        'end', 'era', 'eve', 'few', 'fix', 'gap', 'gas', 'god', 'gym', 'nob',
-        'hip', 'hub', 'hug', 'ivy', 'jab', 'jam', 'jay', 'jog', 'joy', 'lab',
-        'lag', 'lap', 'leg', 'lid', 'lie', 'log', 'lot', 'mat', 'mop', 'mud',
-        'net', 'new', 'nod', 'now', 'oak', 'odd', 'off', 'oil', 'old', 'one',
-        'lol', 'owe', 'own', 'pad', 'pan', 'pat', 'pay', 'pea', 'pen', 'pet',
-        'pie', 'pig', 'pin', 'pit', 'pot', 'pub', 'nah', 'rag', 'ran', 'rap',
-        'rat', 'raw', 'red', 'rib', 'rid', 'rip', 'rod', 'row', 'rub', 'rug',
-        'run', 'sad', 'sap', 'sat', 'saw', 'say', 'sea', 'set', 'wii', 'she',
-        'shy', 'sin', 'sip', 'sir', 'sit', 'six', 'ski', 'sky', 'sly', 'son',
-        'boo', 'soy', 'spa', 'spy', 'rat', 'sun', 'tab', 'tag', 'tan', 'tap',
-        'pls', 'tax', 'tea', 'ten', 'tie', 'tip', 'toe', 'ton', 'top', 'toy',
-        'try', 'tub', 'two', 'use', 'van', 'bum', 'war', 'wax', 'way', 'web',
-        'wed', 'wet', 'who', 'why', 'wig', 'win', 'moo', 'won', 'wow', 'yak',
-        'too', 'gay', 'yet', 'you', 'zip', 'zoo', 'ann'
-    ]
-
-    # Hash to select word and suffix (with collision entropy)
-    hash_val = sum(ord(c) * (i + collision_attempt) for i, c in enumerate(session_id))
-    word = words[hash_val % len(words)]
-
-    # Add letter suffix for pronounceability
-    last_char = word[-1]
-    if last_char in 'aeiou':
-        suffix_options = 'snrl'
-    else:
-        suffix_options = 'aeiouy'
-
-    letter_hash = sum(ord(c) for c in session_id[1:]) if len(session_id) > 1 else hash_val
-    suffix = suffix_options[letter_hash % len(suffix_options)]
-
-    base_name = f"{word}{suffix}"
+    base_name = hash_to_name(session_id, collision_attempt)
 
     # Add single collision word if attempt > 0 (deterministic per attempt number)
     if collision_attempt > 0:
         collision_hash = sum(ord(c) * (collision_attempt + 1) for c in session_id)
-        collision_word = words[collision_hash % len(words)]
+        collision_word = NAME_WORDS[collision_hash % len(NAME_WORDS)]
         base_name = f"{base_name}{collision_word}"
 
     # Add tag prefix if provided (config validation ensures tag is safe)
@@ -350,13 +400,13 @@ def get_display_name(session_id: str | None, tag: str | None = None, collision_a
 
 def resolve_instance_name(session_id: str, tag: str | None = None) -> tuple[str, dict | None]:
     """
-    Resolve instance name for a session_id with race condition handling.
+    Resolve instance name for a session_id with hash collision handling.
     Searches existing instances first (reuses if found), generates new name if not found.
 
-    CRITICAL: Handles name generation race conditions:
-    - Multiple threads may generate same name from get_display_name()
-    - Retry with collision counter (preserves session_id identity)
-    - DB UNIQUE constraint is authoritative source of truth
+    Hash collision handling:
+    - Deterministic hash may generate same name for different session_ids (~1/1000 probability)
+    - Retry with collision_attempt counter (preserves session_id → name mapping)
+    - DB UNIQUE constraint provides paranoid safety net for TOCTOU (astronomically rare)
 
     Returns: (instance_name, existing_data_or_none)
     """
@@ -369,19 +419,19 @@ def resolve_instance_name(session_id: str, tag: str | None = None) -> tuple[str,
             data = get_instance(existing_name)
             return existing_name, data
 
-    # Not found - generate new name with race condition retry
+    # Not found - generate new name with hash collision retry
     max_retries = 100
     for attempt in range(max_retries):
-        # Pass collision_attempt to get_display_name (preserves session_id identity)
+        # Increment collision_attempt to generate different name variant (preserves session_id identity)
         instance_name = get_display_name(session_id, tag, collision_attempt=attempt)
 
-        # Check if name already taken in DB (might be taken between get_display_name and here)
+        # Check if name already exists in DB
         existing = get_instance(instance_name)
         if existing:
-            # Name exists - check if it's ours or collision
+            # Name exists - check if it's ours (idempotent) or hash collision
             if existing.get('session_id') == session_id:
                 return instance_name, existing  # Our instance
-            # Real collision - try next attempt (increments collision_attempt)
+            # Hash collision - different session_id generated same name, try next variant
             continue
 
         # Name appears free
@@ -389,7 +439,7 @@ def resolve_instance_name(session_id: str, tag: str | None = None) -> tuple[str,
 
     raise RuntimeError(f"Cannot generate unique name for session after {max_retries} attempts")
 
-def initialize_instance_in_position_file(instance_name: str, session_id: str | None = None, parent_session_id: str | None = None, enabled: bool | None = None, parent_name: str | None = None, mapid: str | None = None) -> bool:
+def initialize_instance_in_position_file(instance_name: str, session_id: str | None = None, parent_session_id: str | None = None, enabled: bool | None = None, parent_name: str | None = None, mapid: str | None = None, agent_id: str | None = None, transcript_path: str | None = None) -> bool:
     """Initialize instance in DB with required fields (idempotent). Returns True on success, False on failure."""
     from .db import get_instance, save_instance, get_last_event_id
     import sqlite3
@@ -406,19 +456,25 @@ def initialize_instance_in_position_file(instance_name: str, session_id: str | N
                 updates['parent_name'] = parent_name
             if enabled is not None:
                 updates['enabled'] = int(enabled)
-                updates['previously_enabled'] = int(enabled)
             if mapid is not None:
                 updates['mapid'] = mapid
+            if agent_id is not None:
+                updates['agent_id'] = agent_id
+            if transcript_path is not None:
+                updates['transcript_path'] = transcript_path
 
-            # Fix last_event_id for placeholders that never participated (SKIP_HISTORY fix)
-            # Check previously_enabled instead of last_event_id==0 because placeholders
-            # could have been created with any old event ID value
-            if SKIP_HISTORY and not existing.get('previously_enabled', False):
+            # Fix last_event_id for new instances (SKIP_HISTORY fix)
+            # If last_event_id is 0, this is a new instance being created
+            if SKIP_HISTORY and existing.get('last_event_id', 0) == 0:
                 launch_event_id_str = os.environ.get('HCOM_LAUNCH_EVENT_ID')
                 if launch_event_id_str:
                     updates['last_event_id'] = int(launch_event_id_str)
                 else:
                     updates['last_event_id'] = get_last_event_id()
+
+            # Reset status_context for HCOM-launched resumed sessions (triggers ready event)
+            if os.environ.get('HCOM_LAUNCHED') == '1':
+                updates['status_context'] = 'new'
 
             if updates:
                 from .db import update_instance
@@ -449,7 +505,6 @@ def initialize_instance_in_position_file(instance_name: str, session_id: str | N
             "name": instance_name,
             "last_event_id": initial_event_id,
             "enabled": int(default_enabled),
-            "previously_enabled": int(default_enabled),
             "directory": str(Path.cwd()),
             "last_stop": 0,
             "created_at": time.time(),
@@ -457,7 +512,10 @@ def initialize_instance_in_position_file(instance_name: str, session_id: str | N
             "mapid": mapid or "",
             "transcript_path": "",
             "alias_announced": 0,
-            "tag": None
+            "tag": None,
+            "status": "inactive",
+            # status_context="new" triggers ready event on first status update (see set_status)
+            "status_context": "new"
         }
 
         # Add parent_session_id and parent_name for subagents
@@ -465,6 +523,10 @@ def initialize_instance_in_position_file(instance_name: str, session_id: str | N
             data["parent_session_id"] = parent_session_id
         if parent_name:
             data["parent_name"] = parent_name
+        if agent_id:
+            data["agent_id"] = agent_id
+        if transcript_path:
+            data["transcript_path"] = transcript_path
 
         try:
             success = save_instance(instance_name, data)
@@ -485,13 +547,15 @@ def initialize_instance_in_position_file(instance_name: str, session_id: str | N
                         'is_subagent': bool(parent_session_id),
                         'parent_name': parent_name or ''
                     })
-                except Exception:
-                    pass  # Don't break creation if logging fails
+                except Exception as e:
+                    from ..hooks.utils import log_hook_error
+                    log_hook_error('initialize_instance:log_event', e)
 
             return success
         except sqlite3.IntegrityError:
-            # UNIQUE constraint violation (race condition - another thread created same name)
-            # This is expected and safe - just return success (instance exists)
+            # UNIQUE constraint violation - paranoid safety net for hash collision TOCTOU
+            # (Another process won the INSERT race after both checked DB. Astronomically rare.)
+            # Safe to treat as success since instance exists with our intended name
             return True
     except Exception:
         return False
@@ -504,8 +568,7 @@ def enable_instance(instance_name: str, initiated_by: str = 'unknown', reason: s
         reason: Context (e.g., 'manual', 'resume', 'launch')
     """
     update_instance_position(instance_name, {
-        'enabled': True,
-        'previously_enabled': True
+        'enabled': True
     })
     # Log all enable operations
     try:
@@ -515,15 +578,17 @@ def enable_instance(instance_name: str, initiated_by: str = 'unknown', reason: s
             'by': initiated_by,
             'reason': reason
         })
+        # Push lifecycle event (rate-limited)
+        from ..relay import push
+        push()
     except Exception:
-        pass  # Don't break enable if logging fails
+        pass  # Don't break enable if logging/sync fails
 
 __all__ = [
     'load_instance_position',
     'update_instance_position',
     'is_parent_instance',
     'is_subagent_instance',
-    'in_subagent_context',
     'get_instance_status',
     'get_status_description',
     'set_status',

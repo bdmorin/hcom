@@ -19,9 +19,8 @@ from .shared import (
     AGENT_NAME_PATTERN,
 )
 from .claude_args import extract_system_prompt_args, merge_system_prompts
-from .core.paths import hcom_path, SCRIPTS_DIR
+from .core.paths import hcom_path, SCRIPTS_DIR, read_file_with_retry
 from .core.config import get_config
-from .core.paths import read_file_with_retry
 
 # ==================== Agent Management ====================
 
@@ -83,13 +82,6 @@ def resolve_agent(name: str) -> tuple[str, dict[str, str]]:
     from .commands.utils import format_error
 
     hint = 'Agent names must use lowercase letters and dashes only'
-
-    if not isinstance(name, str):
-        raise FileNotFoundError(format_error(
-            f"Agent '{name}' not found",
-            hint
-        ))
-
     candidate = name.strip()
     display_name = candidate or name
 
@@ -282,11 +274,6 @@ def create_bash_script(script_file: str, env: dict[str, Any], cwd: str | None, c
     - Background scripts: persist until `hcom reset logs` cleanup (24 hours)
     - Agent scripts: treated like background (contain 'hcom_agent_')
     """
-    try:
-        script_path = Path(script_file)
-    except (OSError, IOError) as e:
-        raise Exception(f"Cannot create script directory: {e}")
-
     with open(script_file, 'w', encoding='utf-8') as f:
         f.write('#!/bin/bash\n')
         f.write('echo "Starting Claude Code..."\n')
@@ -294,6 +281,16 @@ def create_bash_script(script_file: str, env: dict[str, Any], cwd: str | None, c
         if platform.system() != 'Windows':
             # 1. Discover paths once
             claude_path = shutil.which('claude')
+            if not claude_path:
+                # Fallback for native installer (alias-based, not in PATH)
+                for fallback in [
+                    Path.home() / '.claude' / 'local' / 'claude',
+                    Path.home() / '.local' / 'bin' / 'claude',
+                    Path.home() / '.claude' / 'bin' / 'claude',
+                ]:
+                    if fallback.exists() and fallback.is_file():
+                        claude_path = str(fallback)
+                        break
             node_path = shutil.which('node')
 
             # 2. Add to PATH for minimal environments
@@ -350,8 +347,10 @@ def create_bash_script(script_file: str, env: dict[str, Any], cwd: str | None, c
 # ==================== Terminal Launching ====================
 
 def get_macos_terminal_argv() -> list[str]:
-    """Return macOS Terminal.app launch command as argv list."""
-    return ['osascript', '-e', 'tell app "Terminal" to do script "bash {script}"', '-e', 'tell app "Terminal" to activate']
+    """Return macOS Terminal.app launch command as argv list.
+    Uses 'open -a Terminal' with .command files to avoid AppleScript permission popup.
+    """
+    return ['open', '-a', 'Terminal', '{script}']
 
 def get_windows_terminal_argv() -> list[str]:
     """Return Windows terminal launcher as argv list."""
@@ -484,12 +483,24 @@ def launch_terminal(command: str, env: dict[str, str], cwd: str | None = None, b
         if shell_path:
             env_vars['SHELL'] = shell_path
 
-    env_vars.update(os.environ)
+    # Filter CLAUDECODE to prevent identity inheritance
+    # - TUI (--new-terminal): runs as user (bigboss), not instance
+    # - New instances: get their own CLAUDECODE from Claude Code
+    env_vars.update({k: v for k, v in os.environ.items() if k != 'CLAUDECODE'})
     command_str = command
 
-    # 1) Always create a script
+    # 1) Determine script extension
+    # macOS default mode uses .command
+    # All other cases (custom terminal, other platforms, background) use .sh
+    terminal_mode = get_config().terminal
+    use_command_ext = (
+        not background
+        and platform.system() == 'Darwin'
+        and terminal_mode == 'new'
+    )
+    extension = '.command' if use_command_ext else '.sh'
     script_file = str(hcom_path(SCRIPTS_DIR,
-        f'hcom_{os.getpid()}_{random.randint(1000,9999)}.sh'))
+        f'hcom_{os.getpid()}_{random.randint(1000,9999)}{extension}'))
     create_bash_script(script_file, env_vars, cwd, command_str, background)
 
     # 2) Background mode
@@ -537,8 +548,6 @@ def launch_terminal(command: str, env: dict[str, str], cwd: str | None = None, b
         return str(log_file)
 
     # 3) Terminal modes
-    terminal_mode = get_config().terminal
-
     if terminal_mode == 'print':
         # Print script path and contents
         try:

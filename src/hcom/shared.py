@@ -10,7 +10,7 @@ from pathlib import Path
 from dataclasses import dataclass
 from typing import Literal
 
-__version__ = "0.6.5"
+__version__ = "0.6.6"
 
 # ===== Platform Detection =====
 IS_WINDOWS = sys.platform == 'win32'
@@ -58,12 +58,12 @@ def is_termux() -> bool:
 # - identifiers: var_@name (preceded by underscore)
 # - kebab-case: some-id@mention (preceded by hyphen)
 # Capture group must start with alphanumeric (prevents @-test, @_test, @123)
-MENTION_PATTERN = re.compile(r'(?<![a-zA-Z0-9._-])@([a-zA-Z0-9][\w-]*)')
+# Includes : for remote instance names (e.g., @alice:BOXE)
+MENTION_PATTERN = re.compile(r'(?<![a-zA-Z0-9._-])@([a-zA-Z0-9][\w:-]*)')
 AGENT_NAME_PATTERN = re.compile(r'^[a-z-]+$')
 
 # Sender constants
 SENDER = 'bigboss'  # CLI sender identity
-CLAUDE_SENDER = 'john'  # Fallback when no session_id/MAPID available (edge case in Windows or potential rare claude code thing)
 SYSTEM_SENDER = 'hcom'  # System notification identity (launcher, watchdog, etc)
 SENDER_EMOJI = '🐳' # Legacy whale, unused but kept here to remind me about cake intake
 MAX_MESSAGES_PER_DELIVERY = 50
@@ -80,6 +80,7 @@ class SenderIdentity:
     kind: Literal['external', 'instance', 'system']
     name: str  # Display name (stored in events.instance)
     instance_data: dict | None = None  # For kind='instance' only
+    session_id: str | None = None  # Stable session identifier (available even when instance_data is None)
 
     @property
     def broadcasts(self) -> bool:
@@ -101,16 +102,18 @@ STOP_HOOK_POLL_INTERVAL = 0.1  # 100ms between stop hook polls
 HCOM_INVOCATION_PATTERN = r'(?:uvx\s+)?hcom|python3?\s+-m\s+hcom|(?:python3?\s+)?\S*hcom\.pyz?'
 
 # PreToolUse hook pattern - matches hcom commands for session_id injection and auto-approval
-# - hcom send (any args)
-# - hcom stop (no args) | hcom start (no args or --_hcom_sender only)
+# - hcom send (any args, including --agentid)
+# - hcom stop (no args) | hcom start (no args, or with --agentid flag)
 # - hcom help | hcom --help | hcom -h
-# - hcom list (with optional --json, -v, --verbose, --sql)
-# - hcom watch (with optional --last, --wait, --sql)
-# Negative lookahead ensures stop/start not followed by alias targets (except --_hcom_sender)
+# - hcom list (with optional --json, -v, --verbose)
+# - hcom events (with optional --last, --wait, --sql, --agentid)
+# - hcom relay (with optional pull, hf)
+# - hcom config (any args)
+# Negative lookahead ensures stop/start not followed by alias targets (except approved flags)
 # Allows shell operators (2>&1, >/dev/null, |, &&) but blocks identifier-like targets (myalias, 123abc)
 HCOM_COMMAND_PATTERN = re.compile(
     rf'({HCOM_INVOCATION_PATTERN})\s+'
-    r'(?:send\b|stop(?!\s+(?:[a-zA-Z_]|[0-9]+[a-zA-Z_])[-\w]*(?:\s|$))|start(?:\s+--_hcom_sender\s+\S+)?(?!\s+(?:[a-zA-Z_]|[0-9]+[a-zA-Z_])[-\w]*(?:\s|$))|(?:help|--help|-h)\b|--new-terminal\b|list\b|watch\b)'
+    r'(?:send\b|stop(?!\s+(?:[a-zA-Z_]|[0-9]+[a-zA-Z_])[-\w]*(?:\s|$))|start(?:\s+--agentid\s+\S+)?(?!\s+(?:[a-zA-Z_]|[0-9]+[a-zA-Z_])[-\w]*(?:\s|$))|(?:help|--help|-h)\b|--new-terminal\b|list(?:\s+--(?:agentid|json|verbose|v)\b)*|events\b|relay\b|config\b)'
 )
 
 # ===== Core ANSI Codes =====
@@ -124,21 +127,22 @@ FG_GREEN = "\033[32m"
 FG_CYAN = "\033[36m"
 FG_WHITE = "\033[37m"
 FG_BLACK = "\033[30m"
-FG_GRAY = '\033[90m'
+FG_GRAY = '\033[38;5;245m'  # Mid-gray (was 90, inconsistent across terminals)
 FG_YELLOW = '\033[33m'
 FG_RED = '\033[31m'
-FG_BLUE = '\033[34m'
+FG_BLUE = '\033[38;5;75m'  # Sky blue (256-color, consistent across terminals)
 
 # TUI-specific foreground
 FG_ORANGE = '\033[38;5;208m'
 FG_GOLD = '\033[38;5;220m'
 FG_LIGHTGRAY = '\033[38;5;250m'
+FG_DELIVER = '\033[38;5;156m'  # Light green for message delivery state
 
 # Stale instance color (brownish-grey, distinct from exited)
 FG_STALE = '\033[38;5;137m'  # Tan/brownish-grey
 
 # Background colors
-BG_BLUE = "\033[44m"
+BG_BLUE = '\033[48;5;69m'  # Light blue (256-color, consistent across terminals)
 BG_GREEN = "\033[42m"
 BG_CYAN = "\033[46m"
 BG_YELLOW = "\033[43m"
@@ -178,6 +182,9 @@ DEFAULT_CONFIG_HEADER = [
     "#   HCOM_TAG - Group tag for instances (creates tag-* instances)",
     "#   HCOM_AGENT - Claude code subagent from .claude/agents/, comma-separated for multiple",
     "#   HCOM_CLAUDE_ARGS - Default Claude args (e.g., '-p --model sonnet')",
+    "#   HCOM_RELAY - Cross-device relay server URL (optional)",
+    "#   HCOM_RELAY_TOKEN - Auth token for relay server (optional)",
+    "#   HCOM_RELAY_ENABLED - Enable/disable relay sync (default: 1 if URL set)",
     "#",
     "ANTHROPIC_MODEL=",
     "CLAUDE_CODE_SUBAGENT_MODEL=",
@@ -191,6 +198,9 @@ DEFAULT_CONFIG_DEFAULTS = [
     'HCOM_SUBAGENT_TIMEOUT=30',
     'HCOM_TERMINAL=new',
     r'''HCOM_CLAUDE_ARGS="'say hi in hcom chat'"''',
+    'HCOM_RELAY=',
+    'HCOM_RELAY_TOKEN=',
+    'HCOM_RELAY_ENABLED=1',
 ]
 
 # ===== Status Configuration =====
@@ -243,25 +253,44 @@ STATUS_ORDER = ["active", "idle", "blocked", "inactive"]
 STATUS_FG = STATUS_COLORS
 
 # ===== Pure Utility Functions =====
-def format_timestamp(iso_str: str, fmt: str = '%H:%M') -> str:
-    """Format ISO timestamp for display - pure function"""
+def shorten_path(path: str) -> str:
+    """Shorten path by replacing home directory with ~"""
+    import os
+    if not path:
+        return path
+    return path.replace(os.path.expanduser("~"), "~")
+
+def parse_iso_timestamp(iso_str: str):
+    """Parse ISO timestamp string to datetime, handling Z timezone.
+    Returns datetime object or None on parse failure."""
     from datetime import datetime
     try:
+        return datetime.fromisoformat(iso_str.replace('Z', '+00:00'))
+    except (ValueError, AttributeError):
+        return None
+
+def format_timestamp(iso_str: str, fmt: str = '%H:%M') -> str:
+    """Format ISO timestamp for display - pure function"""
+    try:
         if 'T' in iso_str:
-            dt = datetime.fromisoformat(iso_str.replace('Z', '+00:00'))
-            return dt.strftime(fmt)
+            dt = parse_iso_timestamp(iso_str)
+            if dt:
+                return dt.strftime(fmt)
         return iso_str
     except Exception:
         return iso_str[:5] if len(iso_str) >= 5 else iso_str
 
 def format_age(seconds: float) -> str:
-    """Format time ago in human readable form - pure function"""
+    """Format time ago in human readable form - pure function.
+    Returns compact format: 5s, 3m, 2h, 1d (callers append ' ago' if needed)."""
     if seconds < 60:
         return f"{int(seconds)}s"
     elif seconds < 3600:
         return f"{int(seconds/60)}m"
-    else:
+    elif seconds < 86400:
         return f"{int(seconds/3600)}h"
+    else:
+        return f"{int(seconds/86400)}d"
 
 def get_status_counts(instances: dict[str, dict]) -> dict[str, int]:
     """Count instances by status type - pure data transformation"""

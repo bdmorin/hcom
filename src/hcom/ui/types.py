@@ -44,6 +44,11 @@ class UIState:
     message_cursor_pos: int = 0
     instance_scroll_pos: int = 0
     show_instance_detail: Optional[str] = None  # Instance name to show detail for (cleared on cursor move/ESC)
+    show_stopped: bool = False  # Whether to show stopped (disabled) instances in list
+    show_remote: bool = False   # Whether to show remote (synced from other devices) instances
+    show_stopped_user_set: bool = False  # User explicitly toggled stopped section
+    show_remote_user_set: bool = False   # User explicitly toggled remote section
+    device_sync_times: dict = field(default_factory=dict)  # device_id -> last_import_time (for sync pulse)
 
     # Rendering optimization
     frame_dirty: bool = True  # Frame needs rebuild (set when data/cursor/input changes)
@@ -97,7 +102,20 @@ class UIState:
     last_event_id: int = 0
     last_message_time: float = 0.0
 
-    # LOG filtering
-    log_filter: str = ""                   # Current filter query (empty = inactive)
-    log_filter_cursor: int = 0             # Cursor position in filter input
-    log_event_type: str = "all"            # Event type filter: "all", "message", "status", "life"
+    # Launch batch tracking (for status banner)
+    launch_batch: Optional[dict] = None
+
+    # EVENTS filtering
+    event_filter: str = ""                 # Current filter query (empty = inactive)
+    event_filter_cursor: int = 0           # Cursor position in filter input
+    event_type_filter: str = "all"         # Event type filter: "all", "message", "status", "life"
+
+    # Send state (for inline feedback)
+    send_state: Optional[str] = None       # None, 'sending', 'sent'
+    send_state_until: float = 0.0          # When to clear 'sent' state
+
+    # Relay status (for status bar indicator)
+    relay_configured: bool = False         # Relay URL is set
+    relay_enabled: bool = True             # Relay sync enabled
+    relay_status: Optional[str] = None     # 'ok' | 'error' | None
+    relay_error: Optional[str] = None      # Last error message

@@ -4,6 +4,8 @@ import sys
 import time
 import random
 import uuid
+import json
+from pathlib import Path
 from .utils import CLIError, format_error, is_interactive, resolve_identity
 from ..shared import FG_YELLOW, RESET, IS_WINDOWS
 from ..claude_args import resolve_claude_args, merge_claude_args, add_background_defaults, validate_conflicts
@@ -13,8 +15,10 @@ from ..core.instances import (
     load_instance_position,
     update_instance_position,
     is_subagent_instance,
-    in_subagent_context,
+    SKIP_HISTORY,
+    parse_running_tasks,
 )
+from ..hooks.subagent import in_subagent_context
 from ..core.db import iter_instances
 from ..core.runtime import build_claude_env
 from ..hooks.utils import disable_instance
@@ -22,8 +26,6 @@ from ..hooks.utils import disable_instance
 
 def cmd_launch(argv: list[str]) -> int:
     """Launch Claude instances: hcom [N] [claude] [args]"""
-    # Import here to avoid circular import (cmd_watch is in admin.py)
-    from .admin import cmd_watch, should_show_in_watch
     # Import from terminal module
     from ..terminal import build_claude_command, launch_terminal, resolve_agent
 
@@ -205,8 +207,7 @@ def cmd_launch(argv: list[str]) -> int:
         else:
             print(f"Launched {launched} Claude instance{'s' if launched != 1 else ''}")
 
-        # Print batch ID and usage for automation/tracking
-        print(f"Wait for first instance to be ready: hcom watch --wait 30 --sql \"type = 'life' AND json_extract(data, '$.batch_id') = '{batch_id}' AND json_extract(data, '$.action') = 'ready'\"")
+        print(f"Wait until instance(s) are ready: hcom events launch")
 
         # Log launch event
         if launched > 0:
@@ -274,7 +275,6 @@ def cmd_launch(argv: list[str]) -> int:
 
 def cmd_stop(argv: list[str]) -> int:
     """Stop instances: hcom stop [alias|all]"""
-    from .admin import should_show_in_watch
 
     # Remove flags to get target
     args_without_flags = [a for a in argv if not a.startswith('--')]
@@ -282,7 +282,8 @@ def cmd_stop(argv: list[str]) -> int:
 
     # Handle 'all' target
     if target == 'all':
-        instances = list(iter_instances())
+        # Only stop local instances (not remote ones from other devices)
+        instances = [i for i in iter_instances() if not i.get('origin_device_id')]
 
         if not instances:
             print("No instances found")
@@ -294,8 +295,6 @@ def cmd_stop(argv: list[str]) -> int:
         for instance_data in instances:
             if instance_data.get('enabled', False):
                 instance_name = instance_data['name']
-                # Set external stop flag (stop all is always external)
-                update_instance_position(instance_name, {'external_stop_pending': True})
                 launcher = resolve_identity().name
                 disable_instance(instance_name, initiated_by=launcher, reason='stop_all')
                 stopped_names.append(instance_name)
@@ -326,13 +325,18 @@ def cmd_stop(argv: list[str]) -> int:
         instance_name = target
     else:
         try:
-            instance_name = resolve_identity().name
+            identity = resolve_identity()
+            instance_name = identity.name
+
+            # Block subagents from stopping their parent
+            if in_subagent_context(instance_name):
+                raise CLIError("Cannot run hcom stop from within a Task subagent")
         except ValueError:
             instance_name = None
 
-    # Handle CLAUDE_SENDER or SENDER (not real instances, but cake is real. spongecake.)
-    from ..shared import SENDER, CLAUDE_SENDER
-    if instance_name in (CLAUDE_SENDER, SENDER):
+    # Handle SENDER (not real instance) - cake is real! sponge cake!
+    from ..shared import SENDER
+    if instance_name == SENDER:
         if IS_WINDOWS:
             raise CLIError("Cannot resolve instance identity - use 'hcom <n>' or Windows Terminal for stable identity")
         else:
@@ -346,44 +350,45 @@ def cmd_stop(argv: list[str]) -> int:
     if not position:
         raise CLIError(f"Instance '{instance_name}' not found")
 
+    # Remote instance - send control via relay
+    if position.get('origin_device_id'):
+        if ':' in instance_name:
+            name, device_short_id = instance_name.rsplit(':', 1)
+            from ..relay import send_control
+            if send_control('stop', name, device_short_id):
+                print(f"Stop sent to {instance_name}")
+                return 0
+            else:
+                raise CLIError(f"Failed to send stop to {instance_name} - relay unavailable")
+        raise CLIError(f"Cannot stop remote instance '{instance_name}' - missing device suffix")
+
     # Skip already stopped instances
     if not position.get('enabled', False):
-        print(f"HCOM already stopped for {instance_name}")
+        print(f"hcom already stopped for {instance_name}")
         return 0
 
     # Check if this is a subagent - disable only the targeted one
     if is_subagent_instance(position):
         # External stop = CLI user specified target, Self stop = no target (uses session_id)
         is_external_stop = target is not None
-
-        if is_external_stop:
-            # Set flag to notify instance via PostToolUse
-            update_instance_position(instance_name, {'external_stop_pending': True})
-
         launcher = resolve_identity().name
         reason = 'external' if is_external_stop else 'manual'
         disable_instance(instance_name, initiated_by=launcher, reason=reason)
-        print(f"Stopped HCOM for subagent {instance_name}. Will no longer receive chat messages automatically.")
+        print(f"Stopped hcom for subagent {instance_name}. Will no longer receive chat messages automatically.")
     else:
         # Regular parent instance
         # External stop = CLI user specified target, Self stop = no target (uses session_id)
         is_external_stop = target is not None
-
-        if is_external_stop:
-            # Set flag to notify instance via PostToolUse
-            update_instance_position(instance_name, {'external_stop_pending': True})
-
         launcher = resolve_identity().name
         reason = 'external' if is_external_stop else 'manual'
         disable_instance(instance_name, initiated_by=launcher, reason=reason)
-        print(f"Stopped HCOM for {instance_name}. Will no longer receive chat messages automatically.")
+        print(f"Stopped hcom for {instance_name}. Will no longer receive chat messages automatically.")
 
     # Show background log location if applicable
     if position.get('background'):
         log_file = position.get('background_log_file', '')
         if log_file:
             print(f"\nHeadless instance log: {log_file}")
-            print(f"Monitor: tail -f {log_file}")
 
     return 0
 
@@ -392,49 +397,158 @@ def cmd_start(argv: list[str]) -> int:
     """Enable HCOM participation: hcom start [alias]"""
     from ..core.instances import initialize_instance_in_position_file, enable_instance, set_status
 
-    # Extract --_hcom_sender if present (for subagents)
-    subagent_id = None
-    if '--_hcom_sender' in argv:
-        idx = argv.index('--_hcom_sender')
-        if idx + 1 < len(argv):
-            subagent_id = argv[idx + 1]
-            argv = argv[:idx] + argv[idx + 2:]
+    # Extract --agentid flag (for subagents)
+    agent_id = None
 
-    # SUBAGENT PATH: --_hcom_sender provided
-    if subagent_id:
-        instance_data = load_instance_position(subagent_id)
-        if not instance_data:
-            print(f"Error: Instance '{subagent_id}' not found", file=sys.stderr)
+    # Parse subagent flag
+    i = 0
+    while i < len(argv):
+        if argv[i] == '--agentid' and i + 1 < len(argv):
+            agent_id = argv[i + 1]
+            argv = argv[:i] + argv[i + 2:]
+        else:
+            i += 1
+
+    # SUBAGENT PATH: --agentid provided (lazy creation)
+    if agent_id:
+        # Resolve parent from identity (session_id or mapid)
+        try:
+            parent_identity = resolve_identity()
+            parent_name = parent_identity.name
+        except ValueError:
+            print("Error: Cannot resolve parent identity", file=sys.stderr)
             return 1
 
-        already = 'already ' if instance_data.get('enabled', False) else ''
-        launcher = resolve_identity().name
-        enable_instance(subagent_id, initiated_by=launcher, reason='manual')
-        set_status(subagent_id, 'active', 'tool:start')
+        parent_session_id = parent_identity.session_id
 
-        parent_name = instance_data.get('parent_name', 'unknown')
+        # Validate parent has session_id (required for FK relationship)
+        if parent_session_id is None:
+            print("Error: Parent instance has no session_id (required for subagent creation)", file=sys.stderr)
+            return 1
+
+        # Look up agent_type from parent's running_tasks
+        parent_data = load_instance_position(parent_name)
+        if not parent_data:
+            print("Error: Parent instance not found", file=sys.stderr)
+            return 1
+
+        running_tasks = parse_running_tasks(parent_data.get('running_tasks', ''))
+        subagents = running_tasks.get('subagents', [])
+
+        # Find agent_type for this agent_id
+        agent_type = None
+        for task in subagents:
+            if task.get('agent_id') == agent_id:
+                agent_type = task.get('type')
+                break
+
+        if not agent_type:
+            print(f"Error: agent_id {agent_id} not found in parent's running_tasks.subagents", file=sys.stderr)
+            return 1
+
+        # Check if instance already exists by agent_id (reuse alias)
+        from ..core.db import get_db
+        import sqlite3
+        import re
+        conn = get_db()
+        existing = conn.execute(
+            "SELECT name FROM instances WHERE agent_id = ?",
+            (agent_id,)
+        ).fetchone()
+
+        if existing:
+            # Already created - reuse existing alias, re-enable if stopped
+            alias = existing['name']
+            instance_data = load_instance_position(alias)
+            if instance_data and not instance_data.get('enabled', False):
+                update_instance_position(alias, {'enabled': True})
+                set_status(alias, 'active', 'start')
+                print(f"hcom started for {alias}")
+            else:
+                print(f"hcom already started for {alias}")
+            return 0
+
+        # Compute next suffix: query max(n) for parent_type_% pattern
+        pattern = f"{parent_name}_{agent_type}_%"
+        rows = conn.execute(
+            "SELECT name FROM instances WHERE name LIKE ?",
+            (pattern,)
+        ).fetchall()
+
+        # Extract numeric suffixes and find max
+        max_n = 0
+        suffix_pattern = re.compile(rf'^{re.escape(parent_name)}_{re.escape(agent_type)}_(\d+)$')
+        for row in rows:
+            match = suffix_pattern.match(row['name'])
+            if match:
+                n = int(match.group(1))
+                max_n = max(max_n, n)
+
+        # Propose next alias
+        alias = f"{parent_name}_{agent_type}_{max_n + 1}"
+
+        # Single-pass insert with agent_id (direct DB insert, not via initialize_instance_in_position_file)
+        import time
+        from ..core.db import get_last_event_id
+        initial_event_id = get_last_event_id() if SKIP_HISTORY else 0
+
+        try:
+            conn.execute(
+                """INSERT INTO instances (name, session_id, parent_session_id, parent_name, agent_id, enabled, created_at, last_event_id, directory, last_stop)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (alias, None, parent_session_id, parent_name, agent_id, 1, time.time(), initial_event_id, str(Path.cwd()), 0)
+            )
+            conn.commit()
+        except sqlite3.IntegrityError as e:
+            # Unexpected collision - retry once with next suffix
+            alias = f"{parent_name}_{agent_type}_{max_n + 2}"
+            try:
+                conn.execute(
+                    """INSERT INTO instances (name, session_id, parent_session_id, parent_name, agent_id, enabled, created_at, last_event_id, directory, last_stop)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (alias, None, parent_session_id, parent_name, agent_id, 1, time.time(), initial_event_id, str(Path.cwd()), 0)
+                )
+                conn.commit()
+            except sqlite3.IntegrityError:
+                print(f"Error: Failed to create unique alias after retry: {e}", file=sys.stderr)
+                return 1
+
+        # Set active status
+        set_status(alias, 'active', 'tool:start')
+
+        # Print alias (identity resolution will use agent_id)
         from ..shared import SENDER
         from ..hooks.utils import build_hcom_command
         hcom_cmd = build_hcom_command()
-        print(f"""HCOM {already}started for {subagent_id}
-HCOM is a communication tool. You are now connected.
-Your hcom alias for this session: {subagent_id}
-{parent_name} is the parent instance who spawned you
+        print(f"""hcom started for {alias}
+hcom is a communication tool. You are now connected.
+Your hcom alias for this session: {alias}
+{parent_name} is the alias of the parent instance who spawned you
 
 - To Send a message, run:
-  {hcom_cmd} send 'your message' --_hcom_sender {subagent_id}
+  {hcom_cmd} send --agentid {agent_id} 'your message'
+
+- To see other participants, run:
+  {hcom_cmd} list --agentid {agent_id} [-v]
+  Statuses: ▶ active | ◉ idle (waiting for msgs) | ■ blocked (needs user approval) | ○ inactive (dead)
+
+- To see all event history (messages, status, lifecycle), run:
+  {hcom_cmd} events --agentid {agent_id} [--last N] [--wait SEC] [--sql EXPR]
 
 Receiving Messages:
 - Format: [new message] sender → you: content
 - Targets specific instance: "@alias"
-- Arrives automatically via hooks/bash. No proactive checking needed
+- Messages arrive automatically and instantly via hooks/bash. No proactive checking or sleep commands needed
 
 Response Routing:
 - HCOM message (via hook/bash) → Respond with hcom send
 - Other messages → Respond normally
 
 - Avoid useless chit-chat / excessive confirmation messages unless told otherwise
-- Authority: Prioritize @{SENDER} over other participants""")
+- Authority: Prioritize @{SENDER} over other participants
+- Run hcom commands alone and do not use operators (&&, 1>&2, |, ;, ||, &, etc.)
+- Never use sleep commands, instead use hcom events --wait 10 --sql 'query for the event you are waiting for'
+""")
         return 0
 
     # Remove flags to get target
@@ -450,9 +564,9 @@ Response Routing:
         except ValueError:
             instance_name = None
 
-    # Handle CLAUDE_SENDER or SENDER (not real instances)
-    from ..shared import SENDER, CLAUDE_SENDER
-    if instance_name in (CLAUDE_SENDER, SENDER):
+    # Handle SENDER (not real instance)
+    from ..shared import SENDER
+    if instance_name == SENDER:
         if IS_WINDOWS:
             print(format_error("Cannot resolve instance identity - use 'hcom <n>' or Windows Terminal for stable identity"), file=sys.stderr)
         else:
@@ -468,24 +582,29 @@ Response Routing:
     # Load or create instance
     existing_data = load_instance_position(instance_name)
 
-    # Check for Task ambiguity (parent frozen, subagent calling)
-    if existing_data and not target and in_subagent_context(instance_name):
-        # Query DB for disabled subagents
-        from ..core.db import get_db
-        conn = get_db()
-        subagent_ids = [row['name'] for row in conn.execute(
-            "SELECT name FROM instances WHERE parent_name = ? AND enabled = 0",
-            (instance_name,)
-        ).fetchall()]
+    # Remote instance - send control via relay
+    if existing_data and existing_data.get('origin_device_id'):
+        if ':' in instance_name:
+            name, device_short_id = instance_name.rsplit(':', 1)
+            from ..relay import send_control
+            if send_control('start', name, device_short_id):
+                print(f"Start sent to {instance_name}")
+                return 0
+            else:
+                raise CLIError(f"Failed to send start to {instance_name} - relay unavailable")
+        raise CLIError(f"Cannot start remote instance '{instance_name}' - missing device suffix")
 
-        print("Task tool running - you must provide an alias", file=sys.stderr)
-        print("Use: hcom start --_hcom_sender {alias}", file=sys.stderr)
-        if subagent_ids:
-            print(f"Choose from one of these valid aliases: {', '.join(subagent_ids)}", file=sys.stderr)
-        return 1
-
-    # Create instance if it doesn't exist (opt-in for vanilla instances)
+    # Handle non-existent instance
     if not existing_data:
+        # Explicit target provided → must already exist (re-enable only)
+        if target:
+            print(format_error(f"Instance '{instance_name}' not found"), file=sys.stderr)
+            print("Usage: hcom start <alias>   Re-enable existing stopped instance", file=sys.stderr)
+            print("       hcom start           Enable hcom (inside Claude Code)", file=sys.stderr)
+            print("       hcom <count>         Launch new instances", file=sys.stderr)
+            return 1
+
+        # Self-start (no target) → create new instance for current session
         from ..shared import MAPID
         session_id = os.environ.get('HCOM_SESSION_ID')
 
@@ -503,18 +622,18 @@ Response Routing:
         initialize_instance_in_position_file(instance_name, session_id, mapid=MAPID)
         launcher = resolve_identity().name
         enable_instance(instance_name, initiated_by=launcher, reason='manual')
-        print(f"\nStarted HCOM for {instance_name}")
+        print(f"\nStarted hcom for {instance_name}")
         return 0
 
     # Skip already started instances
     if existing_data.get('enabled', False):
-        print(f"HCOM already started for {instance_name}")
+        print(f"hcom already started for {instance_name}")
         return 0
 
     # Check if background instance has exited permanently
     if existing_data.get('session_ended') and existing_data.get('background'):
         session = existing_data.get('session_id', '')
-        msg = f"Cannot start HCOM for {instance_name}: headless instance has exited permanently\n"
+        msg = f"Cannot start hcom for {instance_name}: headless instance has exited permanently\n"
         if session:
             msg += f"\nResume conversation with same hcom identity: hcom 1 claude -p --resume {session}"
         raise CLIError(msg)
@@ -522,5 +641,5 @@ Response Routing:
     # Re-enabling existing instance
     launcher = resolve_identity().name
     enable_instance(instance_name, initiated_by=launcher, reason='manual')
-    print(f"Started HCOM for {instance_name}")
+    print(f"Started hcom for {instance_name}")
     return 0

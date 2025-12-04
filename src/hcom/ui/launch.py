@@ -13,7 +13,8 @@ from ..ui import Field, LaunchField, Mode
 
 # Import rendering utilities
 from ..ui import (
-    ansi_len, ansi_ljust, bg_ljust, truncate_ansi, get_terminal_size
+    ansi_len, ansi_ljust, bg_ljust, truncate_ansi, get_terminal_size,
+    separator_line,
 )
 
 # Import input utilities
@@ -33,17 +34,33 @@ from ..shared import (
 )
 from ..ui import CONFIG_DEFAULTS, CONFIG_FIELD_OVERRIDES, FG_CLAUDE_ORANGE, FG_CUSTOM_ENV
 from ..api import (
-    get_config, reload_config, cmd_launch, cmd_reset,
+    get_config, reload_config, cmd_launch,
     resolve_claude_args
 )
+from ..commands.admin import reset_config
 
 
 class LaunchScreen:
     """Launch mode: form-based instance creation"""
 
+    _claude_defaults_cache = None  # Class-level cache for claude defaults
+
     def __init__(self, state: UIState, tui: HcomTUI):
         self.state = state  # Shared state (explicit dependency)
         self.tui = tui      # For commands only (flash, config loading, cmd_launch)
+
+    def _get_claude_defaults(self) -> tuple[str, str, str, bool]:
+        """Get (prompt, system, append, background) defaults from HCOM_CLAUDE_ARGS. Cached."""
+        if LaunchScreen._claude_defaults_cache is None:
+            claude_args_default = CONFIG_DEFAULTS.get('HCOM_CLAUDE_ARGS', '')
+            spec = resolve_claude_args(None, claude_args_default if claude_args_default else None)
+            LaunchScreen._claude_defaults_cache = (
+                spec.positional_tokens[0] if spec.positional_tokens else "",
+                spec.user_system or "",
+                spec.user_append or "",
+                spec.is_background,
+            )
+        return LaunchScreen._claude_defaults_cache
 
     def build(self, height: int, width: int) -> List[str]:
         """Build launch screen with expandable sections"""
@@ -83,7 +100,6 @@ class LaunchScreen:
             selected_field_start_line = len(lines)
             lines.append(f"  {BG_ORANGE}{FG_BLACK}{BOLD} \u25b6 Launch \u23ce {RESET}")
             # Show cwd when launch button is selected
-            import os
             cwd = os.getcwd()
             max_cwd_width = width - 10  # Leave margin
             if len(cwd) > max_cwd_width:
@@ -100,16 +116,9 @@ class LaunchScreen:
         claude_selected = (self.state.launch_field == LaunchField.CLAUDE_SECTION and self.state.claude_cursor == -1)
         expand_marker = '\u25bc' if self.state.claude_expanded else '\u25b6'
         claude_fields = self.build_claude_fields()
-        # Count fields modified from defaults by comparing with parsed default spec
+        # Count fields modified from defaults
         claude_set = 0
-
-        # Parse default HCOM_CLAUDE_ARGS to get default prompt/system/background
-        claude_args_default = CONFIG_DEFAULTS.get('HCOM_CLAUDE_ARGS', '')
-        default_spec = resolve_claude_args(None, claude_args_default if claude_args_default else None)
-        default_prompt = default_spec.positional_tokens[0] if default_spec.positional_tokens else ""
-        default_system = default_spec.user_system or ""
-        default_append = default_spec.user_append or ""
-        default_background = default_spec.is_background
+        default_prompt, default_system, default_append, default_background = self._get_claude_defaults()
 
         if self.state.launch_background != default_background:
             claude_set += 1
@@ -121,7 +130,7 @@ class LaunchScreen:
             claude_set += 1
         # claude_args: check if raw value differs from default (normalize quotes)
         claude_args_val = self.state.config_edit.get('HCOM_CLAUDE_ARGS', '').strip().strip("'\"")
-        claude_args_default_normalized = claude_args_default.strip().strip("'\"")
+        claude_args_default_normalized = CONFIG_DEFAULTS.get('HCOM_CLAUDE_ARGS', '').strip().strip("'\"")
         if claude_args_val != claude_args_default_normalized:
             claude_set += 1
         claude_total = len(claude_fields)
@@ -381,7 +390,7 @@ class LaunchScreen:
                 # Other HCOM fields
                 editor_color = FG_CYAN
                 field_name = field_key.replace('HCOM_', '').replace('_', ' ').title()
-                help_text = "HCOM configuration variable"
+                help_text = "hcom configuration variable"
             else:
                 # Custom env vars
                 editor_color = FG_CUSTOM_ENV
@@ -390,17 +399,17 @@ class LaunchScreen:
 
             # Header line - bold field name, regular help text
             header = f"{editor_color}{BOLD}{field_name}:{RESET} {FG_GRAY}{help_text}{RESET}"
-            lines.append(f"{FG_GRAY}{'─' * width}{RESET}")
+            lines.append(separator_line(width))
             lines.append(header)
             lines.append('')  # Blank line between header and input
             # Render editor with wrapping support
             editor_lines = render_text_input(field_value, cursor_pos, width, editor_content_rows, prefix="")
             lines.extend(editor_lines)
             # Separator after editor input
-            lines.append(f"{FG_GRAY}{'─' * width}{RESET}")
+            lines.append(separator_line(width))
         else:
             # Separator at bottom when no editor
-            lines.append(f"{FG_GRAY}{'─' * width}{RESET}")
+            lines.append(separator_line(width))
 
         return lines[:height]
 
@@ -549,6 +558,15 @@ class LaunchScreen:
                     if field.field_type == 'checkbox' and field.key == 'background':
                         self.state.launch_background = not self.state.launch_background
                         self.tui.save_launch_state()
+            elif self.state.launch_field == LaunchField.HCOM_SECTION and self.state.hcom_cursor >= 0:
+                fields = self.build_hcom_fields()
+                if self.state.hcom_cursor < len(fields):
+                    field = fields[self.state.hcom_cursor]
+                    if field.field_type == 'checkbox':
+                        current = self.state.config_edit.get(field.key, '')
+                        new_value = '0' if current == '1' else '1'
+                        self.state.config_edit[field.key] = new_value
+                        self.tui.save_config_to_file()
             elif self.state.launch_field == LaunchField.LAUNCH_BTN:
                 self.do_launch()
             elif self.state.launch_field == LaunchField.OPEN_EDITOR:
@@ -621,7 +639,7 @@ class LaunchScreen:
             if is_confirming:
                 # Execute config reset
                 try:
-                    result = cmd_reset(['config'])
+                    result = reset_config()
                     if result == 0:
                         self.tui.load_config_from_file()
                         self.tui.load_launch_state()
@@ -883,18 +901,15 @@ class LaunchScreen:
         in_config = field.key in self.state.config_edit
 
         # Format value based on type
-        # For Claude fields (prompt, system_prompt, append_system_prompt, background), extract defaults from HCOM_CLAUDE_ARGS
+        # For Claude fields, use cached defaults from HCOM_CLAUDE_ARGS
         if field.key in ('prompt', 'system_prompt', 'append_system_prompt', 'background'):
-            claude_args_default = CONFIG_DEFAULTS.get('HCOM_CLAUDE_ARGS', '')
-            default_spec = resolve_claude_args(None, claude_args_default if claude_args_default else None)
-            if field.key == 'prompt':
-                default = default_spec.positional_tokens[0] if default_spec.positional_tokens else ""
-            elif field.key == 'system_prompt':
-                default = default_spec.user_system or ""
-            elif field.key == 'append_system_prompt':
-                default = default_spec.user_append or ""
-            else:  # background
-                default = default_spec.is_background
+            default_prompt, default_system, default_append, default_background = self._get_claude_defaults()
+            default = {
+                'prompt': default_prompt,
+                'system_prompt': default_system,
+                'append_system_prompt': default_append,
+                'background': default_background,
+            }[field.key]
         else:
             default = CONFIG_DEFAULTS.get(field.key, '')
 
@@ -902,9 +917,12 @@ class LaunchScreen:
         has_error = field.key in self.state.validation_errors
 
         if field.field_type == 'checkbox':
-            check = '●' if field.value else '○'
-            # Color if differs from default (False is default for checkboxes)
-            is_modified = field.value != False
+            # Handle both boolean (Claude section) and string '1'/'0' (HCOM section)
+            is_checked = field.value is True or field.value == '1'
+            check = '●' if is_checked else '○'
+            # Color if differs from default
+            default_checked = default is True or default == '1'
+            is_modified = is_checked != default_checked
             value_str = f"{value_color if is_modified else FG_WHITE}{check}{RESET}"
         elif field.field_type == 'text':
             if field.value:
@@ -1001,7 +1019,9 @@ class LaunchScreen:
             fields = self.build_hcom_fields()
             if self.state.hcom_cursor < len(fields):
                 field = fields[self.state.hcom_cursor]
-                if field.field_type == 'cycle':
+                if field.field_type == 'checkbox':
+                    return f"{FG_GRAY}tab: switch  enter: toggle  ctrl+r: reset config{RESET}"
+                elif field.field_type == 'cycle':
                     return f"{FG_GRAY}tab: switch  ←→: cycle options  esc: clear  ctrl+r: reset config{RESET}"
                 elif field.field_type == 'numeric':
                     return f"{FG_GRAY}tab: switch  type: digits  ←→: cursor  esc: clear  ctrl+r: reset config{RESET}"
@@ -1081,6 +1101,10 @@ class LaunchScreen:
             # Call hcom.cmd_launch (handles all validation)
             # Add --no-auto-watch flag to prevent opening another watch window
             reload_config()
+            # Close stale DB connection before launch - ensures fresh max event ID
+            # (fixes inode reuse issue on macOS where TUI's connection persists after reset)
+            from ..core.db import close_db
+            close_db()
             result = cmd_launch(argv + ['--no-auto-watch'])
 
             if result == 0:  # Success

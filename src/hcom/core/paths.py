@@ -92,6 +92,34 @@ def atomic_write(filepath: str | Path, content: str) -> bool:
 
     return False  # All attempts exhausted
 
+def increment_flag_counter(name: str) -> int:
+    """Increment a counter in .tmp/flags/{name} and return new value."""
+    flag_file = hcom_path(FLAGS_DIR, name)
+    flag_file.parent.mkdir(parents=True, exist_ok=True)
+
+    count = 0
+    if flag_file.exists():
+        try:
+            count = int(flag_file.read_text().strip())
+        except (ValueError, OSError):
+            count = 0
+
+    count += 1
+    atomic_write(flag_file, str(count))
+    return count
+
+
+def get_flag_counter(name: str) -> int:
+    """Get current value of a counter in .tmp/flags/{name}."""
+    flag_file = hcom_path(FLAGS_DIR, name)
+    if not flag_file.exists():
+        return 0
+    try:
+        return int(flag_file.read_text().strip())
+    except (ValueError, OSError):
+        return 0
+
+
 def read_file_with_retry(filepath: str | Path, read_func: Callable[[TextIO], Any], default: Any = None, max_retries: int = 3) -> Any:
     """Read file with retry logic for Windows file locking"""
     if not Path(filepath).exists():
@@ -120,6 +148,8 @@ __all__ = [
     'ensure_hcom_directories',
     'atomic_write',
     'read_file_with_retry',
+    'increment_flag_counter',
+    'get_flag_counter',
     # Path constants
     'LOGS_DIR',
     'SCRIPTS_DIR',

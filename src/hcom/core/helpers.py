@@ -53,12 +53,14 @@ def validate_scope(scope: str) -> None:
 def is_mentioned(text: str, name: str) -> bool:
     """Check if instance name is @-mentioned in text using prefix matching.
 
-    Uses same prefix matching logic as compute_scope() for consistency.
-    This allows @api to match instances like "api-worker-1" and "api-worker-2".
+    Uses same prefix matching logic as compute_scope() for consistency:
+    - @alice matches "alice" and "alice-worker" (prefix match)
+    - @alice does NOT match "alice:BOXE" (bare mention excludes remote instances)
+    - @alice:BOX matches "alice:BOXE" (remote mention includes device suffix)
 
     Args:
         text: Text to search in
-        name: Instance name to look for (without @ prefix)
+        name: Instance name to check if mentioned (without @ prefix)
 
     Returns:
         True if @mention prefix-matches name, False otherwise
@@ -72,6 +74,10 @@ def is_mentioned(text: str, name: str) -> bool:
         False
         >>> is_mentioned("email@john.com", "john")  # not a mention
         False
+        >>> is_mentioned("@alice", "alice:BOXE")  # bare mention excludes remote
+        False
+        >>> is_mentioned("@alice:BOX", "alice:BOXE")  # remote prefix match
+        True
     """
     from ..shared import MENTION_PATTERN
 
@@ -79,9 +85,16 @@ def is_mentioned(text: str, name: str) -> bool:
     mentions = MENTION_PATTERN.findall(text)
 
     # Check if any mention prefix-matches the instance name (case-insensitive)
+    # Respects local/remote distinction: bare mentions only match local instances
     for mention in mentions:
-        if name.lower().startswith(mention.lower()):
-            return True
+        if ':' in mention:
+            # Remote mention - match any instance with prefix
+            if name.lower().startswith(mention.lower()):
+                return True
+        else:
+            # Bare mention - only match local instances (no : in name)
+            if ':' not in name and name.lower().startswith(mention.lower()):
+                return True
 
     return False
 

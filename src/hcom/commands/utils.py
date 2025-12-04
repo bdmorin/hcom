@@ -1,26 +1,103 @@
 """Command utilities for HCOM"""
 import sys
 import re
-from ..shared import __version__, MAX_MESSAGE_SIZE, SenderIdentity, SENDER, CLAUDE_SENDER
+from ..shared import __version__, MAX_MESSAGE_SIZE, SenderIdentity, SENDER
 
 
 class CLIError(Exception):
     """Raised when arguments cannot be mapped to command semantics."""
 
 
+# Command registry - single source of truth for CLI help
+# Format: list of (usage, description) tuples per command
+COMMAND_HELP: dict[str, list[tuple[str, str]]] = {
+    'events': [
+        ('events', 'Query recent events (JSON)'),
+        ('  --last N', 'Limit to last N events (default: 20)'),
+        ('  --wait [SEC]', 'Block until matching event (default: 60s timeout)'),
+        ('  --sql EXPR', 'SQL WHERE clause filter'),
+    ],
+    'list': [
+        ('list', 'List current instances status'),
+        ('  -v, --verbose', 'Show detailed metadata'),
+        ('  --json', 'Emit JSON with detailed data'),
+    ],
+    'send': [
+        ('send "msg"', 'Send message to all instances'),
+        ('send "@alias msg"', 'Send to specific instance/group'),
+        ('  --from <name>', 'Custom external identity'),
+        ('  --wait', 'Block until reply with --from'),
+    ],
+    'stop': [
+        ('stop', 'Stop current instance (from inside Claude)'),
+        ('stop <alias>', 'Stop specific instance'),
+        ('stop all', 'Stop all instances'),
+    ],
+    'start': [
+        ('start', 'Start current instance (from inside Claude)'),
+        ('start <alias>', 'Start specific instance'),
+    ],
+    'reset': [
+        ('reset', 'Clear database (archive conversation)'),
+        ('reset hooks', 'Remove hooks only'),
+        ('reset all', 'Stop all + clear db + remove hooks + reset config'),
+    ],
+    'config': [
+        ('config', 'Show all config settings'),
+        ('config <key>', 'Get single config value'),
+        ('config <key> <val>', 'Set config value'),
+        ('  --json', 'JSON output'),
+        ('  --edit', 'Open config in $EDITOR'),
+        ('  --reset', 'Reset config to defaults'),
+    ],
+    'relay': [
+        ('relay', 'Show relay status'),
+        ('relay on', 'Enable relay sync'),
+        ('relay off', 'Disable relay sync'),
+        ('relay pull', 'Manual relay pull'),
+        ('relay hf [token]', 'Setup HuggingFace relay'),
+    ],
+}
+
+
+def get_command_help(name: str) -> str:
+    """Get formatted help for a single command."""
+    if name not in COMMAND_HELP:
+        return f"Usage: hcom {name}"
+    lines = ['Usage:']
+    for usage, desc in COMMAND_HELP[name]:
+        if usage.startswith('  '):  # Option line
+            lines.append(f"  {usage:<20} {desc}")
+        else:  # Command line
+            lines.append(f"  hcom {usage:<18} {desc}")
+    return '\n'.join(lines)
+
+
+def _format_commands_section() -> str:
+    """Generate Commands section from registry."""
+    lines = []
+    for name, entries in COMMAND_HELP.items():
+        for usage, desc in entries:
+            if usage.startswith('  '):  # Option
+                lines.append(f"  {usage:<18} {desc}")
+            else:  # Command
+                lines.append(f"  {usage:<18} {desc}")
+        lines.append('')  # Blank line between commands
+    return '\n'.join(lines).rstrip()
+
+
 def get_help_text() -> str:
     """Generate help text with current version"""
-    return f"""hcom {__version__}
-Hook-based communication bus for real-time messaging between Claude Code instances
+    return f"""hcom v{__version__} - Hook-based communication for Claude Code instances
 
 Usage: hcom                           # TUI dashboard
        [ENV_VARS] hcom <COUNT> [claude <ARGS>...]
-       hcom watch [--last N] [--wait SEC] [--sql EXPR]
+       hcom events [--last N] [--wait SEC] [--sql EXPR]
        hcom list [--json] [-v|--verbose]
        hcom send "message"
        hcom stop [alias|all]
        hcom start [alias]
-       hcom reset [logs|hooks|config]
+       hcom reset [hooks|all]
 
 Launch Examples:
   hcom 3             open 3 terminals with claude connected to hcom
@@ -29,31 +106,7 @@ Launch Examples:
   claude 'run hcom start'        claude code with prompt also works
 
 Commands:
-  watch               Query recent events (JSON)
-    --last N          Limit to last N events (default: 20)
-    --wait [SEC]      Block until matching event (default: 60s timeout)
-    --sql EXPR        SQL WHERE clause filter
-
-  list                List current instances status
-    -v, --verbose     Show detailed metadata
-    --json            Emit JSON with detailed data
-
-  send "msg"          Send message to all instances
-  send "@alias msg"   Send to specific instance/group
-    --from <name>     Custom external identity
-    --wait            Block until reply with --from
-
-  stop                Stop current instance (from inside Claude)
-  stop <alias>        Stop specific instance
-  stop all            Stop all instances
-
-  start               Start current instance (from inside Claude)
-  start <alias>       Start specific instance
-
-  reset               Stop all + archive logs + remove hooks + clear config
-  reset logs          Clear + archive conversation
-  reset hooks         Safely remove hcom hooks from claude settings.json
-  reset config        Clear + archive config.env
+{_format_commands_section()}
 
 Environment Variables:
   HCOM_TAG=name               Group tag (creates name-* instances)
@@ -66,7 +119,7 @@ Environment Variables:
 
   ANTHROPIC_MODEL=opus # Any env var passed through to Claude Code
 
-  Persist Env Vars in `~/.hcom/config.env`
+  Persist Env Vars in `~/.hcom/config.env` or use `hcom config`
 """
 
 
@@ -118,7 +171,7 @@ def resolve_identity(subagent_id: str | None = None, custom_from: str | None = N
         if not data:
             # This shouldn't happen - cmd_send validates before calling
             raise ValueError(f"Subagent '{subagent_id}' position data missing")
-        return SenderIdentity(kind='instance', name=subagent_id, instance_data=data)
+        return SenderIdentity(kind='instance', name=subagent_id, instance_data=data, session_id=data.get('session_id'))
 
     # CLI context (not in Claude Code)
     if os.environ.get('CLAUDECODE') != '1':
@@ -129,7 +182,7 @@ def resolve_identity(subagent_id: str | None = None, custom_from: str | None = N
     if session_id:
         name, data = resolve_instance_name(session_id, get_config().tag)
         # Return instance identity (data may be None if not opted in yet)
-        return SenderIdentity(kind='instance', name=name, instance_data=data)
+        return SenderIdentity(kind='instance', name=name, instance_data=data, session_id=session_id)
 
     # Try MAPID (Windows fallback - terminal session ID like WT_SESSION)
     if MAPID:
@@ -139,7 +192,7 @@ def resolve_identity(subagent_id: str | None = None, custom_from: str | None = N
         # First try to find existing instance by MAPID
         data = get_instance_by_mapid(MAPID)
         if data:
-            return SenderIdentity(kind='instance', name=data['name'], instance_data=data)
+            return SenderIdentity(kind='instance', name=data['name'], instance_data=data, session_id=data.get('session_id'))
 
         # No instance for this MAPID - look up session_id from mapping
         # This handles Windows resume in different terminal (MAPID changes but session_id stays same)
@@ -154,10 +207,10 @@ def resolve_identity(subagent_id: str | None = None, custom_from: str | None = N
             session_id = row['session_id']
             name, data = resolve_instance_name(session_id, get_config().tag)
             # Return instance identity (data may be None if not opted in yet)
-            return SenderIdentity(kind='instance', name=name, instance_data=data)
+            return SenderIdentity(kind='instance', name=name, instance_data=data, session_id=session_id)
 
-    # No identity available - fallback to external 'john'
-    return SenderIdentity(kind='external', name=CLAUDE_SENDER, instance_data=None)
+    # No identity available - fail with error directing to --from
+    raise ValueError("Cannot resolve identity - use: hcom send --from <yourname> \"message\"")
 
 
 def validate_message(message: str) -> str | None:
@@ -173,3 +226,32 @@ def validate_message(message: str) -> str | None:
         return format_error(f"Message too large (max {MAX_MESSAGE_SIZE} chars)")
 
     return None
+
+
+def parse_agentid_flag(argv: list[str]) -> tuple[str | None, list[str], str | None]:
+    """Parse --agentid flag and return (subagent_id, remaining_argv, agent_id_value)
+
+    Looks up instance by agent_id and returns the instance name.
+
+    Returns:
+        (subagent_id, argv, agent_id_value): Instance name if found (else None), argv with flag removed, agent_id value if flag was provided (else None).
+    """
+    if '--agentid' not in argv:
+        return None, argv, None
+
+    idx = argv.index('--agentid')
+    if idx + 1 >= len(argv):
+        return None, argv, None
+
+    agent_id = argv[idx + 1]
+    argv = argv[:idx] + argv[idx + 2:]
+
+    # Look up instance by agent_id
+    from ..core.db import get_db
+    conn = get_db()
+    row = conn.execute(
+        "SELECT name FROM instances WHERE agent_id = ?",
+        (agent_id,)
+    ).fetchone()
+
+    return (row['name'] if row else None), argv, agent_id

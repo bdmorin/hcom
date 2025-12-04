@@ -12,7 +12,7 @@ from typing import List, Optional
 from .types import Mode, UIState
 from .rendering import (
     ansi_len, ansi_ljust, truncate_ansi, get_terminal_size,
-    get_message_pulse_colors,
+    get_message_pulse_colors, separator_line,
 )
 from .input import KeyboardInput
 
@@ -28,12 +28,12 @@ from ..shared import (
     # Status configuration
     STATUS_ORDER, STATUS_BG_MAP,
     # Utilities
-    format_timestamp, get_status_counts,
+    format_timestamp, get_status_counts, parse_iso_timestamp,
     resolve_claude_args,
 )
 from ..api import (
     # Instance operations
-    get_instance_status, should_show_in_watch,
+    get_instance_status,
     # Path utilities
     hcom_path, ensure_hcom_directories,
     # Configuration
@@ -57,6 +57,20 @@ from . import CONFIG_DEFAULTS
 MESSAGE_PREVIEW_LIMIT = 100  # Keep last N messages in message preview
 
 
+from contextlib import contextmanager
+from io import StringIO
+
+@contextmanager
+def _suppress_output():
+    """Capture stdout/stderr to prevent CLI output from corrupting TUI display"""
+    old_stdout, old_stderr = sys.stdout, sys.stderr
+    sys.stdout, sys.stderr = StringIO(), StringIO()
+    try:
+        yield
+    finally:
+        sys.stdout, sys.stderr = old_stdout, old_stderr
+
+
 class HcomTUI:
     """Main TUI application - orchestration only"""
 
@@ -74,6 +88,9 @@ class HcomTUI:
         self.last_status_update = 0.0
         self.last_config_check = 0.0
         self.first_render = True
+
+        # Sync subprocess (for cross-device sync when no instances running)
+        self.sync_proc = None
 
         # Screen instances (pass state + self)
         self.manage_screen = ManageScreen(self.state, self)
@@ -174,8 +191,9 @@ class HcomTUI:
             # Count enabled instances before stopping
             enabled_before = sum(1 for info in self.state.instances.values() if info['data'].get('enabled', False))
 
-            # Use cmd_stop(['all']) which handles all instances atomically
-            result = cmd_stop(['all'])
+            # Suppress CLI output to prevent TUI corruption
+            with _suppress_output():
+                result = cmd_stop(['all'])
             if result == 0:
                 self.load_status()
                 # Count how many were actually stopped
@@ -191,20 +209,27 @@ class HcomTUI:
         except Exception as e:
             self.flash_error(f"Error: {str(e)}")
 
-    def reset_logs(self):
-        """Reset logs (archive and clear)"""
+    def reset_events(self):
+        """Reset events (archive and clear database)"""
         try:
-            result = cmd_reset(['logs'])
+            # Close stale connection before reset (clear() deletes DB file)
+            from ..core.db import close_db
+            close_db()
+
+            # Suppress CLI output to prevent TUI corruption
+            with _suppress_output():
+                result = cmd_reset([])
             if result == 0:
                 # Clear message state
                 self.state.messages = []
                 self.state.last_event_id = 0
+                self.state.device_sync_times = {}  # Clear cached sync times
                 # Reload to clear instance list from display
                 self.load_status()
                 archive_path = f"{Path.home()}/.hcom/archive/"
                 self.flash(f"Logs and instance list archived to {archive_path}", duration=10.0)
             else:
-                self.flash_error("Failed to reset logs")
+                self.flash_error("Failed to reset events")
         except Exception as e:
             self.flash_error(f"Error: {str(e)}")
 
@@ -265,6 +290,14 @@ class HcomTUI:
             traceback.print_exc()
             return 1
         finally:
+            # Cleanup sync subprocess
+            if self.sync_proc:
+                try:
+                    self.sync_proc.terminate()
+                except Exception:
+                    pass
+                self.sync_proc = None
+
             # Ensure terminal restored (idempotent)
             sys.stdout.write('\033[?1049l')
             sys.stdout.write('\033[?25h')
@@ -272,12 +305,19 @@ class HcomTUI:
 
     def load_status(self):
         """Load instance status from DB (streamed, not all at once)"""
-        from ..core.db import iter_instances
+        import sqlite3
+        from ..core.db import iter_instances, close_db
 
-        # Stream instances from DB, filter using same logic as watch
-        instances = {}
-        for data in iter_instances():
-            if should_show_in_watch(data):
+        try:
+            # Stream instances from DB
+            instances = {}
+            for data in iter_instances():
+                instances[data['name']] = data
+        except sqlite3.OperationalError:
+            # DB was deleted/reset by another process - reconnect
+            close_db()
+            instances = {}
+            for data in iter_instances():
                 instances[data['name']] = data
 
         # Build instance info dict (replace old instances, don't just add)
@@ -295,7 +335,50 @@ class HcomTUI:
             }
 
         self.state.instances = new_instances
-        self.state.status_counts = get_status_counts(self.state.instances)
+        # Status counts only for enabled instances (header shows active participants)
+        enabled_instances = {k: v for k, v in self.state.instances.items() if v.get('enabled', False)}
+        self.state.status_counts = get_status_counts(enabled_instances)
+
+        # Load launch status (for banner) - aggregates all pending batches
+        try:
+            from ..core.db import get_launch_status
+            batch = get_launch_status()  # No launcher filter - show all pending
+            # Only show if not complete (get_launch_status handles recency)
+            if batch and batch['ready'] < batch['expected']:
+                self.state.launch_batch = batch
+            else:
+                self.state.launch_batch = None
+        except Exception:
+            self.state.launch_batch = None
+
+        # Load device sync times for remote instance pulse coloring
+        try:
+            from ..core.db import get_db, kv_get
+            conn = get_db()
+            # Get unique remote device IDs
+            rows = conn.execute(
+                "SELECT DISTINCT origin_device_id FROM instances WHERE origin_device_id IS NOT NULL AND origin_device_id != ''"
+            ).fetchall()
+            device_times = {}
+            for row in rows:
+                device_id = row['origin_device_id']
+                ts = kv_get(f'relay_sync_time_{device_id}')
+                if ts:
+                    device_times[device_id] = float(ts)
+            self.state.device_sync_times = device_times
+        except Exception:
+            pass  # Keep existing sync times if query fails
+
+        # Load relay status for status bar indicator
+        try:
+            from ..relay import get_relay_status
+            status = get_relay_status()
+            self.state.relay_configured = status['configured']
+            self.state.relay_enabled = status['enabled']
+            self.state.relay_status = status['status']
+            self.state.relay_error = status['error']
+        except Exception:
+            pass
 
     def save_launch_state(self):
         """Save launch form values to config.env via claude args parser"""
@@ -352,10 +435,10 @@ class HcomTUI:
             self.state.launch_system_prompt = spec.user_system or ""
             self.state.launch_append_system_prompt = spec.user_append or ""
 
-            # Initialize cursors to end of text for first-time navigation
-            self.state.launch_prompt_cursor = len(self.state.launch_prompt)
-            self.state.launch_system_prompt_cursor = len(self.state.launch_system_prompt)
-            self.state.launch_append_system_prompt_cursor = len(self.state.launch_append_system_prompt)
+            # Clamp cursors to valid range (preserve position if within bounds)
+            self.state.launch_prompt_cursor = min(self.state.launch_prompt_cursor, len(self.state.launch_prompt))
+            self.state.launch_system_prompt_cursor = min(self.state.launch_system_prompt_cursor, len(self.state.launch_system_prompt))
+            self.state.launch_append_system_prompt_cursor = min(self.state.launch_append_system_prompt_cursor, len(self.state.launch_append_system_prompt))
         except Exception as e:
             # Failed to parse - use defaults and log warning
             sys.stderr.write(f"Warning: Failed to load launch state (using defaults): {e}\n")
@@ -431,6 +514,10 @@ class HcomTUI:
             # Reload snapshot to pick up canonical formatting
             self.load_config_from_file()
             self.load_launch_state()
+            # Refresh runtime config cache (for relay, etc.)
+            reload_config()
+            # Update relay status in UI state
+            self.load_status()
         except Exception as exc:
             self.flash_error(f"Save failed: {exc}")
 
@@ -455,6 +542,7 @@ class HcomTUI:
         try:
             self.load_config_from_file()
             self.load_launch_state()
+            reload_config()  # Refresh runtime cache
         except Exception as exc:
             self.flash_error(f"Failed to reload config.env: {exc}")
             return
@@ -540,8 +628,37 @@ class HcomTUI:
             self.state.flash_message = None
             self.state.frame_dirty = True
 
-        # Update status every 0.5 seconds
-        if now - self.last_status_update >= 0.5:
+        # Clear expired send state
+        if self.state.send_state == 'sent' and now >= self.state.send_state_until:
+            self.state.send_state = None
+            self.state.frame_dirty = True
+
+        # Update interval: faster during active pulse animation, slower when idle
+        pulse_active = (self.state.last_message_time > 0 and
+                       now - self.state.last_message_time < 5.0)
+        update_interval = 0.1 if pulse_active else 0.5
+
+        if now - self.last_status_update >= update_interval:
+            # Check if sync subprocess finished (non-blocking)
+            if self.sync_proc and self.sync_proc.poll() is not None:
+                if self.sync_proc.returncode == 0:
+                    self.state.frame_dirty = True  # New data arrived
+                self.sync_proc = None
+
+            # Start sync subprocess if no enabled instances and not already running
+            enabled_count = sum(1 for i in self.state.instances.values() if i.get('enabled'))
+            if enabled_count == 0 and self.sync_proc is None:
+                try:
+                    from ..relay import is_relay_enabled
+                    if is_relay_enabled():  # Only if relay configured AND enabled
+                        self.sync_proc = subprocess.Popen(
+                            [sys.executable, '-m', 'hcom', 'relay', 'poll', '25'],
+                            stdout=subprocess.DEVNULL,
+                            stderr=subprocess.DEVNULL,
+                        )
+                except Exception:
+                    pass  # Ignore sync errors
+
             self.load_status()
             self.last_status_update = now
             self.state.frame_dirty = True
@@ -549,6 +666,7 @@ class HcomTUI:
         # Clear pending toggle after timeout
         if self.state.pending_toggle and (now - self.state.pending_toggle_time) > self.CONFIRMATION_TIMEOUT:
             self.state.pending_toggle = None
+            self.state.show_instance_detail = None
             self.state.frame_dirty = True
 
         # Clear completed toggle display after 2s (match flash default)
@@ -566,14 +684,10 @@ class HcomTUI:
             self.state.pending_reset = False
             self.state.frame_dirty = True
 
-        # Periodic config reload check (only in Launch mode)
-        if self.mode == Mode.LAUNCH:
-            if not hasattr(self, 'last_config_check'):
-                self.last_config_check = 0.0
-
-            if (now - self.last_config_check) >= 0.5:
-                self.last_config_check = now
-                self.check_external_config_changes()
+        # Periodic config reload check (detects external changes from CLI, editor, etc.)
+        if (now - self.last_config_check) >= 0.5:
+            self.last_config_check = now
+            self.check_external_config_changes()
 
         # Load messages for MANAGE screen preview (with event ID caching)
         if self.mode == Mode.MANAGE:
@@ -582,18 +696,23 @@ class HcomTUI:
 
             try:
                 current_max_id = get_last_event_id()
+                # Detect external reset: max ID dropped means DB was cleared
+                if current_max_id < self.state.last_event_id:
+                    self.state.messages = []
+                    self.state.last_event_id = 0
+                    self.state.frame_dirty = True
                 if current_max_id != self.state.last_event_id:
                     events = get_events_since(self.state.last_event_id, event_type='message')
                     new_messages = []
                     for e in events:
                         event_data = e['data']  # Already a dict from db.py
-                        # Include recipients and event_id for read receipt tracking
-                        recipients = event_data.get('recipients', [])
+                        # Include delivered_to and event_id for read receipt tracking
+                        delivered_to = event_data.get('delivered_to', [])
                         new_messages.append((
                             e['timestamp'],
                             event_data.get('from', ''),
                             event_data.get('text', ''),
-                            recipients,
+                            delivered_to,
                             e['id']  # event_id for read receipt lookup
                         ))
 
@@ -601,16 +720,11 @@ class HcomTUI:
                     all_messages = list(self.state.messages) + new_messages
                     self.state.messages = all_messages[-MESSAGE_PREVIEW_LIMIT:] if len(all_messages) > MESSAGE_PREVIEW_LIMIT else all_messages
 
-                    # Update last message time for LOG tab pulse
+                    # Update last message time for EVENTS tab pulse
                     if all_messages:
                         last_msg_timestamp = all_messages[-1][0]
-                        try:
-                            from datetime import datetime
-                            if 'T' in last_msg_timestamp:
-                                dt = datetime.fromisoformat(last_msg_timestamp.replace('Z', '+00:00'))
-                                self.state.last_message_time = dt.timestamp()
-                        except Exception:
-                            self.state.last_message_time = 0.0
+                        dt = parse_iso_timestamp(last_msg_timestamp) if 'T' in last_msg_timestamp else None
+                        self.state.last_message_time = dt.timestamp() if dt else 0.0
                     else:
                         self.state.last_message_time = 0.0
 
@@ -621,16 +735,16 @@ class HcomTUI:
                 self.flash_error(f"Message load failed: {e}", duration=5.0)
 
     def build_status_bar(self, highlight_tab: str | None = None) -> str:
-        """Build status bar with tabs - shared by TUI header and native log view
+        """Build status bar with tabs - shared by TUI header and native events view
         Args:
-            highlight_tab: Which tab to highlight ("MANAGE", "LAUNCH", or "LOG")
+            highlight_tab: Which tab to highlight ("MANAGE", "LAUNCH", or "EVENTS")
                           If None, uses self.mode
         """
         # Determine which tab to highlight
         if highlight_tab is None:
             highlight_tab = self.mode.value.upper()
 
-        # Calculate message pulse colors for LOG tab
+        # Calculate message pulse colors for EVENTS tab
         if self.state.last_message_time > 0:
             seconds_since_msg = time.time() - self.state.last_message_time
         else:
@@ -655,16 +769,16 @@ class HcomTUI:
                     part = f"{text_color}{BOLD}{color} {count} {symbol} {RESET}"
                 status_parts.append(part)
 
-        # No instances - use orange if selected, charcoal if not
+        # No instances - show MANAGE text instead of 0
         if status_parts:
             status_display = "".join(status_parts)
         elif is_manage_selected:
-            status_display = f"{FG_BLACK}{BOLD}{BG_ORANGE}  0  {RESET}"
+            status_display = f"{FG_BLACK}{BOLD}{BG_ORANGE} MANAGE {RESET}"
         else:
-            status_display = f"{BG_CHARCOAL}{FG_WHITE}  0  {RESET}"
+            status_display = f"{BG_CHARCOAL}{FG_WHITE} MANAGE {RESET}"
 
-        # Build tabs: MANAGE, LAUNCH, and LOG (LOG only shown in native view)
-        tab_names = ["MANAGE", "LAUNCH", "LOG"]
+        # Build tabs: MANAGE, LAUNCH, and EVENTS (EVENTS only shown in native view)
+        tab_names = ["MANAGE", "LAUNCH", "EVENTS"]
         tabs = []
 
         for tab_name in tab_names:
@@ -676,13 +790,13 @@ class HcomTUI:
 
             # Highlight current tab (non-MANAGE tabs get orange bg)
             if tab_name == highlight_tab and tab_name != "MANAGE":
-                # Selected tab: always orange bg + black fg (LOG and LAUNCH same)
+                # Selected tab: always orange bg + black fg (EVENTS and LAUNCH same)
                 tabs.append(f"{BG_ORANGE}{FG_BLACK}{BOLD} {label} {RESET}")
             elif tab_name == "MANAGE":
                 # MANAGE tab is just status blocks (already has color/bg)
                 tabs.append(f" {label}")
-            elif tab_name == "LOG":
-                # LOG tab when not selected: use pulse colors (white→charcoal fade)
+            elif tab_name == "EVENTS":
+                # EVENTS tab when not selected: use pulse colors (white→charcoal fade)
                 tabs.append(f"{log_bg_color}{log_fg_color} {label} {RESET}")
             else:
                 # LAUNCH when not selected: charcoal bg (milder than black)
@@ -690,7 +804,22 @@ class HcomTUI:
 
         tab_display = " ".join(tabs)
 
-        return f"{BOLD}hcom{RESET} {tab_display}"
+        # Relay indicator - only show if configured AND enabled
+        relay_indicator = ""
+        if self.state.relay_configured and self.state.relay_enabled:
+            if self.state.relay_status == 'error':
+                icon = f"{FG_RED}⇄{RESET}"
+                err = self.state.relay_error
+                relay_indicator = f" {icon} {err}" if err else f" {icon}"
+            elif self.state.relay_status == 'ok':
+                icon = f"{FG_GREEN}⇄{RESET}"
+                relay_indicator = f" {icon}"
+            else:
+                # Never connected yet
+                icon = f"{FG_GRAY}⇄{RESET}"
+                relay_indicator = f" {icon}"
+
+        return f"{BOLD}hcom{RESET} {tab_display}{relay_indicator}"
 
     def build_flash(self) -> Optional[str]:
         """Build flash notification if active"""
@@ -730,11 +859,11 @@ class HcomTUI:
             # Flash message on left, separator line fills rest of row
             flash_len = ansi_len(flash)
             remaining = cols - flash_len - 1  # -1 for space
-            separator = f"{FG_GRAY}{'─' * remaining}{RESET}" if remaining > 0 else ""
-            frame.append(f"{flash} {separator}")
+            sep = separator_line(remaining) if remaining > 0 else ""
+            frame.append(f"{flash} {sep}")
         else:
             # Just separator line when no flash message
-            frame.append(f"{FG_GRAY}{'─' * cols}{RESET}")
+            frame.append(separator_line(cols))
 
         # Welcome message on first render
         if self.first_render:
@@ -789,15 +918,15 @@ class HcomTUI:
             self.mode = Mode.LAUNCH
             self.flash("Launch Instances")
         elif self.mode == Mode.LAUNCH:
-            # Go directly to native log view instead of LOG mode
+            # Go directly to native events view instead of alternate mode
             self.flash(f"Event History {RESET}{FG_ORANGE}- type to filter")
-            self.show_log_native()
+            self.show_events_native()
             # After returning from native view, go to MANAGE
             self.mode = Mode.MANAGE
             self.flash("Manage Instances")
 
-    def format_multiline_log(self, display_time: str, sender: str, message: str, type_prefix: str = '', sender_padded: str = '') -> List[str]:
-        """Format log message with multiline support (indented continuation lines)
+    def format_multiline_event(self, display_time: str, sender: str, message: str, type_prefix: str = '', sender_padded: str = '') -> List[str]:
+        """Format event with multiline support (indented continuation lines)
         Format: time name: [type] content
         """
         display_sender = sender_padded if sender_padded else sender
@@ -814,20 +943,7 @@ class HcomTUI:
         result.extend(indent + line for line in lines[1:])
         return result
 
-    def render_log_message(self, msg: dict):
-        """Render a single log message (extracted helper)"""
-        time_str = msg.get('timestamp', '')
-        sender = msg.get('from', '')
-        message = msg.get('message', '')
-        type_prefix = msg.get('type_prefix', '')
-        sender_padded = msg.get('from_padded', '')
-        display_time = format_timestamp(time_str)
-
-        for line in self.format_multiline_log(display_time, sender, message, type_prefix, sender_padded):
-            print(line)
-        print()  # Empty line between messages
-
-    def render_status_with_separator(self, highlight_tab: str = "LOG"):
+    def render_status_with_separator(self, highlight_tab: str = "EVENTS"):
         """Render separator line and status bar (extracted helper)"""
         cols, _ = get_terminal_size()
 
@@ -836,10 +952,10 @@ class HcomTUI:
         if flash:
             flash_len = ansi_len(flash)
             remaining = cols - flash_len - 1
-            separator = f"{FG_GRAY}{'─' * remaining}{RESET}" if remaining > 0 else ""
-            print(f"{flash} {separator}")
+            sep = separator_line(remaining) if remaining > 0 else ""
+            print(f"{flash} {sep}")
         else:
-            print(f"{FG_GRAY}{'─' * cols}{RESET}")
+            print(separator_line(cols))
 
         # Status line
         safe_width = cols - 2
@@ -909,15 +1025,13 @@ class HcomTUI:
         type_label = type_labels.get(event_type, event_type)
 
         if event_type == 'message':
-            # Format: time name: [message] content
-            msg = {
-                'timestamp': timestamp,
-                'from': data.get('from', '?'),
-                'message': data.get('text', ''),
-                'type_prefix': f"{FG_GRAY}[{type_label}]{RESET} ",
-                'from_padded': instance
-            }
-            self.render_log_message(msg)
+            # Format: time name [message]\ncontent
+            sender = data.get('from', '?')
+            message = data.get('text', '')
+            display_time = format_timestamp(timestamp)
+            print(f"{DIM}{FG_GRAY}{display_time}{RESET} {BOLD}{FG_ORANGE}{sender}{RESET} {FG_GRAY}[{type_label}]{RESET}")
+            print(message)
+            print()  # Empty line between events
 
         elif event_type == 'status':
             # Format: time name: [status] status, context
@@ -954,18 +1068,53 @@ class HcomTUI:
             import sys
             print(f"DEBUG: Render failed for event {event_id}: {e}", file=sys.stderr)
 
-    def show_log_native(self):
-        """Exit TUI, show streaming log in native buffer with filtering support"""
+    def _render_events_bottom(self, cols: int, matched: int, total: int, use_write: bool = False):
+        """Render bottom rows for events view (filter/separator + status bar)"""
+        filter_active = bool(self.state.event_filter.strip())
+
+        # First row: filter line or separator/flash
+        if filter_active:
+            filter_prefix = "Filter: "
+            available = cols - len(filter_prefix) - 20
+            filter_text = self.state.event_filter[:available] if len(self.state.event_filter) > available else self.state.event_filter
+            cursor_display = "_" if self.state.event_filter_cursor == len(self.state.event_filter) else ""
+            filter_display = filter_text[:self.state.event_filter_cursor] + cursor_display + filter_text[self.state.event_filter_cursor:]
+            count_str = f" [{matched}/{total}]"
+            first_line = truncate_ansi(f"{filter_prefix}{filter_display}{count_str}", cols)
+        else:
+            flash = self.build_flash()
+            if flash:
+                flash_len = ansi_len(flash)
+                remaining = cols - flash_len - 1
+                sep = separator_line(remaining) if remaining > 0 else ""
+                first_line = f"{flash} {sep}"
+            else:
+                first_line = separator_line(cols)
+
+        # Output first line
+        if use_write:
+            sys.stdout.write(first_line + '\n')
+        else:
+            print(first_line)
+
+        # Status bar with enter indicator and current type
+        type_suffix = f" {DIM}[ ↵ {self.state.event_type_filter} ]{RESET}"
+        status = self.build_status_bar(highlight_tab="EVENTS") + type_suffix
+        sys.stdout.write(truncate_ansi(status, cols))
+        sys.stdout.flush()
+
+    def show_events_native(self):
+        """Exit TUI, show streaming events in native buffer with filtering support"""
         # Clear filter on entry (fresh start each time)
-        self.state.log_filter = ""
-        self.state.log_filter_cursor = 0
+        self.state.event_filter = ""
+        self.state.event_filter_cursor = 0
 
         # Exit alt screen
         sys.stdout.write('\033[?1049l' + SHOW_CURSOR)
         sys.stdout.flush()
 
         def redraw_all():
-            """Redraw entire log with filtering (on entry or resize)"""
+            """Redraw entire event list with filtering (on entry or resize)"""
             from ..core.db import get_events_since, get_last_event_id
 
             # Clear screen
@@ -981,7 +1130,7 @@ class HcomTUI:
                 # Get all messages matching current filter
                 # Note: We use a fresh query here to ensure we have everything
                 # even if the incremental updates missed something
-                event_type = None if self.state.log_event_type == "all" else self.state.log_event_type
+                event_type = None if self.state.event_type_filter == "all" else self.state.event_type_filter
                 events = get_events_since(0, event_type=event_type)
                 total_count = len(events)
                 has_events = bool(events)
@@ -989,12 +1138,12 @@ class HcomTUI:
                 if events:
                     # Filter and render all matching events
                     for event in events:
-                        if self.matches_filter_safe(event, self.state.log_filter):
+                        if self.matches_filter_safe(event, self.state.event_filter):
                             self.render_event_safe(event)
                             matched_count += 1
 
                     # Show message if no matches when filtering
-                    if matched_count == 0 and self.state.log_filter.strip():
+                    if matched_count == 0 and self.state.event_filter.strip():
                         print(f"{FG_GRAY}(no matching events){RESET}")
                         print()
                 else:
@@ -1013,42 +1162,14 @@ class HcomTUI:
             sys.stdout.write(f'\033[{target_row};1H')  # Move to target row, column 1
             sys.stdout.flush()
 
-            # Render bottom rows (filter + status or separator + status)
-            filter_active = bool(self.state.log_filter.strip())
-
-            if filter_active:
-                # Filter row: "Filter: query_    [matched/total]"
-                filter_prefix = "Filter: "
-                available = cols - len(filter_prefix) - 20  # Reserve space for count
-                filter_text = self.state.log_filter[:available] if len(self.state.log_filter) > available else self.state.log_filter
-                cursor_display = "_" if self.state.log_filter_cursor == len(self.state.log_filter) else ""
-                filter_display = filter_text[:self.state.log_filter_cursor] + cursor_display + filter_text[self.state.log_filter_cursor:]
-                count_str = f" [{matched_count}/{total_count}]"
-                filter_line = f"{filter_prefix}{filter_display}{count_str}"
-                print(truncate_ansi(filter_line, cols))
-            else:
-                # Separator or flash line (when not filtering)
-                flash = self.build_flash()
-                if flash:
-                    flash_len = ansi_len(flash)
-                    remaining = cols - flash_len - 1
-                    separator = f"{FG_GRAY}{'─' * remaining}{RESET}" if remaining > 0 else ""
-                    print(f"{flash} {separator}")
-                else:
-                    print(f"{FG_GRAY}{'─' * cols}{RESET}")
-
-            # Status bar with enter indicator and current type
-            type_suffix = f" {DIM}[ ↵ {self.state.log_event_type} ]{RESET}"
-            status = self.build_status_bar(highlight_tab="LOG") + type_suffix
-            sys.stdout.write(truncate_ansi(status, cols))
-            sys.stdout.flush()
+            # Render bottom rows
+            self._render_events_bottom(cols, matched_count, total_count)
 
             return get_last_event_id(), cols, matched_count, total_count
 
         # Initial draw
         last_pos, last_width, last_matched, last_total = redraw_all()
         last_status_update = time.time()
-        has_events_state = last_pos > 0
 
         with KeyboardInput() as kbd:
             while True:
@@ -1062,41 +1183,37 @@ class HcomTUI:
                 # Enter cycles event types (all → message → status → life → all)
                 elif key == 'ENTER':
                     cycle = {"all": "message", "message": "status", "status": "life", "life": "all"}
-                    self.state.log_event_type = cycle[self.state.log_event_type]
+                    self.state.event_type_filter = cycle[self.state.event_type_filter]
                     last_pos, last_width, last_matched, last_total = redraw_all()
-                    has_events_state = last_pos > 0
 
                 # ESC clears filter
                 elif key == 'ESC':
-                    if self.state.log_filter:
-                        self.state.log_filter = ""
-                        self.state.log_filter_cursor = 0
+                    if self.state.event_filter:
+                        self.state.event_filter = ""
+                        self.state.event_filter_cursor = 0
                         last_pos, last_width, last_matched, last_total = redraw_all()
-                        has_events_state = last_pos > 0
 
                 # Backspace deletes char
                 elif key == 'BACKSPACE':
-                    if self.state.log_filter and self.state.log_filter_cursor > 0:
-                        self.state.log_filter = (
-                            self.state.log_filter[:self.state.log_filter_cursor-1] +
-                            self.state.log_filter[self.state.log_filter_cursor:]
+                    if self.state.event_filter and self.state.event_filter_cursor > 0:
+                        self.state.event_filter = (
+                            self.state.event_filter[:self.state.event_filter_cursor-1] +
+                            self.state.event_filter[self.state.event_filter_cursor:]
                         )
-                        self.state.log_filter_cursor -= 1
+                        self.state.event_filter_cursor -= 1
                         last_pos, last_width, last_matched, last_total = redraw_all()
-                        has_events_state = last_pos > 0
 
                 # Printable chars: type-to-activate filtering
                 elif key and len(key) == 1 and key.isprintable():
                     sanitized = self.sanitize_filter_input(key)
                     if sanitized:
-                        self.state.log_filter = (
-                            self.state.log_filter[:self.state.log_filter_cursor] +
+                        self.state.event_filter = (
+                            self.state.event_filter[:self.state.event_filter_cursor] +
                             sanitized +
-                            self.state.log_filter[self.state.log_filter_cursor:]
+                            self.state.event_filter[self.state.event_filter_cursor:]
                         )
-                        self.state.log_filter_cursor += len(sanitized)
+                        self.state.event_filter_cursor += len(sanitized)
                         last_pos, last_width, last_matched, last_total = redraw_all()
-                        has_events_state = last_pos > 0
 
                 # Update status periodically
                 now = time.time()
@@ -1107,39 +1224,10 @@ class HcomTUI:
                     # Check if resize requires redraw
                     if current_cols != last_width:
                         last_pos, last_width, last_matched, last_total = redraw_all()
-                        has_events_state = last_pos > 0
                     else:
                         # Just update status line
-                        filter_active = bool(self.state.log_filter.strip())
-                        n_rows = 2  # Both modes have 2 rows (filter/separator + status)
-                        sys.stdout.write('\r' + '\033[A\033[K' * (n_rows - 1))
-
-                        # Re-render bottom rows
-                        if filter_active:
-                            filter_prefix = "Filter: "
-                            available = current_cols - len(filter_prefix) - 20
-                            filter_text = self.state.log_filter[:available] if len(self.state.log_filter) > available else self.state.log_filter
-                            cursor_display = "_" if self.state.log_filter_cursor == len(self.state.log_filter) else ""
-                            filter_display = filter_text[:self.state.log_filter_cursor] + cursor_display + filter_text[self.state.log_filter_cursor:]
-                            count_str = f" [{last_matched}/{last_total}]"
-                            filter_line = f"{filter_prefix}{filter_display}{count_str}"
-                            sys.stdout.write(truncate_ansi(filter_line, current_cols) + '\n')
-                        else:
-                            # Separator or flash line
-                            flash = self.build_flash()
-                            if flash:
-                                flash_len = ansi_len(flash)
-                                remaining = current_cols - flash_len - 1
-                                separator = f"{FG_GRAY}{'─' * remaining}{RESET}" if remaining > 0 else ""
-                                sys.stdout.write(f"{flash} {separator}\n")
-                            else:
-                                sys.stdout.write(f"{FG_GRAY}{'─' * current_cols}{RESET}\n")
-
-                        # Status bar with enter indicator and current type
-                        type_suffix = f" {DIM}[ ↵ {self.state.log_event_type} ]{RESET}"
-                        status = self.build_status_bar(highlight_tab="LOG") + type_suffix
-                        sys.stdout.write(truncate_ansi(status, current_cols))
-                        sys.stdout.flush()
+                        sys.stdout.write('\r' + '\033[A\033[K')  # Move up 1 row, clear
+                        self._render_events_bottom(current_cols, last_matched, last_total, use_write=True)
 
                     last_status_update = now
                     last_width = current_cols
@@ -1150,22 +1238,20 @@ class HcomTUI:
                 try:
                     current_max_id = get_last_event_id()
                     if current_max_id > last_pos:
-                        event_type = None if self.state.log_event_type == "all" else self.state.log_event_type
+                        event_type = None if self.state.event_type_filter == "all" else self.state.event_type_filter
                         events = get_events_since(last_pos, event_type=event_type)
 
                         if events:
                             # Count new matches
                             new_matches = []
                             for event in events:
-                                if self.matches_filter_safe(event, self.state.log_filter):
+                                if self.matches_filter_safe(event, self.state.event_filter):
                                     new_matches.append(event)
 
                             if new_matches:
-                                # Clear bottom rows (always 2 rows: filter/separator + status)
-                                filter_active = bool(self.state.log_filter.strip())
+                                # Clear bottom rows and render new events
                                 sys.stdout.write('\r\033[A\033[K\n\033[K\033[A\r')
 
-                                # Render new matching events
                                 for event in new_matches:
                                     self.render_event_safe(event)
                                     last_matched += 1
@@ -1174,33 +1260,7 @@ class HcomTUI:
 
                                 # Re-render bottom rows
                                 cols, _ = get_terminal_size()
-                                if filter_active:
-                                    filter_prefix = "Filter: "
-                                    available = cols - len(filter_prefix) - 20
-                                    filter_text = self.state.log_filter[:available] if len(self.state.log_filter) > available else self.state.log_filter
-                                    cursor_display = "_" if self.state.log_filter_cursor == len(self.state.log_filter) else ""
-                                    filter_display = filter_text[:self.state.log_filter_cursor] + cursor_display + filter_text[self.state.log_filter_cursor:]
-                                    count_str = f" [{last_matched}/{last_total}]"
-                                    filter_line = f"{filter_prefix}{filter_display}{count_str}"
-                                    print(truncate_ansi(filter_line, cols))
-                                else:
-                                    # Separator or flash line
-                                    flash = self.build_flash()
-                                    if flash:
-                                        flash_len = ansi_len(flash)
-                                        remaining = cols - flash_len - 1
-                                        separator = f"{FG_GRAY}{'─' * remaining}{RESET}" if remaining > 0 else ""
-                                        print(f"{flash} {separator}")
-                                    else:
-                                        print(f"{FG_GRAY}{'─' * cols}{RESET}")
-
-                                # Status bar with enter indicator and current type
-                                type_suffix = f" {DIM}[ ↵ {self.state.log_event_type} ]{RESET}"
-                                status = self.build_status_bar(highlight_tab="LOG") + type_suffix
-                                sys.stdout.write(truncate_ansi(status, cols))
-                                sys.stdout.flush()
-
-                                has_events_state = True
+                                self._render_events_bottom(cols, last_matched, last_total)
 
                         last_pos = current_max_id
                 except Exception as e:

@@ -1,129 +1,156 @@
-"""Hook dispatcher - single entry point with sys.exit"""
+"""Hook dispatcher - single entry point with clean parent/subagent separation"""
 from __future__ import annotations
 from typing import Any
 import sys
 import json
-import os
 import re
 
 from ..core.paths import ensure_hcom_directories
-from ..core.instances import load_instance_position, in_subagent_context, get_display_name
-from ..core.config import get_config
-from ..core.db import get_instance, find_instance_by_session, get_db
-from .handlers import (
-    handle_pretooluse, handle_posttooluse, handle_stop,
-    handle_subagent_stop, handle_userpromptsubmit,
-    handle_sessionstart, handle_sessionend, handle_notify,
-)
+from ..core.instances import load_instance_position
+from ..core.db import get_db, find_instance_by_session
+from . import subagent, parent
 from .utils import init_hook_context, log_hook_error
 
 
-def should_skip_vanilla_instance(hook_type: str, hook_data: dict) -> bool:
+def _auto_approve_hcom_bash(hook_data: dict[str, Any]) -> None:
+    """Auto-approve safe hcom bash commands (fast path, no instance needed).
+
+    Allows vanilla instances to run 'hcom start' and disabled instances to re-enable.
+    Exits if approved.
     """
-    Returns True if hook should exit early.
-    Vanilla instances (never opted in via previously_enabled) exit early unless:
-    - PreToolUse (handles auto-approval)
-    - HCOM-launched (opted in at launch)
-    - UserPromptSubmit with hcom command in prompt (shows preemptive bootstrap)
-    """
-    # PreToolUse always runs (auto-approval for hcom commands)
-    if hook_type == 'pre':
-        return False
+    tool_name = hook_data.get('tool_name', '')
+    if tool_name != 'Bash':
+        return
 
-    # HCOM-launched instances always run (opted in at launch)
-    if os.environ.get('HCOM_LAUNCHED') == '1':
-        return False
+    tool_input = hook_data.get('tool_input', {})
+    command = tool_input.get('command', '')
+    if not command:
+        return
 
-    # Get session_id
-    session_id = hook_data.get('session_id', '')
-    if not session_id:
-        return True  # No identity = skip
+    from ..shared import HCOM_COMMAND_PATTERN
+    from .utils import is_safe_hcom_command
 
-    # Check if instance exists
-    stored_name = find_instance_by_session(session_id)
-    if not stored_name:
-        # No instance = never opted in, skip all hooks
-        return True
-
-    # Instance exists - check if ever participated
-    instance_data = get_instance(stored_name)
-    if not instance_data:
-        return True  # Shouldn't happen, but defensive
-
-    # Check previously_enabled flag
-    if not instance_data.get('previously_enabled', False):
-        return True  # Never participated = skip
-
-    return False  # Participated before = run hook
+    matches = list(re.finditer(HCOM_COMMAND_PATTERN, command))
+    if matches and is_safe_hcom_command(command):
+        output = {
+            "hookSpecificOutput": {
+                "hookEventName": "PreToolUse",
+                "permissionDecision": "allow"
+            }
+        }
+        print(json.dumps(output, ensure_ascii=False))
+        sys.exit(0)
 
 
 def handle_hook(hook_type: str) -> None:
-    """Unified hook handler for all HCOM hooks"""
+    """Hook dispatcher with clean parent/subagent separation
+
+    Error handling strategy:
+    - Non-participants (no instance / disabled): exit 0 silently to avoid leaking errors
+      into normal Claude Code usage when user has hcom installed but not using it
+    - Participants (enabled): errors surface normally
+    """
+    # The try/except below is commented out during development to see errors.
+    # In production, it catches pre-gate errors (before we know if instance exists/enabled).
+
+    # try:
+    _handle_hook_impl(hook_type)
+    # except Exception as e:
+    #     # Pre-gate error (before instance context resolved) - must be silent
+    #     # because we don't know if user is even using hcom
+    #     log_hook_error(f'handle_hook:{hook_type}', e)
+    #     sys.exit(0)
+
+def _handle_hook_impl(hook_type: str) -> None:
+    """Hook dispatcher implementation"""
+
+    # ============ SETUP, LOAD, AUTO-APPROVE, SYNC (BOTH CONTEXTS) ============
+
     hook_data = json.load(sys.stdin)
+    tool_name = hook_data.get('tool_name', '')
+    session_id = hook_data.get('session_id')
 
     if not ensure_hcom_directories():
         log_hook_error('handle_hook', Exception('Failed to create directories'))
         sys.exit(0)
 
-    # Ensure database connection (runs schema/migrations on first use)
     get_db()
 
-    # SessionStart is standalone - no instance files
-    if hook_type == 'sessionstart':
-        handle_sessionstart(hook_data)
+    if hook_type == 'pre':
+        _auto_approve_hcom_bash(hook_data)
+
+    # ============ TASK TRANSITIONS (PARENT CONTEXT) ============
+
+    # Task start - enter subagent context
+    if hook_type == 'pre' and tool_name == 'Task':
+        parent.start_task(session_id, hook_data)
         sys.exit(0)
 
-    # Vanilla instance check - exit early if should skip
-    if should_skip_vanilla_instance(hook_type, hook_data):
+    # Task end (completed) - exit subagent context
+    if hook_type == 'post' and tool_name == 'Task':
+        parent.end_task(session_id, hook_data, interrupted=False)
         sys.exit(0)
 
-    # Initialize instance context (creates file if needed, reuses existing if session_id matches)
-    instance_name, updates, is_matched_resume = init_hook_context(hook_data, hook_type)
+    # Task end (interrupted) - exit subagent context
+    if subagent.in_subagent_context(session_id) and hook_type == 'userpromptsubmit':
+        parent.end_task(session_id, hook_data, interrupted=True)
+        # Fall through to parent handling
 
-    # Load instance data once (for enabled check and to pass to handlers)
-    instance_data = None
-    if hook_type != 'pre':
-        instance_data = load_instance_position(instance_name)
+    # ============ SUBAGENT INSTANCE HOOKS ============
 
-        # Skip enabled check for UserPromptSubmit when bootstrap needs to be shown
-        # (alias_announced=false means bootstrap hasn't been shown yet)
-        # Skip enabled check for PostToolUse when launch context needs to be shown
-        # Skip enabled check for PostToolUse in subagent context (need to deliver subagent messages)
-        # Skip enabled check for SubagentStop (resolves to parent name, but runs for subagents)
-        skip_enabled_check = (
-            (hook_type == 'userpromptsubmit' and not instance_data.get('alias_announced', False)) or
-            (hook_type == 'post' and not instance_data.get('launch_context_announced', False)) or
-            (hook_type == 'post' and in_subagent_context(instance_name)) or
-            (hook_type == 'subagent-stop')
-        )
+    # subagent gate 
+    if subagent.in_subagent_context(session_id):
 
-        if not skip_enabled_check:
-            # Skip vanilla instances (never participated)
-            if not instance_data.get('previously_enabled', False):
+        match hook_type:
+            case 'subagent-start':
+                agent_id = hook_data.get('agent_id')
+                agent_type = hook_data.get('agent_type')
+                subagent.track_subagent(session_id, agent_id, agent_type)
+                subagent.subagent_start(hook_data)
+                sys.exit(0)
+            case 'subagent-stop':
+                subagent.subagent_stop(hook_data)
+                sys.exit(0)
+            case 'post':
+                subagent.posttooluse(hook_data, '', None)
                 sys.exit(0)
 
-            # Skip exited instances - frozen until restart
-            status = instance_data.get('status')
-            status_context = instance_data.get('status_context', '')
-            if status == 'inactive' and status_context.startswith('exit:'):
-                # Exception: Allow Stop hook to run when re-enabled (transitions back to 'idle')
-                if not (hook_type == 'poll' and instance_data.get('enabled', False)):
-                    sys.exit(0)
+    # ============  PARENT INSTANCE HOOKS ============
+    else:
+        
+        if hook_type == 'sessionstart':
+            parent.sessionstart(hook_data)
+            sys.exit(0)
 
-    match hook_type:
-        case 'pre':
-            handle_pretooluse(hook_data, instance_name)
-        case 'post':
-            handle_posttooluse(hook_data, instance_name)
-        case 'poll':
-            handle_stop(hook_data, instance_name, updates, instance_data)
-        case 'subagent-stop':
-            handle_subagent_stop(hook_data, instance_name, updates, instance_data)
-        case 'notify':
-            handle_notify(hook_data, instance_name, updates, instance_data)
-        case 'userpromptsubmit':
-            handle_userpromptsubmit(hook_data, instance_name, updates, is_matched_resume, instance_data)
-        case 'sessionend':
-            handle_sessionend(hook_data, instance_name, updates)
+        # Resolve instance for parent hooks
+        instance_name, updates, is_matched_resume = init_hook_context(hook_data, hook_type)
+        instance_data = load_instance_position(instance_name)
+
+        # exists gate
+        if not instance_data:
+            sys.exit(0)
+
+        # Status-only for stop pending (disabled but awaiting exit)
+        if not instance_data.get('enabled') and instance_data.get('external_stop_pending'):
+            parent.handle_stop_pending(hook_type, hook_data, instance_name, instance_data)
+            sys.exit(0)
+
+        # enabled gate
+        if not instance_data.get('enabled', False):
+            sys.exit(0)
+
+        match hook_type:
+            case 'pre':
+                parent.pretooluse(hook_data, instance_name, tool_name)
+            case 'post':
+                parent.posttooluse(hook_data, instance_name, instance_data, updates)
+            case 'poll':
+                parent.stop(instance_name, instance_data)
+            case 'notify':
+                parent.notify(hook_data, instance_name, updates, instance_data)
+            case 'userpromptsubmit':
+                parent.userpromptsubmit(hook_data, instance_name, updates, is_matched_resume, instance_data)
+            case 'sessionend':
+                parent.sessionend(hook_data, instance_name, updates)
 
     sys.exit(0)

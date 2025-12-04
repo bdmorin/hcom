@@ -72,6 +72,9 @@ class HcomConfig:
     tag: str = ''
     agent: str = ''
     claude_args: str = ''
+    relay: str = ''
+    relay_token: str = ''
+    relay_enabled: bool = True
 
     def __post_init__(self):
         """Validate configuration on construction"""
@@ -153,6 +156,18 @@ class HcomConfig:
             except ValueError as e:
                 set_error('claude_args', f"claude_args contains invalid shell quoting: {e}")
 
+        # Validate relay (optional string - URL)
+        if not isinstance(self.relay, str):
+            set_error('relay', f"relay must be a string, got {type(self.relay).__name__}")
+
+        # Validate relay_token (optional string)
+        if not isinstance(self.relay_token, str):
+            set_error('relay_token', f"relay_token must be a string, got {type(self.relay_token).__name__}")
+
+        # Validate relay_enabled (boolean)
+        if not isinstance(self.relay_enabled, bool):
+            set_error('relay_enabled', f"relay_enabled must be a boolean, got {type(self.relay_enabled).__name__}")
+
         return errors
 
     @classmethod
@@ -219,6 +234,19 @@ class HcomConfig:
         if claude_args is not None:  # Allow empty string for claude_args (valid value)
             data['claude_args'] = claude_args
 
+        # Load relay string values
+        relay = get_var('HCOM_RELAY')
+        if relay is not None:  # Allow empty string for relay (valid value - means disabled)
+            data['relay'] = relay
+        relay_token = get_var('HCOM_RELAY_TOKEN')
+        if relay_token is not None:  # Allow empty string for token (valid value)
+            data['relay_token'] = relay_token
+
+        # Load relay_enabled (boolean - "0" or "1", default True)
+        relay_enabled_str = get_var('HCOM_RELAY_ENABLED')
+        if relay_enabled_str is not None:
+            data['relay_enabled'] = relay_enabled_str not in ('0', 'false', 'False', 'no', 'off')
+
         return cls(**data)  # Validation happens in __post_init__
 
 
@@ -243,6 +271,9 @@ def hcom_config_to_dict(config: HcomConfig) -> dict[str, str]:
         'HCOM_TAG': config.tag,
         'HCOM_AGENT': config.agent,
         'HCOM_CLAUDE_ARGS': config.claude_args,
+        'HCOM_RELAY': config.relay,
+        'HCOM_RELAY_TOKEN': config.relay_token,
+        'HCOM_RELAY_ENABLED': '1' if config.relay_enabled else '0',
     }
 
 
@@ -293,6 +324,12 @@ def dict_to_hcom_config(data: dict[str, str]) -> HcomConfig:
         kwargs['agent'] = data['HCOM_AGENT']
     if 'HCOM_CLAUDE_ARGS' in data:
         kwargs['claude_args'] = data['HCOM_CLAUDE_ARGS']
+    if 'HCOM_RELAY' in data:
+        kwargs['relay'] = data['HCOM_RELAY']
+    if 'HCOM_RELAY_TOKEN' in data:
+        kwargs['relay_token'] = data['HCOM_RELAY_TOKEN']
+    if 'HCOM_RELAY_ENABLED' in data:
+        kwargs['relay_enabled'] = data['HCOM_RELAY_ENABLED'] not in ('0', 'false', 'False', 'no', 'off')
 
     if errors:
         raise HcomConfigError(errors)

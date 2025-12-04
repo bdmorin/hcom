@@ -16,6 +16,7 @@ HOOK_CONFIGS = [
     ('PreToolUse', 'Bash|Task', 'pre', None),
     ('PostToolUse', '', 'post', 86400),
     ('Stop', '', 'poll', 86400),          # Poll for messages (24hr max timeout)
+    ('SubagentStart', '', 'subagent-start', None),  # Subagent birth hook (test)
     ('SubagentStop', '', 'subagent-stop', 86400),  # Subagent coordination (24hr max)
     ('Notification', '', 'notify', None),
     ('SessionEnd', '', 'sessionend', None),

@@ -36,8 +36,7 @@ from .core.messages import (
 # Commands (for TUI to call directly)
 from .commands.admin import (
     cmd_reset,
-    cmd_watch,
-    should_show_in_watch,
+    cmd_events,
 )
 from .commands.lifecycle import (
     cmd_launch,
@@ -84,8 +83,7 @@ __all__ = [
     'cmd_stop',
     'cmd_send',
     'cmd_reset',
-    'cmd_watch',
-    'should_show_in_watch',
+    'cmd_events',
     # Terminal
     'list_available_agents',
     # Shared

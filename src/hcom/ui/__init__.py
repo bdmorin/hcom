@@ -2,11 +2,12 @@
 from pathlib import Path
 from .types import Field, Mode, LaunchField, UIState
 from .rendering import (
-    ANSI_RE,
+    ANSI_RE, MAX_INPUT_ROWS,
     ansi_len, ansi_ljust, bg_ljust, truncate_ansi,
     get_terminal_size, get_message_pulse_colors,
     smart_truncate_name, AnsiTextWrapper,
-    ease_out_quad, interpolate_color_index
+    ease_out_quad, interpolate_color_index,
+    separator_line,
 )
 from .input import (
     KeyboardInput,
@@ -16,8 +17,7 @@ from .input import (
     text_input_move_right,
     calculate_text_input_rows,
     render_text_input,
-    MAX_INPUT_ROWS,
-    IS_WINDOWS
+    IS_WINDOWS,
 )
 
 # UI-specific colors
@@ -70,6 +70,18 @@ CONFIG_FIELD_OVERRIDES = {
         'options': lambda: list_available_agents(),
         'hint': '←→ cycle options',
     },
+    'HCOM_RELAY': {
+        'type': 'text',
+        'hint': 'relay server URL',
+    },
+    'HCOM_RELAY_TOKEN': {
+        'type': 'text',
+        'hint': 'auth token for relay',
+    },
+    'HCOM_RELAY_ENABLED': {
+        'type': 'checkbox',
+        'hint': 'enter to toggle',
+    },
 }
 
 from .tui import HcomTUI
@@ -87,10 +99,11 @@ __all__ = [
     # Config
     'CONFIG_DEFAULTS', 'CONFIG_FIELD_OVERRIDES',
     # Rendering
-    'ANSI_RE', 'ansi_len', 'ansi_ljust', 'bg_ljust', 'truncate_ansi',
+    'ANSI_RE', 'MAX_INPUT_ROWS', 'ansi_len', 'ansi_ljust', 'bg_ljust', 'truncate_ansi',
     'get_terminal_size', 'get_message_pulse_colors',
     'smart_truncate_name', 'AnsiTextWrapper',
     'ease_out_quad', 'interpolate_color_index',
+    'separator_line',
     # Input
     'KeyboardInput',
     'text_input_insert',
@@ -99,8 +112,7 @@ __all__ = [
     'text_input_move_right',
     'calculate_text_input_rows',
     'render_text_input',
-    'MAX_INPUT_ROWS',
     'IS_WINDOWS',
     # Public API
-    'run_tui'
+    'run_tui',
 ]

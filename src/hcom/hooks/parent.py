@@ -1,55 +1,328 @@
 """Parent instance hook implementations"""
 from __future__ import annotations
 from typing import Any
-from pathlib import Path
 import sys
 import os
 import time
 import json
 
 from ..shared import HCOM_INVOCATION_PATTERN
-from ..core.paths import hcom_path
 from ..core.instances import (
-    load_instance_position, update_instance_position, set_status,
-    in_subagent_context
+    load_instance_position, update_instance_position, set_status, parse_running_tasks
 )
 from ..core.config import get_config
 
-from .relay import (
-    setup_subagent_identity,
-    cleanup_orphaned_subagents,
-    handle_task_completion
-)
+from .family import check_external_stop_notification
+from ..core.db import get_db, get_events_since
 
 from .utils import (
-    build_hcom_bootstrap_text, build_launch_context,
+    build_hcom_bootstrap_text, build_launch_context, build_hcom_command,
     disable_instance, log_hook_error, notify_instance
 )
 
 
-def update_status(instance_name: str, tool_name: str) -> None:
-    """Update parent status"""
+def handle_stop_pending(hook_type: str, hook_data: dict[str, Any], instance_name: str, instance_data: dict[str, Any]) -> None:
+    """Handle status-only updates for external stop pending instances.
+
+    Called by dispatcher for disabled instances with external_stop_pending=True.
+    Allows tracking instance activity between external stop and actual session end.
+    """
+    tool_name = hook_data.get('tool_name', '')
+
+    match hook_type:
+        case 'pre':
+            set_status(instance_name, 'active', f'tool:{tool_name}')
+        case 'post':
+            if instance_data.get('status') == 'blocked':
+                set_status(instance_name, 'active', f'approved:{tool_name}')
+        case 'notify':
+            message = hook_data.get('message', '')
+            if not (message == "Claude is waiting for your input" and instance_data.get('status') == 'idle'):
+                set_status(instance_name, 'blocked', message)
+        case 'poll':
+            stop(instance_name, instance_data)
+        case 'sessionend':
+            set_status(instance_name, 'inactive', f'exit:{hook_data.get("reason", "unknown")}')
+            update_instance_position(instance_name, {'session_ended': True, 'external_stop_pending': False})
+            notify_instance(instance_name)
+
+
+def sessionstart(hook_data: dict[str, Any]) -> None:
+    """Parent SessionStart: write session ID to env file, create instance for HCOM-launched, show initial msg"""
+    # Write session ID to CLAUDE_ENV_FILE for automatic identity resolution
+    # NOTE: CLAUDE_ENV_FILE only works on Unix (Claude Code doesn't source it on Windows).
+    # Windows vanilla instances must use MAPID fallback for identity resolution.
+    # Windows HCOM-launched instances get HCOM_LAUNCH_TOKEN via launch env.
+    session_id = hook_data.get('session_id')
+    env_file = os.environ.get('CLAUDE_ENV_FILE')
+
+    if session_id and env_file:
+        try:
+            with open(env_file, 'a', newline='\n') as f:
+                f.write(f'\nexport HCOM_SESSION_ID={session_id}\n')
+        except Exception:
+            # Fail silently - hook safety
+            pass
+
+    # Store MAPID → session_id mapping for Windows bash command identity resolution
+    from ..shared import MAPID
+    if session_id and MAPID:
+        try:
+            from ..core.db import get_db
+            conn = get_db()
+            conn.execute(
+                "INSERT OR REPLACE INTO mapid_sessions (mapid, session_id, updated_at) VALUES (?, ?, ?)",
+                (MAPID, session_id, time.time())
+            )
+            conn.commit()
+        except Exception:
+            # Fail silently - hook safety
+            pass
+
+    # Create instance for HCOM-launched (explicit opt-in via launch)
+    if os.environ.get('HCOM_LAUNCHED') == '1' and session_id:
+        try:
+            from ..core.instances import resolve_instance_name, initialize_instance_in_position_file
+            # Use resolve_instance_name for collision handling (not get_display_name)
+            instance_name, _ = resolve_instance_name(session_id, get_config().tag)
+            initialize_instance_in_position_file(
+                instance_name,
+                session_id=session_id,
+                mapid=MAPID,
+                enabled=True  # HCOM-launched = opted in
+            )
+        except Exception as e:
+            log_hook_error('sessionstart:create_instance', e)
+
+    # Pull remote events on session start (catch up on messages)
+    try:
+        from ..relay import pull
+        pull()
+    except Exception:
+        pass  # Silent failure - don't break hook
+
+    # Only show message for HCOM-launched instances
+    if os.environ.get('HCOM_LAUNCHED') == '1':
+        parts = f"[HCOM is started, you can send messages with the command: {build_hcom_command()} send]"
+    else:
+        parts = f"[You can start HCOM with the command: {build_hcom_command()} start]"
+
+    output = {
+        "hookSpecificOutput": {
+            "hookEventName": "SessionStart",
+            "additionalContext": parts
+        }
+    }
+
+    print(json.dumps(output))
+
+
+def start_task(session_id: str, hook_data: dict[str, Any]) -> None:
+    """Task started - enter subagent context
+
+    Creates parent instance if doesn't exist.
+    """
+    from ..core.db import find_instance_by_session
+
+    # Resolve or create parent instance
+    instance_name = find_instance_by_session(session_id)
+    if not instance_name:
+        # Create minimal parent instance (enabled=False) for tracking
+        from ..core.instances import resolve_instance_name, initialize_instance_in_position_file
+        instance_name, _ = resolve_instance_name(session_id, get_config().tag)
+        initialize_instance_in_position_file(
+            instance_name,
+            session_id=session_id,
+            enabled=False
+        )
+
+    # Set active flag (track_subagent will append to subagents array)
+    # Don't reset subagents array here - multiple parallel Tasks would overwrite each other
+    instance_data = load_instance_position(instance_name)
+    running_tasks = parse_running_tasks(instance_data.get('running_tasks', ''))
+    running_tasks['active'] = True
+    update_instance_position(instance_name, {'running_tasks': json.dumps(running_tasks)})
+
+    # Set status for enabled instances only
+    instance_data = load_instance_position(instance_name)
+    if instance_data and instance_data.get('enabled', False):
+        set_status(instance_name, 'active', 'tool:Task')
+
+
+def end_task(session_id: str, hook_data: dict[str, Any], interrupted: bool = False) -> None:
+    """Task ended - exit subagent context, optionally deliver freeze messages
+
+    Args:
+        session_id: Parent's session ID
+        hook_data: Hook data from dispatcher
+        interrupted: True if Task was interrupted (no message delivery), False for normal completion
+    """
+    from ..core.db import find_instance_by_session
+
+    # Resolve parent instance name
+    instance_name = find_instance_by_session(session_id)
+    if not instance_name:
+        return
+
+    instance_data = load_instance_position(instance_name)
+    if not instance_data:
+        return
+
+    if not interrupted:
+        # Completed: deliver freeze messages (last_event_id handles deduplication for parallel Tasks)
+        freeze_event_id = instance_data.get('last_event_id', 0)
+        last_event_id = _deliver_freeze_messages(instance_name, freeze_event_id)
+        update_instance_position(instance_name, {'last_event_id': last_event_id})
+    else:
+        # Interrupted: disable tracked subagents and clear running_tasks
+        _disable_tracked_subagents(instance_name, instance_data)
+        update_instance_position(instance_name, {'running_tasks': ''})
+
+
+def _disable_tracked_subagents(instance_name: str, instance_data: dict[str, Any]) -> None:
+    """Disable subagents in running_tasks with exit:interrupted"""
+    running_tasks_json = instance_data.get('running_tasks', '')
+    if not running_tasks_json:
+        return
+
+    try:
+        running_tasks = json.loads(running_tasks_json)
+        subagents = running_tasks.get('subagents', []) if isinstance(running_tasks, dict) else []
+    except json.JSONDecodeError:
+        return
+
+    if not subagents:
+        return
+
+    conn = get_db()
+    agent_id_map = {r['agent_id']: r['name'] for r in conn.execute(
+        "SELECT name, agent_id FROM instances WHERE parent_name = ?", (instance_name,)
+    ).fetchall() if r['agent_id']}
+
+    for entry in subagents:
+        if (aid := entry.get('agent_id')) and (name := agent_id_map.get(aid)):
+            disable_instance(name, initiated_by='system', reason='exit:interrupted')
+            set_status(name, 'inactive', 'exit:interrupted')
+
+
+def _deliver_freeze_messages(instance_name: str, freeze_event_id: int) -> int:
+    """Deliver messages from Task freeze period
+
+    Returns the last event ID processed (for updating parent position).
+    """
+    from ..core.messages import should_deliver_message
+
+    # Query freeze period messages
+    events = get_events_since(freeze_event_id, event_type='message')
+
+    if not events:
+        return freeze_event_id
+
+    # Determine last_event_id from events retrieved
+    last_id = max(e['id'] for e in events)
+
+    # Get subagents for message filtering
+    conn = get_db()
+    subagent_rows = conn.execute(
+        "SELECT name, agent_id FROM instances WHERE parent_name = ?",
+        (instance_name,)
+    ).fetchall()
+    subagent_names = [row['name'] for row in subagent_rows]
+
+    # Filter messages with scope validation
+    subagent_msgs = []
+    parent_msgs = []
+
+    for event in events:
+        event_data = event['data']
+
+        sender_name = event_data['from']
+
+        # Build message dict
+        msg = {
+            'timestamp': event['timestamp'],
+            'from': sender_name,
+            'message': event_data['text']
+        }
+
+        try:
+            # Messages FROM subagents
+            if sender_name in subagent_names:
+                subagent_msgs.append(msg)
+            # Messages TO subagents via scope routing
+            elif subagent_names and any(
+                should_deliver_message(event_data, name, sender_name) for name in subagent_names
+            ):
+                if msg not in subagent_msgs:  # Avoid duplicates
+                    subagent_msgs.append(msg)
+            # Messages TO parent via scope routing
+            elif should_deliver_message(event_data, instance_name, sender_name):
+                parent_msgs.append(msg)
+        except (ValueError, KeyError) as e:
+            # ValueError: corrupt message data
+            # KeyError: old message format missing 'scope' field
+            # Only show error if instance is enabled (bypass path can run for disabled)
+            inst = load_instance_position(instance_name)
+            if inst and inst.get('enabled', False):
+                print(
+                    f"Error: Invalid message format in event {event['id']}: {e}. "
+                    f"Run 'hcom reset logs' to clear old/corrupt messages.",
+                    file=sys.stderr
+                )
+            continue
+
+    # Combine and format messages
+    all_relevant = subagent_msgs + parent_msgs
+    all_relevant.sort(key=lambda m: m['timestamp'])
+
+    if all_relevant:
+        formatted = '\n'.join(f"{msg['from']}: {msg['message']}" for msg in all_relevant)
+
+        # Format subagent list with agent_ids for correlation
+        subagent_list = ', '.join(
+            f"{row['name']} (agent_id: {row['agent_id']})" if row['agent_id'] else row['name']
+            for row in subagent_rows
+        ) if subagent_rows else 'none'
+
+        summary = (
+            f"[Task tool completed - Message history during Task tool]\n"
+            f"Subagents: {subagent_list}\n"
+            f"The following {len(all_relevant)} message(s) occurred:\n\n"
+            f"{formatted}\n\n"
+            f"[End of message history. Subagents have finished and are no longer active.]"
+        )
+
+        output = {
+            "systemMessage": "[Task subagent messages shown to instance]",
+            "hookSpecificOutput": {
+                "hookEventName": "PostToolUse",
+                "additionalContext": summary
+            }
+        }
+        print(json.dumps(output, ensure_ascii=False))
+
+    return last_id
+
+
+def pretooluse(_hook_data: dict[str, Any], instance_name: str, tool_name: str) -> None:
+    """Parent PreToolUse: status tracking only (Task creation in dispatcher)
+
+    Called only for enabled instances with validated existence.
+    """
     set_status(instance_name, 'active', f'tool:{tool_name}')
 
 
-def setup_task_subagent(hook_data: dict[str, Any], instance_name: str, instance_data: dict[str, Any] | None) -> None:
-    """Task tool subagent setup"""
-    tool_input = hook_data.get('tool_input', {})
-    session_id = hook_data.get('session_id', '')
-    if output := setup_subagent_identity(instance_data, instance_name, tool_input, session_id):
-        print(json.dumps(output, ensure_ascii=False))
-        sys.exit(0)
+def update_status(instance_name: str, tool_name: str) -> None:
+    """Update parent status (direct call, no checks)"""
+    set_status(instance_name, 'active', f'tool:{tool_name}')
 
 
-def stop(hook_data: dict[str, Any], instance_name: str, updates: dict[str, Any], instance_data: dict[str, Any] | None) -> None:
+def stop(instance_name: str, instance_data: dict[str, Any]) -> None:
     """Parent Stop: TCP polling loop using shared helper"""
-    from .relay import poll_messages
+    from .family import poll_messages
 
-    # Cleanup orphaned subagents
-    cleanup_orphaned_subagents(instance_name, instance_data)
-
-    # Use shared polling helper
-    wait_timeout = instance_data.get('wait_timeout') if instance_data else None
+    # Use shared polling helper (instance_data guaranteed by dispatcher)
+    wait_timeout = instance_data.get('wait_timeout')
     timeout = wait_timeout or get_config().timeout
 
     # Persist effective timeout for observability (hcom list --json, TUI)
@@ -70,27 +343,29 @@ def stop(hook_data: dict[str, Any], instance_name: str, updates: dict[str, Any],
     sys.exit(exit_code)
 
 
-def task_completion(hook_data: dict[str, Any], instance_name: str) -> None:
-    """Task PostToolUse: freeze-period message delivery"""
-    instance_data = load_instance_position(instance_name)
-
-    if output := handle_task_completion(instance_name, instance_data):
-        print(json.dumps(output, ensure_ascii=False))
-    sys.exit(0)
-
-
-def posttooluse(hook_data: dict[str, Any], instance_name: str, instance_data: dict[str, Any] | None) -> None:
-    """Parent PostToolUse: launch context, bootstrap, messages
-
-    This contains all the parent-specific PostToolUse logic from handlers.py
-    """
-    from ..core.messages import get_unread_messages, format_hook_messages
+def posttooluse(hook_data: dict[str, Any], instance_name: str, instance_data: dict[str, Any], updates: dict[str, Any] | None = None) -> None:
+    """Parent PostToolUse: launch context, bootstrap, messages"""
     from ..shared import HCOM_COMMAND_PATTERN
     import re
 
     tool_name = hook_data.get('tool_name', '')
     tool_input = hook_data.get('tool_input', {})
     outputs_to_combine: list[dict[str, Any]] = []
+
+    # Clear blocked status - tool completed means approval was granted
+    if instance_data.get('status') == 'blocked':
+        set_status(instance_name, 'active', f'approved:{tool_name}')
+
+    # Pull remote events (rate-limited) - receive messages during operation
+    try:
+        from ..relay import pull
+        pull()  # relay.py logs errors internally
+    except Exception as e:
+        log_hook_error('posttooluse:relay_pull', e)
+
+    # External stop notification (for ALL tools)
+    if output := check_external_stop_notification(instance_name, instance_data):
+        outputs_to_combine.append(output)
 
     # Bash-specific flows
     if tool_name == 'Bash':
@@ -100,12 +375,13 @@ def posttooluse(hook_data: dict[str, Any], instance_name: str, instance_data: di
         if output := _inject_launch_context_if_needed(instance_name, command, instance_data):
             outputs_to_combine.append(output)
 
-        # Check hcom command pattern
+        # Check hcom command pattern - bootstrap and updates on hcom commands
         matches = list(re.finditer(HCOM_COMMAND_PATTERN, command))
         if matches:
-            # External stop notification
-            if output := _check_external_stop_notification(instance_name, instance_data, command):
-                outputs_to_combine.append(output)
+            # Persist updates (transcript_path, directory, etc.) for vanilla instances
+            # Vanilla instances opt-in via hcom start - this is their first chance to store metadata
+            if updates:
+                update_instance_position(instance_name, updates)
 
             # Bootstrap
             if output := _inject_bootstrap_if_needed(instance_name, instance_data):
@@ -119,12 +395,11 @@ def posttooluse(hook_data: dict[str, Any], instance_name: str, instance_data: di
     if outputs_to_combine:
         combined = _combine_posttooluse_outputs(outputs_to_combine)
         print(json.dumps(combined, ensure_ascii=False))
-        sys.exit(0)
 
     sys.exit(0)
 
 
-def _inject_launch_context_if_needed(instance_name: str, command: str, instance_data: dict[str, Any] | None) -> dict[str, Any] | None:
+def _inject_launch_context_if_needed(instance_name: str, command: str, instance_data: dict[str, Any]) -> dict[str, Any] | None:
     """Parent context: inject launch context for help/launch commands
 
     Returns hook output dict or None.
@@ -138,7 +413,7 @@ def _inject_launch_context_if_needed(instance_name: str, command: str, instance_
     if not launch_pattern.search(command):
         return None
 
-    if instance_data and instance_data.get('launch_context_announced', False):
+    if instance_data.get('launch_context_announced', False):
         return None
 
     msg = build_launch_context(instance_name)
@@ -153,54 +428,20 @@ def _inject_launch_context_if_needed(instance_name: str, command: str, instance_
     }
 
 
-def _check_external_stop_notification(instance_name: str, instance_data: dict[str, Any] | None, command: str) -> dict[str, Any] | None:
-    """Parent or subagent context: show notification if externally stopped
-
-    Returns hook output dict or None.
-    """
-    import re
-    check_name = instance_name
-    check_data = instance_data
-
-    # Subagent override
-    if '--_hcom_sender' in command:
-        match = re.search(r'--_hcom_sender\s+(\S+)', command)
-        if match:
-            check_name = match.group(1)
-            check_data = load_instance_position(check_name)
-
-    if not check_data or not check_data.get('external_stop_pending'):
-        return None
-
-    update_instance_position(check_name, {'external_stop_pending': False})
-
-    if not check_data.get('enabled', False) and check_data.get('previously_enabled', False):
-        message = (
-            "[HCOM NOTIFICATION]\n"
-            "Your HCOM connection has been stopped by an external command.\n"
-            "You will no longer receive messages. Stop your current work immediately."
-        )
-        return {
-            "systemMessage": "[hcom stop notification]",
-            "hookSpecificOutput": {
-                "hookEventName": "PostToolUse",
-                "additionalContext": message
-            }
-        }
-
-    return None
-
-
-def _inject_bootstrap_if_needed(instance_name: str, instance_data: dict[str, Any] | None) -> dict[str, Any] | None:
+def _inject_bootstrap_if_needed(instance_name: str, instance_data: dict[str, Any]) -> dict[str, Any] | None:
     """Parent context: inject bootstrap text if not announced
 
     Returns hook output dict or None.
     """
-    if instance_data and instance_data.get('alias_announced', False):
+    if instance_data.get('alias_announced', False):
         return None
 
     msg = build_hcom_bootstrap_text(instance_name)
     update_instance_position(instance_name, {'alias_announced': True})
+
+    # Track bootstrap count for first-time user hints
+    from ..core.paths import increment_flag_counter
+    increment_flag_counter('instance_count')
 
     return {
         "systemMessage": "[HCOM info shown to instance]",
@@ -211,25 +452,19 @@ def _inject_bootstrap_if_needed(instance_name: str, instance_data: dict[str, Any
     }
 
 
-def _get_posttooluse_messages(instance_name: str, instance_data: dict[str, Any] | None) -> dict[str, Any] | None:
+def _get_posttooluse_messages(instance_name: str, _instance_data: dict[str, Any]) -> dict[str, Any] | None:
     """Parent context: check for unread messages
     Returns hook output dict or None.
     """
     from ..core.messages import get_unread_messages, format_hook_messages
 
-    if in_subagent_context(instance_name):
-        return None
-
-    # Skip message delivery if instance is disabled
-    if not instance_data or not instance_data.get('enabled', False):
-        return None
-
+    # Instance guaranteed enabled by dispatcher
     messages, _ = get_unread_messages(instance_name, update_position=True)
     if not messages:
         return None
 
     formatted = format_hook_messages(messages, instance_name)
-    set_status(instance_name, 'active', f"deliver:{messages[0]['from']}")
+    set_status(instance_name, 'active', f"deliver:{messages[0]['from']}", msg_ts=messages[-1]['timestamp'])
 
     return {
         "systemMessage": formatted,
@@ -271,32 +506,16 @@ def _combine_posttooluse_outputs(outputs: list[dict[str, Any]]) -> dict[str, Any
     return result
 
 
-def userpromptsubmit(hook_data: dict[str, Any], instance_name: str, updates: dict[str, Any], is_matched_resume: bool, instance_data: dict[str, Any] | None) -> None:
-    """Parent UserPromptSubmit: timestamp, orphan cleanup, bootstrap"""
-    import re
+def userpromptsubmit(_hook_data: dict[str, Any], instance_name: str, updates: dict[str, Any], is_matched_resume: bool, instance_data: dict[str, Any]) -> None:
+    """Parent UserPromptSubmit: timestamp, bootstrap"""
 
-    is_enabled = instance_data.get('enabled', False) if instance_data else False
-    last_stop = instance_data.get('last_stop', 0) if instance_data else 0
-    alias_announced = instance_data.get('alias_announced', False) if instance_data else False
-    notify_port = instance_data.get('notify_port') if instance_data else None
+    # Instance guaranteed to exist by dispatcher
+    alias_announced = instance_data.get('alias_announced', False)
 
     # Session_ended prevents user receiving messages(?) so reset it.
-    if is_matched_resume and instance_data and instance_data.get('session_ended'):
+    if is_matched_resume and instance_data.get('session_ended'):
         update_instance_position(instance_name, {'session_ended': False})
         instance_data['session_ended'] = False  # Resume path reactivates Stop hook polling
-
-    # Disable orphaned subagents (user cancelled/interrupted Task or resumed)
-    if instance_data:
-        from ..core.db import get_db
-        conn = get_db()
-        # Only process non-exited subagents (skip historical ones)
-        subagents = conn.execute(
-            "SELECT name FROM instances WHERE parent_name = ? AND NOT (status = 'inactive' AND status_context LIKE 'exit:%')",
-            (instance_name,)
-        ).fetchall()
-        for row in subagents:
-            disable_instance(row['name'], initiated_by=instance_name, reason='orphaned')
-            set_status(row['name'], 'inactive', 'exit:orphaned')
 
     # Show bootstrap if not already announced (HCOM-launched instances only)
     # Vanilla instances get bootstrap in PostToolUse after cmd_start creates instance
@@ -322,22 +541,28 @@ def userpromptsubmit(hook_data: dict[str, Any], instance_name: str, updates: dic
     # Mark bootstrap as shown
     if show_bootstrap:
         update_instance_position(instance_name, {'alias_announced': True})
+        # Track bootstrap count for first-time user hints
+        from ..core.paths import increment_flag_counter
+        increment_flag_counter('instance_count')
 
     # Persist updates (transcript_path, directory, tag, etc.)
     if updates:
         update_instance_position(instance_name, updates)
 
     # Set status to active (user submitted prompt)
-    set_status(instance_name, 'active', 'tool:prompt')
+    set_status(instance_name, 'active', 'prompt')
 
 
-def notify(hook_data: dict[str, Any], instance_name: str, updates: dict[str, Any], instance_data: dict[str, Any] | None) -> None:
-    """Parent Notification: update status to blocked"""
-    # Skip status updates when parent is frozen during Task execution
-    if in_subagent_context(instance_name):
-        return
-
+def notify(hook_data: dict[str, Any], instance_name: str, updates: dict[str, Any], instance_data: dict[str, Any]) -> None:
+    """Parent Notification: update status to blocked (parent only, handler filters subagent context)"""
     message = hook_data.get('message', '')
+
+    # Filter generic "waiting for input" when already idle
+    if message == "Claude is waiting for your input":
+        current_status = instance_data.get('status', '')
+        if current_status == 'idle':
+            return  # Instance is idle, Stop hook will maintain idle status
+
     if updates:
         update_instance_position(instance_name, updates)
     set_status(instance_name, 'blocked', message)

@@ -64,13 +64,27 @@ from .commands import (
     cmd_stop,
     cmd_start,
     cmd_send,
-    cmd_watch,
+    cmd_events,
     cmd_reset,
     cmd_help,
     cmd_list,
+    cmd_relay,
+    cmd_config,
     CLIError,
     format_error,
 )
+
+# Commands that support --help (maps to cmd_* functions)
+COMMANDS = ('events', 'send', 'stop', 'start', 'reset', 'list', 'config', 'relay')
+
+
+def _run_command(name: str, argv: list[str]) -> int:
+    """Run command with --help support."""
+    if argv and argv[0] in ('--help', '-h'):
+        from .commands.utils import get_command_help
+        print(get_command_help(name))
+        return 0
+    return globals()[f'cmd_{name}'](argv)
 
 # Note: Removed backward compat aliases (_parse_env_value, etc.) - not used by any code or tests
 
@@ -313,6 +327,14 @@ def ensure_hooks_current() -> bool:
     Auto-updates hooks if execution context changes (e.g., pip → uvx).
     Always returns True (warns but never blocks - Claude Code is fault-tolerant)."""
 
+    # Skip global hook installation in web environments with project hooks
+    # (prevents duplicate hook execution after restart)
+    if os.environ.get('CLAUDE_CODE_REMOTE') == 'true':
+        project_settings = Path('.claude/settings.json')
+        if project_settings.exists() and verify_hooks_installed(project_settings):
+            # Project has HCOM hooks configured - don't install global hooks
+            return True
+
     # Verify hooks exist and match current execution context
     global_settings = get_claude_settings_path()
 
@@ -337,13 +359,13 @@ def ensure_hooks_current() -> bool:
         try:
             setup_hooks()
             if os.environ.get('CLAUDECODE') == '1':
-                print("HCOM hooks updated. Please restart Claude Code to apply changes.", file=sys.stderr)
+                print("hcom hooks updated. Please restart Claude Code to apply changes.", file=sys.stderr)
                 print("=" * 60, file=sys.stderr)
         except Exception as e:
             # Failed to verify/update hooks, but they might still work
             # Claude Code is fault-tolerant with malformed JSON
-            print(f"⚠️  Could not verify/update hooks: {e}", file=sys.stderr)
-            print("If HCOM doesn't work, check ~/.claude/settings.json", file=sys.stderr)
+            print(f"Warning: Could not verify/update hooks: {e}", file=sys.stderr)
+            print("If hcom doesn't work, check ~/.claude/settings.json", file=sys.stderr)
 
     return True
 
@@ -361,17 +383,21 @@ def check_and_migrate_legacy_messages() -> None:
 
         conn = get_db()
 
-        # Query for any message events without scope field
+        # Query for messages with old format:
+        # - Missing scope field (pre-0.6.4)
+        # - Old field names: mentioned_instances (now: mentions), recipients (now: delivered_to)
         result = conn.execute("""
             SELECT COUNT(*) as count
             FROM events
             WHERE type = 'message'
-              AND json_extract(data, '$.scope') IS NULL
+              AND (json_extract(data, '$.scope') IS NULL
+                   OR json_extract(data, '$.mentioned_instances') IS NOT NULL
+                   OR json_extract(data, '$.recipients') IS NOT NULL)
         """).fetchone()
 
         if result and result['count'] > 0:
             print("\n" + "=" * 60, file=sys.stderr)
-            print("HCOM v0.6.4 Auto-Migration", file=sys.stderr)
+            print("hcom v0.6.4 Auto-Migration", file=sys.stderr)
             print("=" * 60, file=sys.stderr)
             print(f"\nFound {result['count']} message(s) in old format.", file=sys.stderr)
             print("Archiving and clearing old database...", file=sys.stderr)
@@ -404,7 +430,7 @@ def main(argv: list[str] | None = None) -> int | None:
         argv = argv[1:] if len(argv) > 0 and argv[0].endswith('hcom.py') else argv
 
     # Hook handlers only (called BY hooks, not users)
-    if argv and argv[0] in ('poll', 'notify', 'pre', 'post', 'sessionstart', 'userpromptsubmit', 'sessionend', 'subagent-stop'):
+    if argv and argv[0] in ('poll', 'notify', 'pre', 'post', 'sessionstart', 'userpromptsubmit', 'sessionend', 'subagent-start', 'subagent-stop'):
         handle_hook(argv[0])
         return 0
 
@@ -422,6 +448,21 @@ def main(argv: list[str] | None = None) -> int | None:
 
     # Auto-migrate legacy messages (v0.6.3 → v0.6.4)
     check_and_migrate_legacy_messages()
+
+    # Subagent context: require --agentid for all commands
+    if argv and '--agentid' not in argv and os.environ.get('CLAUDECODE') == '1':
+        try:
+            from .commands.utils import resolve_identity
+            from .hooks.subagent import in_subagent_context
+            identity = resolve_identity()
+            if identity.name and in_subagent_context(identity.name):
+                print(format_error(
+                    "Task subagent must provide --agentid",
+                    f"Use: hcom {argv[0]} --agentid <agent_id> ..."
+                ), file=sys.stderr)
+                return 1
+        except ValueError:
+            pass  # Can't resolve identity - not relevant
 
     # Launch TUI in a new terminal window (equivalent to legacy 'watch --launch')
     if len(argv) == 1 and argv[0] == '--new-terminal':
@@ -441,18 +482,8 @@ def main(argv: list[str] | None = None) -> int | None:
         elif argv[0] in ('--version', '-v'):
             print(f"hcom {__version__}")
             return 0
-        elif argv[0] == 'watch':
-            return cmd_watch(argv[1:])
-        elif argv[0] == 'send':
-            return cmd_send(argv[1:])
-        elif argv[0] == 'stop':
-            return cmd_stop(argv[1:])
-        elif argv[0] == 'start':
-            return cmd_start(argv[1:])
-        elif argv[0] == 'reset':
-            return cmd_reset(argv[1:])
-        elif argv[0] == 'list':
-            return cmd_list(argv[1:])
+        elif argv[0] in COMMANDS:
+            return _run_command(argv[0], argv[1:])
         elif argv[0].isdigit() or argv[0] == 'claude':
             # Launch instances: hcom <1-100> [args] or hcom claude [args]
             return cmd_launch(argv)

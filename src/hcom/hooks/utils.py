@@ -2,18 +2,16 @@
 from __future__ import annotations
 from typing import Any
 from pathlib import Path
-from datetime import datetime
+from datetime import datetime, timezone
 import os
 import sys
 import socket
 import shlex
 import re
 
-from ..shared import SENDER
 from ..core.paths import hcom_path, LOGS_DIR
 from ..core.config import get_config
 from ..core.instances import load_instance_position, update_instance_position
-from ..core.messages import format_hook_messages
 from ..core.runtime import (
     build_claude_env,
     build_hcom_bootstrap_text,
@@ -31,7 +29,7 @@ def log_hook_error(hook_name: str, error: Exception | str | None = None) -> None
     import traceback
     try:
         log_file = hcom_path(LOGS_DIR) / "hooks.log"
-        timestamp = datetime.now().isoformat()
+        timestamp = datetime.now(timezone.utc).isoformat()
         if error and isinstance(error, Exception):
             tb = ''.join(traceback.format_exception(type(error), error, error.__traceback__))
             with open(log_file, 'a') as f:
@@ -114,11 +112,22 @@ def disable_instance(instance_name: str, initiated_by: str = 'unknown', reason: 
     Args:
         instance_name: Instance to disable
         initiated_by: Who initiated (from resolve_identity())
-        reason: Context (e.g., 'manual', 'timeout', 'orphaned', 'external')
+        reason: Context (e.g., 'manual', 'timeout', 'orphaned', 'external', 'stop_all', 'remote')
+
+    Note: enabled and status are orthogonal - don't set status here.
+    enabled = HCOM participation flag, status = HCOM activity state.
+    Status updates happen via hooks detecting state changes and exiting properly
+    (e.g., Stop hook detects enabled=false, sets inactive status, then exits).
+    Setting status directly here would be lying about the actual hook/session state.
     """
     updates = {
         'enabled': False
     }
+
+    # External stops need notification flag (instance notified via PostToolUse)
+    if reason in ('stop_all', 'external', 'remote'):
+        updates['external_stop_pending'] = True
+
     update_instance_position(instance_name, updates)
     # Notify instance to wake and see enabled=false
     notify_instance(instance_name)
@@ -130,8 +139,12 @@ def disable_instance(instance_name: str, initiated_by: str = 'unknown', reason: 
             'by': initiated_by,
             'reason': reason
         })
-    except Exception:
-        pass  # Don't break disable if logging fails
+        # Push lifecycle event (rate-limited)
+        from ..relay import push
+        push()  # relay.py logs errors internally to relay.log
+    except Exception as e:
+        # Participant context - log for debugging but don't break disable
+        log_hook_error('disable_instance:log_event', e)
 
 
 def init_hook_context(hook_data: dict[str, Any], hook_type: str | None = None) -> tuple[str, dict[str, Any], bool]:
@@ -165,7 +178,7 @@ def init_hook_context(hook_data: dict[str, Any], hook_type: str | None = None) -
     if not existing_data and tag:
         updates['tag'] = tag
 
-    # Update session_id (may have changed on resume)
+    # Update session_id (may have changed on resume (it would be a new instance record then, this is the same for entire instance life))
     if session_id:
         updates['session_id'] = session_id
 
@@ -286,3 +299,5 @@ def is_safe_hcom_command(command: str) -> bool:
             return False
 
     return True
+
+

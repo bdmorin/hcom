@@ -3,18 +3,14 @@ from __future__ import annotations
 import os
 import sys
 import select
-import re
 import unicodedata
 from typing import Optional, List
 
 # Platform detection
 IS_WINDOWS = os.name == 'nt'
 
-# ANSI escape code pattern (for stripping from pasted input)
-ANSI_RE = re.compile(r'\x1B\[[0-?]*[ -/]*[@-~]')
-
-# Import ANSI-aware utilities from rendering module
-from .rendering import ansi_len
+# Import from rendering module (single source of truth)
+from .rendering import ansi_len, ANSI_RE, MAX_INPUT_ROWS
 
 # Import platform-specific modules conditionally
 if IS_WINDOWS:
@@ -26,11 +22,8 @@ else:
 # Import ANSI codes from shared module
 from ..shared import (
     HIDE_CURSOR, SHOW_CURSOR,
-    FG_GRAY, FG_WHITE, RESET, REVERSE
+    FG_GRAY, FG_WHITE, FG_LIGHTGRAY, DIM, RESET, REVERSE
 )
-
-# Constants
-MAX_INPUT_ROWS = 8  # Cap input area at N rows
 
 
 def slice_by_visual_width(text: str, max_width: int) -> tuple[str, int]:
@@ -230,7 +223,7 @@ def calculate_text_input_rows(text: str, width: int, max_rows: int = MAX_INPUT_R
     return min(total_rows, max_rows)
 
 
-def render_text_input(buffer: str, cursor: int, width: int, max_rows: int, prefix: str = "> ") -> List[str]:
+def render_text_input(buffer: str, cursor: int, width: int, max_rows: int, prefix: str = "> ", send_state: str = None) -> List[str]:
     """
     Render text input with cursor, wrapping, and literal newlines.
 
@@ -240,17 +233,29 @@ def render_text_input(buffer: str, cursor: int, width: int, max_rows: int, prefi
         width: Terminal width
         max_rows: Maximum rows to render
         prefix: First line prefix (e.g., "> " or "")
+        send_state: None (normal), 'sending' (dim), or 'sent' (orange prefix)
 
     Returns:
         List of formatted lines with cursor (█)
     """
+    # Determine colors based on send state
+    if send_state == 'sending':
+        prefix_color = DIM + FG_GRAY
+        text_color = DIM + FG_GRAY
+    elif send_state == 'sent':
+        prefix_color = FG_LIGHTGRAY
+        text_color = FG_WHITE
+    else:
+        prefix_color = FG_GRAY
+        text_color = FG_WHITE
+
     if not buffer:
-        return [f"{FG_GRAY}{prefix}{REVERSE} {RESET}{RESET}"]
+        return [f"{prefix_color}{prefix}{REVERSE} {RESET}{RESET}"]
 
     line_width = width - len(prefix)
     # Guard against invalid width (terminal too narrow)
     if line_width <= 0:
-        return [f"{FG_GRAY}{prefix}{RESET}"]  # Just show prefix if no room
+        return [f"{prefix_color}{prefix}{RESET}"]  # Just show prefix if no room
 
     before = buffer[:cursor]
 
@@ -273,7 +278,7 @@ def render_text_input(buffer: str, cursor: int, width: int, max_rows: int, prefi
         if not line:
             # Empty line (from consecutive newlines or trailing newline)
             line_prefix = prefix if line_idx == 0 else " " * len(prefix)
-            wrapped.append(f"{FG_WHITE}{line_prefix}{RESET}")
+            wrapped.append(f"{prefix_color if line_idx == 0 else text_color}{line_prefix}{RESET}")
         else:
             # Wrap long lines by visual width (handles wide chars and ANSI codes)
             char_offset = 0
@@ -282,8 +287,10 @@ def render_text_input(buffer: str, cursor: int, width: int, max_rows: int, prefi
                 chunk, consumed = slice_by_visual_width(line[char_offset:], line_width)
                 if not consumed:  # Safety: avoid infinite loop
                     break
-                line_prefix = prefix if line_idx == 0 and is_first_chunk else " " * len(prefix)
-                wrapped.append(f"{FG_WHITE}{line_prefix}{RESET}{FG_WHITE}{chunk}{RESET}")
+                is_prefix_line = line_idx == 0 and is_first_chunk
+                line_prefix = prefix if is_prefix_line else " " * len(prefix)
+                pcolor = prefix_color if is_prefix_line else text_color
+                wrapped.append(f"{pcolor}{line_prefix}{RESET}{text_color}{chunk}{RESET}")
                 char_offset += consumed
                 is_first_chunk = False
 

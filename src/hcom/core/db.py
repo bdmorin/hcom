@@ -2,11 +2,13 @@
 from __future__ import annotations
 import sqlite3
 import json
+import os
 import threading
 from typing import Any, Optional
 from datetime import datetime, timezone
 
 from .paths import hcom_path
+from ..shared import parse_iso_timestamp
 
 # Database configuration
 DB_FILE = "hcom.db"
@@ -20,11 +22,37 @@ def get_db() -> sqlite3.Connection:
 
     Returns per-thread connection with WAL mode enabled for concurrent access.
     Each thread gets its own connection to avoid SQLite threading issues.
+
+    Detects if DB file was deleted/replaced (e.g., by `hcom reset logs`) and
+    reconnects automatically.
     """
+    db_path = hcom_path(DB_FILE)
+
+    # Check if existing connection is stale (DB file deleted or replaced)
+    if hasattr(_thread_local, 'conn') and _thread_local.conn is not None:
+        if hasattr(_thread_local, 'db_inode'):
+            try:
+                current_inode = os.stat(db_path).st_ino if db_path.exists() else None
+                if current_inode != _thread_local.db_inode:
+                    # DB file changed - close stale connection
+                    try:
+                        _thread_local.conn.close()
+                    except Exception:
+                        pass
+                    _thread_local.conn = None
+                    _thread_local.db_inode = None
+            except Exception:
+                pass
+
     if not hasattr(_thread_local, 'conn') or _thread_local.conn is None:
-        db_path = hcom_path(DB_FILE)
         _thread_local.conn = sqlite3.connect(str(db_path))
         _thread_local.conn.row_factory = sqlite3.Row
+
+        # Track inode for stale connection detection
+        try:
+            _thread_local.db_inode = os.stat(db_path).st_ino
+        except Exception:
+            _thread_local.db_inode = None
 
         # Enable foreign key constraints (disabled by default in SQLite)
         _thread_local.conn.execute("PRAGMA foreign_keys = ON")
@@ -101,7 +129,6 @@ def init_db(conn: Optional[sqlite3.Connection] = None) -> None:
             tag TEXT,
             last_event_id INTEGER DEFAULT 0,
             enabled INTEGER DEFAULT 0,
-            previously_enabled INTEGER DEFAULT 0,
             status TEXT DEFAULT 'unknown',
             status_time INTEGER DEFAULT 0,
             status_context TEXT DEFAULT '',
@@ -118,7 +145,7 @@ def init_db(conn: Optional[sqlite3.Connection] = None) -> None:
             launch_context_announced INTEGER DEFAULT 0,
             external_stop_pending INTEGER DEFAULT 0,
             session_ended INTEGER DEFAULT 0,
-            agent_id TEXT,
+            agent_id TEXT UNIQUE,
             FOREIGN KEY (parent_session_id) REFERENCES instances(session_id) ON DELETE SET NULL
         )
     """)
@@ -151,6 +178,17 @@ def init_db(conn: Optional[sqlite3.Connection] = None) -> None:
             if 'duplicate column' not in str(e).lower():
                 raise
 
+    # Migrate existing databases: add running_tasks column if missing
+    cursor = conn.execute("PRAGMA table_info(instances)")
+    columns = {row['name'] for row in cursor.fetchall()}
+    if 'running_tasks' not in columns:
+        try:
+            conn.execute("ALTER TABLE instances ADD COLUMN running_tasks TEXT DEFAULT ''")
+            conn.commit()
+        except sqlite3.OperationalError as e:
+            if 'duplicate column' not in str(e).lower():
+                raise
+
     # Create indexes for common query patterns
     conn.execute("CREATE INDEX IF NOT EXISTS idx_timestamp ON events(timestamp)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_type ON events(type)")
@@ -165,12 +203,45 @@ def init_db(conn: Optional[sqlite3.Connection] = None) -> None:
     conn.execute("CREATE INDEX IF NOT EXISTS idx_created_at ON instances(created_at DESC)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_status ON instances(status)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_mapid ON instances(mapid) WHERE mapid != ''")
-    conn.execute("CREATE INDEX IF NOT EXISTS idx_agent_id ON instances(agent_id) WHERE agent_id IS NOT NULL")
+    conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_agent_id_unique ON instances(agent_id) WHERE agent_id IS NOT NULL")
 
     # Create mapid_sessions index
     conn.execute("CREATE INDEX IF NOT EXISTS idx_mapid_sessions_updated ON mapid_sessions(updated_at DESC)")
 
     conn.commit()
+
+    # Run schema migration (idempotent)
+    migrate_sync_schema(conn)
+
+def migrate_sync_schema(conn: Optional[sqlite3.Connection] = None) -> None:
+    """Run schema migration (idempotent). Adds origin_device_id and kv table."""
+    if conn is None:
+        conn = get_db()
+
+    version = conn.execute("PRAGMA user_version").fetchone()[0]
+
+    if version < 2:
+        # Add origin_device_id to instances
+        with _write_lock:
+            columns = [row[1] for row in conn.execute("PRAGMA table_info(instances)")]
+            if 'origin_device_id' not in columns:
+                try:
+                    conn.execute("ALTER TABLE instances ADD COLUMN origin_device_id TEXT DEFAULT ''")
+                    conn.execute("CREATE INDEX IF NOT EXISTS idx_instances_origin ON instances(origin_device_id)")
+                    conn.commit()
+                except sqlite3.OperationalError as e:
+                    # Concurrent process may have added it
+                    if 'duplicate column' not in str(e).lower():
+                        raise
+
+        with _write_lock:
+            conn.execute("PRAGMA user_version = 2")
+            conn.commit()
+
+    # kv table for relay state
+    with _write_lock:
+        conn.execute("CREATE TABLE IF NOT EXISTS kv (key TEXT PRIMARY KEY, value TEXT)")
+        conn.commit()
 
 # ==================== Event Operations ====================
 
@@ -203,7 +274,11 @@ def log_event(
             (timestamp, event_type, instance, json.dumps(data))
         )
         conn.commit()
-        return cursor.lastrowid
+        event_id = cursor.lastrowid
+
+    # Sync export moved to hook dispatcher (rate-limited, builds from SQLite)
+    # No duplicate JSONL append needed - single source of truth
+    return event_id
 
 def get_events_since(
     last_event_id: int = 0,
@@ -331,6 +406,24 @@ def update_instance(name: str, updates: dict[str, Any]) -> bool:
         print(f"Unexpected error updating instance {name}: {e}", file=sys.stderr)
         return False
 
+def delete_instance(name: str) -> bool:
+    """Delete instance from database. Returns True on success."""
+    conn = get_db()
+
+    try:
+        with _write_lock:
+            conn.execute("DELETE FROM instances WHERE name = ?", (name,))
+            conn.commit()
+            return True
+    except sqlite3.Error as e:
+        import sys
+        print(f"DB error deleting instance {name}: {e}", file=sys.stderr)
+        return False
+    except Exception as e:
+        import sys
+        print(f"Unexpected error deleting instance {name}: {e}", file=sys.stderr)
+        return False
+
 def find_instance_by_session(session_id: str) -> str | None:
     """Find instance name by session_id. Returns name or None.
 
@@ -377,6 +470,169 @@ def iter_instances(enabled_only: bool = False):
     for row in conn.execute(query):
         yield dict(row)
 
+# ==================== Launch Batch Queries ====================
+
+def get_launch_status(launcher: str | None = None) -> dict | None:
+    """Get aggregated launch status across all pending/recent batches.
+
+    Priority:
+    1. All pending batches (ready < expected) by launcher
+    2. All batches from last 60s by launcher
+    3. Most recent batch by launcher
+    4. None
+
+    Returns:
+        Dict with: expected, ready, instances, batches (list), launcher
+        Or None if no launches found.
+    """
+    conn = get_db()
+    from datetime import datetime, timezone
+
+    launcher_filter = "AND e.instance = ?" if launcher else ""
+    params = (launcher,) if launcher else ()
+
+    # Get all launch events by this launcher
+    launches = conn.execute(f"""
+        SELECT e.timestamp, e.instance as launcher,
+               json_extract(e.data, '$.batch_id') as batch_id,
+               json_extract(e.data, '$.launched') as expected
+        FROM events e
+        WHERE e.type = 'life'
+          AND json_extract(e.data, '$.action') = 'launched'
+          {launcher_filter}
+        ORDER BY e.id DESC
+        LIMIT 20
+    """, params).fetchall()
+
+    if not launches:
+        return None
+
+    # Get ready counts per batch
+    def get_ready(batch_id: str) -> tuple[int, list[str]]:
+        rows = conn.execute("""
+            SELECT instance FROM events
+            WHERE type = 'life'
+              AND json_extract(data, '$.action') = 'ready'
+              AND json_extract(data, '$.batch_id') = ?
+        """, (batch_id,)).fetchall()
+        return len(rows), [r['instance'] for r in rows]
+
+    # Build batch info with ready counts
+    batches = []
+    for row in launches:
+        ready_count, ready_instances = get_ready(row['batch_id'])
+        batches.append({
+            'batch_id': row['batch_id'],
+            'launcher': row['launcher'],
+            'expected': row['expected'] or 0,
+            'ready': ready_count,
+            'instances': ready_instances,
+            'timestamp': row['timestamp'],
+            'pending': ready_count < (row['expected'] or 0),
+        })
+
+    # Use provided launcher or get from first batch
+    effective_launcher = launcher or batches[0]['launcher']
+
+    # Cutoff for "recent" - 60s
+    cutoff = datetime.now(timezone.utc).timestamp() - 60
+
+    # Priority 1: pending batches (incomplete AND recent - timeout stuck launches)
+    pending = []
+    for b in batches:
+        if b['pending']:
+            dt = parse_iso_timestamp(b['timestamp'])
+            if dt and dt.timestamp() > cutoff:
+                pending.append(b)
+    if pending:
+        return _aggregate_batches(pending, effective_launcher)
+
+    # Priority 2: batches from last 60s
+    recent = []
+    for b in batches:
+        dt = parse_iso_timestamp(b['timestamp'])
+        if dt and dt.timestamp() > cutoff:
+            recent.append(b)
+    if recent:
+        return _aggregate_batches(recent, effective_launcher)
+
+    # Priority 3: most recent
+    return _aggregate_batches([batches[0]], effective_launcher)
+
+
+def _aggregate_batches(batches: list[dict], launcher: str) -> dict:
+    """Aggregate multiple batches into single status."""
+    total_expected = sum(b['expected'] for b in batches)
+    total_ready = sum(b['ready'] for b in batches)
+    all_instances = []
+    for b in batches:
+        all_instances.extend(b['instances'])
+
+    return {
+        'expected': total_expected,
+        'ready': total_ready,
+        'instances': all_instances,
+        'batches': [b['batch_id'] for b in batches],
+        'launcher': launcher,
+        'timestamp': batches[0]['timestamp'],  # most recent
+    }
+
+
+def get_launch_batch(batch_id: str) -> dict | None:
+    """Get single batch status by ID prefix."""
+    conn = get_db()
+
+    row = conn.execute("""
+        SELECT e.timestamp, e.instance as launcher,
+               json_extract(e.data, '$.batch_id') as batch_id,
+               json_extract(e.data, '$.launched') as expected
+        FROM events e
+        WHERE e.type = 'life'
+          AND json_extract(e.data, '$.action') = 'launched'
+          AND json_extract(e.data, '$.batch_id') LIKE ?
+        ORDER BY e.id DESC LIMIT 1
+    """, (f'{batch_id}%',)).fetchone()
+
+    if not row:
+        return None
+
+    ready_rows = conn.execute("""
+        SELECT instance FROM events
+        WHERE type = 'life'
+          AND json_extract(data, '$.action') = 'ready'
+          AND json_extract(data, '$.batch_id') = ?
+    """, (row['batch_id'],)).fetchall()
+
+    return {
+        'batch_id': row['batch_id'],
+        'expected': row['expected'] or 0,
+        'ready': len(ready_rows),
+        'instances': [r['instance'] for r in ready_rows],
+        'launcher': row['launcher'],
+        'timestamp': row['timestamp'],
+    }
+
+# ==================== KV Store ====================
+
+def kv_get(key: str) -> str | None:
+    """Get value from kv table."""
+    conn = get_db()
+    row = conn.execute("SELECT value FROM kv WHERE key = ?", (key,)).fetchone()
+    return row['value'] if row else None
+
+def kv_set(key: str, value: str | None) -> None:
+    """Set or delete value in kv table."""
+    conn = get_db()
+    with _write_lock:
+        if value is None:
+            conn.execute("DELETE FROM kv WHERE key = ?", (key,))
+        else:
+            conn.execute(
+                "INSERT OR REPLACE INTO kv (key, value) VALUES (?, ?)",
+                (key, value)
+            )
+        conn.commit()
+
 __all__ = [
     # Events
     'get_db',
@@ -394,4 +650,10 @@ __all__ = [
     'get_instance_by_mapid',
     # Instances (high-level queries)
     'iter_instances',
+    # Launch batch
+    'get_launch_status',
+    'get_launch_batch',
+    # KV store
+    'kv_get',
+    'kv_set',
 ]

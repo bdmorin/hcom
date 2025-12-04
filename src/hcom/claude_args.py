@@ -82,6 +82,7 @@ _VALUE_FLAGS = {
     "--disallowed-tools",
     "--fallback-model",
     "--input-format",
+    "--json-schema",
     "--max-turns",
     "--mcp-config",
     "--model",
@@ -92,6 +93,7 @@ _VALUE_FLAGS = {
     "--session-id",
     "--setting-sources",
     "--settings",
+    "--system-prompt-file",
     "--tools",
 }
 
@@ -104,6 +106,7 @@ _VALUE_FLAG_PREFIXES = {
     "--disallowed-tools=",
     "--fallback-model=",
     "--input-format=",
+    "--json-schema=",
     "--max-turns=",
     "--mcp-config=",
     "--model=",
@@ -114,6 +117,7 @@ _VALUE_FLAG_PREFIXES = {
     "--session-id=",
     "--setting-sources=",
     "--settings=",
+    "--system-prompt-file=",
     "--tools=",
 }
 

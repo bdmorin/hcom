@@ -3,106 +3,259 @@ from __future__ import annotations
 from typing import Any
 import sys
 import json
-import re
 
-from ..core.instances import (
-    load_instance_position, update_instance_position, set_status
-)
 from ..core.config import get_config
+from ..core.instances import load_instance_position, update_instance_position, set_status, parse_running_tasks
+from ..core.db import get_db, find_instance_by_session
+from .family import check_external_stop_notification
 
+# ============ TASK CONTEXT TRACKING ============
 
-def extract_subagent_id_from_transcript(transcript_path: str) -> str | None:
-    """Parse agent transcript for --_hcom_sender flag from hcom start command
+def in_subagent_context(session_id_or_name: str) -> bool:
+    """Check if session/instance is in subagent context (Task active, parent frozen)
 
-    Subagents must run: hcom start --_hcom_sender <alias>
-    This pattern appears in their transcript when they execute the command.
+    Uses database running_tasks.active field for cross-process detection.
+    Task is active if running_tasks JSON has active=true.
+
+    Args:
+        session_id_or_name: Either session_id (from hooks) or instance_name (from commands)
     """
-    import os
+    conn = get_db()
 
-    expanded = os.path.expanduser(transcript_path)
-    # Match --_hcom_sender followed by the alias
-    pattern = re.compile(r'--_hcom_sender\s+(\S+)')
+    # Try as session_id first (fast path for hooks)
+    instance_name = find_instance_by_session(session_id_or_name)
+    if not instance_name:
+        # Try as instance_name (for commands)
+        instance_name = session_id_or_name
+
+    row = conn.execute(
+        "SELECT running_tasks FROM instances WHERE name = ? LIMIT 1",
+        (instance_name,)
+    ).fetchone()
+
+    if not row or not row['running_tasks']:
+        return False
 
     try:
-        with open(expanded, 'r') as f:
-            for line in f:
-                try:
-                    entry = json.loads(line)
-
-                    # Check message.content for tool_use (actual Claude Code transcript format)
-                    if 'message' in entry:
-                        content = entry['message'].get('content', [])
-                        if isinstance(content, list):
-                            for block in content:
-                                if isinstance(block, dict) and block.get('type') == 'tool_use':
-                                    if block.get('name') == 'Bash':
-                                        command = block.get('input', {}).get('command', '')
-                                        if '--_hcom_sender' in command:
-                                            match = pattern.search(command)
-                                            if match:
-                                                return match.group(1)
-                except (json.JSONDecodeError, KeyError, TypeError):
-                    continue
-        return None
-    except Exception:
-        return None
+        running_tasks = json.loads(row['running_tasks'])
+        return running_tasks.get('active', False)
+    except (json.JSONDecodeError, AttributeError):
+        return False
 
 
-def subagent_stop(hook_data: dict[str, Any], parent_name: str, _updates: dict[str, Any], _instance_data: dict[str, Any] | None) -> None:
-    """SubagentStop: Message polling using agent_id"""
+def track_subagent(parent_session_id: str, agent_id: str, agent_type: str) -> None:
+    """Track subagent in parent's running_tasks.subagents array
+
+    Appends {agent_id, type} to parent's running_tasks.subagents array.
+    """
+    instance_name = find_instance_by_session(parent_session_id)
+    if not instance_name:
+        return
+
+    instance_data = load_instance_position(instance_name)
+    if not instance_data:
+        return
+
+    # Load existing running_tasks structure
+    running_tasks = parse_running_tasks(instance_data.get('running_tasks', ''))
+    running_tasks['active'] = True  # Ensure active flag is set
+
+    # Add subagent if not already tracked
+    subagents = running_tasks['subagents']
+    if not any(s['agent_id'] == agent_id for s in subagents):
+        subagents.append({'agent_id': agent_id, 'type': agent_type})
+        update_instance_position(instance_name, {'running_tasks': json.dumps(running_tasks)})
+
+
+def _remove_subagent_from_parent(parent_name: str, agent_id: str) -> None:
+    """Remove subagent from parent's running_tasks.subagents array
+
+    Called when subagent exits (SubagentStop).
+    Sets active=False when last subagent removed (enables parallel Task support).
+    """
+    parent_data = load_instance_position(parent_name)
+    if not parent_data:
+        return
+
+    # Load existing running_tasks structure
+    running_tasks = parse_running_tasks(parent_data.get('running_tasks', ''))
+    if not running_tasks.get('subagents'):
+        return
+
+    # Remove subagent with matching agent_id
+    running_tasks['subagents'] = [s for s in running_tasks['subagents'] if s.get('agent_id') != agent_id]
+
+    # If no more subagents, clear active flag
+    if not running_tasks['subagents']:
+        running_tasks['active'] = False
+
+    # Update parent
+    update_instance_position(parent_name, {'running_tasks': json.dumps(running_tasks)})
+
+
+# ============ HOOK HANDLERS ============
+
+
+def posttooluse(hook_data: dict[str, Any], _instance_name: str, _instance_data: dict[str, Any] | None) -> None:
+    """Subagent PostToolUse: pull remote events, external stop notification, message delivery
+
+    Handles subagents running hcom commands (identified by --agentid in Bash command).
+    """
+    import re
     from ..core.db import get_db
+    from ..core.messages import get_unread_messages, format_hook_messages
+
+    tool_name = hook_data.get('tool_name', '')
+    tool_input = hook_data.get('tool_input', {})
+
+    # Only handle Bash commands with --agentid flag
+    if tool_name != 'Bash':
+        sys.exit(0)
+
+    command = tool_input.get('command', '')
+    if '--agentid' not in command:
+        sys.exit(0)
+
+    # Extract agent_id and resolve subagent
+    match = re.search(r'--agentid\s+(\S+)', command)
+    if not match:
+        sys.exit(0)
+
+    agent_id = match.group(1)
+    conn = get_db()
+    row = conn.execute("SELECT name FROM instances WHERE agent_id = ?", (agent_id,)).fetchone()
+    if not row:
+        sys.exit(0)
+
+    subagent_name = row['name']
+    subagent_data = load_instance_position(subagent_name)
+    if not subagent_data or not subagent_data.get('enabled', False):
+        sys.exit(0)
+
+    # Pull remote events (rate-limited)
+    try:
+        from ..relay import pull
+        pull()
+    except Exception as e:
+        # Best-effort sync - log for debugging
+        from .utils import log_hook_error
+        log_hook_error('subagent_stop:relay_pull', e)
+
+    outputs = []
+
+    # External stop notification
+    if output := check_external_stop_notification(subagent_name, subagent_data):
+        outputs.append(output)
+
+    # Message delivery (like parent PostToolUse)
+    messages, _ = get_unread_messages(subagent_name, update_position=True)
+    if messages:
+        formatted = format_hook_messages(messages, subagent_name)
+        set_status(subagent_name, 'active', f"deliver:{messages[0]['from']}", msg_ts=messages[-1]['timestamp'])
+        outputs.append({
+            "hookSpecificOutput": {
+                "hookEventName": "PostToolUse",
+                "additionalContext": formatted
+            }
+        })
+
+    # Combine outputs if multiple
+    if outputs:
+        if len(outputs) == 1:
+            print(json.dumps(outputs[0], ensure_ascii=False))
+        else:
+            contexts = [o['hookSpecificOutput']['additionalContext'] for o in outputs if 'hookSpecificOutput' in o]
+            combined = {
+                "hookSpecificOutput": {
+                    "hookEventName": "PostToolUse",
+                    "additionalContext": '\n\n---\n\n'.join(contexts)
+                }
+            }
+            print(json.dumps(combined, ensure_ascii=False))
+
+    sys.exit(0)
+
+
+def subagent_start(hook_data: dict[str, Any]) -> None:
+    """SubagentStart: Surface agent_id to subagent"""
+    from .utils import build_hcom_command
+
+    agent_id = hook_data.get('agent_id')
+    if not agent_id:
+        sys.exit(0)
+
+    # Minimal hint - cmd_start resolves parent from identity and looks up type from running_tasks
+    hcom_cmd = build_hcom_command()
+    hint = f"[HCOM INFORMATION] hcom is a communication tool for interacting with other claude code instances.\n"
+    hint += f"To use hcom, you must run this command first: '{hcom_cmd} start --agentid {agent_id}'\n"
+    hint += f"If you have been prompted to run any hcom commands, assume you must add --agentid {agent_id} to every command\n"
+    hint += f"Important: hcom will not work until you first register with: '{hcom_cmd} start --agentid {agent_id}'"
+
+    output = {
+        "hookSpecificOutput": {
+            "hookEventName": "SubagentStart",
+            "additionalContext": hint
+        }
+    }
+
+    print(json.dumps(output))
+    sys.exit(0)
+
+
+def subagent_stop(hook_data: dict[str, Any]) -> None:
+    """SubagentStop: Message polling using agent_id (lazy creation pattern)"""
+    from .utils import log_hook_error
 
     # Extract agent_id
     agent_id = hook_data.get('agent_id')
     if not agent_id:
         sys.exit(0)
 
-    # Optimization: Check if parent has any enabled subagents before parsing
+    # Query for subagent by agent_id (stored when subagent ran hcom start)
     conn = get_db()
-    has_subagents = conn.execute(
-        "SELECT 1 FROM instances WHERE parent_name = ? AND enabled = 1 LIMIT 1",
-        (parent_name,)
-    ).fetchone()
-
-    if not has_subagents:
-        sys.exit(0)  # Parent has no enabled subagents - skip
-
-    # Query for existing subagent with this agent_id (O(1) indexed lookup)
     row = conn.execute(
-        "SELECT name FROM instances WHERE parent_name = ? AND agent_id = ?",
-        (parent_name, agent_id)
+        "SELECT name, transcript_path, parent_name, enabled FROM instances WHERE agent_id = ?",
+        (agent_id,)
     ).fetchone()
 
-    if row:
-        # Found cached - no transcript parsing needed
-        subagent_id = row['name']
-    else:
-        # First SubagentStop fire - parse transcript for hcom start command
+    if not row:
+        # No instance = subagent hasn't run hcom start yet (not opted in)
+        sys.exit(0)
+
+    subagent_id = row['name']
+    parent_name = row['parent_name']
+    enabled_at_entry = row['enabled']
+
+    log_hook_error('subagent_stop:enter', f'{subagent_id} agent_id={agent_id} enabled={enabled_at_entry}')
+
+    # Store transcript_path if not already set
+    if not row['transcript_path']:
         transcript_path = hook_data.get('agent_transcript_path')
-        if not transcript_path:
-            sys.exit(0)
-
-        subagent_id = extract_subagent_id_from_transcript(transcript_path)
-        if not subagent_id:
-            sys.exit(0)  # Agent didn't run hcom start - not opted in
-
-        # Store agent_id and transcript_path in subagent's own record (cache for next time)
-        update_instance_position(subagent_id, {
-            'agent_id': agent_id,
-            'transcript_path': transcript_path
-        })
+        if transcript_path:
+            update_instance_position(subagent_id, {'transcript_path': transcript_path})
 
     # Poll messages using shared helper
     timeout = get_config().subagent_timeout
-    from .relay import poll_messages
-    exit_code, output, _ = poll_messages(
+    from .family import poll_messages
+
+    exit_code, output, timed_out = poll_messages(
         subagent_id,
         timeout,
-        disable_on_timeout=True  # Subagents die on timeout
+        disable_on_timeout=False
     )
 
+    log_hook_error('subagent_stop:poll_done', f'{subagent_id} exit_code={exit_code} timed_out={timed_out}')
+
     if output:
-        print(json.dumps(output, ensure_ascii=False), file=sys.stderr)
+        print(json.dumps(output, ensure_ascii=False))
+
+    # exit_code=2: message delivered, subagent continues processing, SubagentStop fires again
+    # exit_code=0: no message/timeout, disable and cleanup
+    if exit_code == 0:
+        update_instance_position(subagent_id, {'enabled': False})
+        set_status(subagent_id, 'inactive', 'exit:timeout' if timed_out else 'exit:task_completed')
+        if parent_name:
+            _remove_subagent_from_parent(parent_name, agent_id)
 
     sys.exit(exit_code)
 

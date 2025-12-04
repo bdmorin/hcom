@@ -16,6 +16,11 @@ ANSI_RE = re.compile(r'\x1B\[[0-?]*[ -/]*[@-~]')
 MAX_INPUT_ROWS = 8  # Cap input area at N rows
 
 
+def separator_line(width: int) -> str:
+    """Render a horizontal separator line"""
+    return f"{FG_GRAY}{'─' * width}{RESET}"
+
+
 def ansi_len(text: str) -> int:
     """Get visible length of text (excluding ANSI codes), accounting for wide chars"""
     visible = ANSI_RE.sub('', text)
@@ -171,29 +176,51 @@ def interpolate_color_index(start: int, end: int, progress: float) -> int:
 
 
 def get_message_pulse_colors(seconds_since: float) -> tuple[str, str]:
-    """Get background and foreground colors for LOG tab based on message recency
+    """Get background and foreground colors for EVENTS tab based on message recency
+
+    Uses true RGB for smooth gradients (not 256-color palette).
 
     Args:
-        seconds_since: Seconds since last message (0 = just now, 5+ = quiet)
+        seconds_since: Seconds since last message (0 = just now, 8+ = quiet)
 
     Returns:
         (bg_color, fg_color) tuple of ANSI escape codes
     """
-    # At rest (5s+), use exact same colors as LAUNCH tab
-    if seconds_since >= 5.0:
+    FADE_DURATION = 5.0  # seconds
+
+    # At rest, use charcoal bg / light gray fg
+    if seconds_since >= FADE_DURATION:
         return BG_CHARCOAL, FG_WHITE
 
-    # Clamp to 5s range
-    seconds = max(0.0, min(5.0, seconds_since))
-
     # Progress: 0.0 = recent (white), 1.0 = quiet (charcoal)
-    progress = seconds / 5.0
+    progress = min(1.0, seconds_since / FADE_DURATION)
 
-    # Interpolate background: 255 (white) → 236 (charcoal)
-    bg_index = interpolate_color_index(255, 236, progress)
+    # Apply ease-out curve
+    eased = ease_out_quad(progress)
 
-    # Interpolate foreground: 232 (darkest gray) → 250 (light gray matching FG_WHITE)
-    # Don't overshoot to 255 (pure white) - normal FG_WHITE is dimmer
-    fg_index = interpolate_color_index(232, 250, progress)
+    # RGB interpolation for smooth gradients
+    # Background: white (255) → charcoal (48)
+    bg_val = int(255 - (255 - 48) * eased)
+    # Foreground: dark (18) → light gray (188)
+    fg_val = int(18 + (188 - 18) * eased)
 
-    return f'\033[48;5;{bg_index}m', f'\033[38;5;{fg_index}m'
+    return f'\033[48;2;{bg_val};{bg_val};{bg_val}m', f'\033[38;2;{fg_val};{fg_val};{fg_val}m'
+
+
+def get_device_sync_color(seconds_since: float) -> str:
+    """Get foreground color for device suffix based on sync recency.
+
+    Smooth RGB gradient from bright cyan to gray over 30 seconds.
+    """
+    if seconds_since >= 30:
+        return '\033[38;5;245m'  # Gray baseline
+
+    # Normalize to 0-1 range over 30 seconds
+    t = min(seconds_since / 30.0, 1.0)
+
+    # Bright cyan (0, 255, 255) → Gray (148, 148, 148)
+    r = int(0 + 148 * t)
+    g = int(255 - 107 * t)  # 255 → 148
+    b = int(255 - 107 * t)  # 255 → 148
+
+    return f'\033[38;2;{r};{g};{b}m'

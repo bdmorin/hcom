@@ -6,19 +6,40 @@ from .instances import (
     update_instance_position, is_parent_instance
 )
 from .config import get_config
-from ..shared import MENTION_PATTERN, SENDER, CLAUDE_SENDER, SenderIdentity
+from ..shared import MENTION_PATTERN, SENDER, SenderIdentity, parse_iso_timestamp, format_age
 from .helpers import in_same_group_by_id, validate_scope, get_group_session_id, is_mentioned
 import sys
 
+# ==================== Formatting Helpers ====================
+
+def format_recipients(delivered_to: list[str], max_show: int = 10) -> str:
+    """Format recipients list for display.
+
+    Args:
+        delivered_to: Instances that received the message (enabled at send time)
+        max_show: Max names to show before truncating
+
+    Returns:
+        "alice, bob" or "5 instances" or "(none)"
+    """
+    if not delivered_to:
+        return "(none)"
+
+    if len(delivered_to) > max_show:
+        return f"{len(delivered_to)} instances"
+
+    return ", ".join(delivered_to)
+
+
 # ==================== Scope Computation ====================
 
-def compute_scope(identity: SenderIdentity, message: str, all_instances: list[str]) -> tuple[str, dict] | None:
+def compute_scope(identity: SenderIdentity, message: str, enabled_instances: list[str]) -> tuple[str, dict] | None:
     """Compute message scope and routing data.
 
     Args:
         identity: Sender identity (kind + name + instance_data)
         message: Message text
-        all_instances: List of all active instance names (for @mention validation)
+        enabled_instances: List of enabled instance names (for @mention validation)
 
     Returns:
         (scope, extra_data) tuple, or None on validation failure
@@ -29,41 +50,47 @@ def compute_scope(identity: SenderIdentity, message: str, all_instances: list[st
         - 'parent_broadcast': Parent broadcasting to other parents
         - 'subagent_group': Subagent broadcasting to same group
 
-    STRICT FAILURE: Unmatched @mentions return None and print error
+    STRICT FAILURE: @mentions to non-existent or disabled instances return None with error
     """
     # Check for @mentions FIRST (crosses all boundaries)
     if '@' in message:
         mentions = MENTION_PATTERN.findall(message)
         if mentions:
-            # Validate all mentions match real instances
+            # Validate all mentions match ENABLED instances only
             matched_instances = []
             unmatched = []
 
             for mention in mentions:
-                # Check if mention matches any instance (prefix match, case insensitive)
-                matches = [name for name in all_instances
-                          if name.lower().startswith(mention.lower())]
+                # Check if mention matches any ENABLED instance (prefix match, case insensitive)
+                # If mention has no :, only match local instances (exclude :-suffixed remotes)
+                # If mention has :, allow matching remote instances
+                if ':' in mention:
+                    # Mention includes device suffix - match any instance with prefix
+                    matches = [name for name in enabled_instances
+                              if name.lower().startswith(mention.lower())]
+                else:
+                    # Mention is bare name - only match local instances (no : in name)
+                    matches = [name for name in enabled_instances
+                              if ':' not in name and name.lower().startswith(mention.lower())]
                 if matches:
                     matched_instances.extend(matches)
                 else:
                     unmatched.append(mention)
 
-            # STRICT: fail loud on unmatched mentions
+            # STRICT: fail loud on unmatched mentions (non-existent OR disabled)
             if unmatched:
                 print(
-                    f"Error: Unmatched @mentions: {', '.join(f'@{m}' for m in unmatched)}",
+                    f"Error: @mentions to non-existent or stopped instances: {', '.join(f'@{m}' for m in unmatched)}",
                     file=sys.stderr
                 )
-                # Show available instances (up to 10)
-                available = all_instances[:10]
-                if all_instances:
-                    more = f" (and {len(all_instances) - 10} more)" if len(all_instances) > 10 else ""
-                    print(f"Available instances: {', '.join(available)}{more}", file=sys.stderr)
+                # Show available (enabled) instances
+                display = format_recipients(enabled_instances)
+                print(f"Available: {display}", file=sys.stderr)
                 return None
 
             # Deduplicate matched instances
             unique_instances = list(dict.fromkeys(matched_instances))
-            return ('mentions', {'mentioned_instances': unique_instances})
+            return ('mentions', {'mentions': unique_instances})
 
     # External senders broadcast (no mentions)
     if identity.broadcasts:
@@ -94,7 +121,7 @@ def _should_deliver(scope: str, extra: dict, receiver_name: str, sender_name: st
 
     Args:
         scope: Message scope ('broadcast', 'mentions', 'parent_broadcast', 'subagent_group')
-        extra: Extra scope data (mentioned_instances, group_id, etc)
+        extra: Extra scope data (mentions, group_id, etc)
         receiver_name: Instance to check delivery for
         sender_name: Sender name (excluded from delivery)
 
@@ -113,7 +140,7 @@ def _should_deliver(scope: str, extra: dict, receiver_name: str, sender_name: st
         return True
 
     if scope == 'mentions':
-        return receiver_name in extra.get('mentioned_instances', [])
+        return receiver_name in extra.get('mentions', [])
 
     if scope == 'parent_broadcast':
         receiver_data = load_instance_position(receiver_name)
@@ -162,31 +189,32 @@ def send_message(identity: SenderIdentity, message: str) -> list[str] | None:
         message: Message text
 
     Returns:
-        List of recipient names on success, None on failure (unmatched @mentions or DB error)
+        delivered_to list on success (enabled instances that will receive), None on failure
     """
     from .db import log_event, get_db
 
-    # Get real instances for recipient computation
     conn = get_db()
-    real_instances = [
+
+    # Get enabled instances only (for @mention validation AND delivery)
+    enabled_instances = [
         row['name'] for row in
-        conn.execute("SELECT name FROM instances WHERE previously_enabled = 1").fetchall()
+        conn.execute("SELECT name FROM instances WHERE enabled = 1").fetchall()
     ]
 
-    # For @mention validation: include CLI/TUI identities as valid targets
-    mentionable = real_instances + [SENDER, CLAUDE_SENDER]
+    # For @mention validation: enabled instances + CLI identity (bigboss)
+    mentionable = enabled_instances + [SENDER]
 
-    # Compute scope and routing data
+    # Compute scope and routing data (validates @mentions against enabled only)
     scope_result = compute_scope(identity, message, mentionable)
     if scope_result is None:
-        # Failed validation (unmatched @mentions) - error already printed
+        # Failed validation (unmatched or stopped @mentions) - error already printed
         return None
 
     scope, extra = scope_result
 
-    # Compute recipient snapshot using only real instances
-    recipients = [
-        inst_name for inst_name in real_instances
+    # Compute delivered_to: enabled instances in scope
+    delivered_to = [
+        inst_name for inst_name in enabled_instances
         if _should_deliver(scope, extra, inst_name, identity.name)
     ]
 
@@ -196,10 +224,10 @@ def send_message(identity: SenderIdentity, message: str) -> list[str] | None:
         'sender_kind': identity.kind,   # 'external' or 'instance' for filtering
         'scope': scope,                 # Routing scope
         'text': message,
-        'recipients': recipients        # Snapshot for read receipts
+        'delivered_to': delivered_to,   # Who received (enabled at send time)
     }
 
-    # Add scope extra data
+    # Add scope extra data (mentions, group_id)
     if extra:
         data.update(extra)
 
@@ -226,11 +254,18 @@ def send_message(identity: SenderIdentity, message: str) -> list[str] | None:
         print(f"Error: Failed to write message to database: {e}", file=sys.stderr)
         return None
 
+    # Push to relay server immediately (messages always push)
+    try:
+        from ..relay import push
+        push(force=True)
+    except Exception:
+        pass  # Best effort
+
     # Notify all instances after successful write
     from .runtime import notify_all_instances
     notify_all_instances()
 
-    return recipients
+    return delivered_to
 
 
 def send_system_message(sender_name: str, message: str) -> list[str] | None:
@@ -241,7 +276,7 @@ def send_system_message(sender_name: str, message: str) -> list[str] | None:
         message: Message text (can include @mentions for targeting)
 
     Returns:
-        List of recipient names on success, None on failure
+        delivered_to list on success, None on failure
     """
     identity = SenderIdentity(kind='system', name=sender_name, instance_data=None)
     return send_message(identity, message)
@@ -343,7 +378,11 @@ def should_deliver_message(event_data: dict, receiver_name: str, sender_name: st
         return True
 
     if scope == 'mentions':
-        return receiver_name in event_data.get('mentioned_instances', [])
+        mentions = event_data.get('mentions', [])
+        # Strip device suffix for cross-device matching
+        # e.g., 'mude' matches 'mude:BOXE' after stripping
+        receiver_base = receiver_name.split(':')[0]
+        return any(receiver_base == m.split(':')[0] for m in mentions)
 
     if scope == 'parent_broadcast':
         receiver_data = load_instance_position(receiver_name)
@@ -510,11 +549,11 @@ def get_read_receipts(identity: SenderIdentity, max_text_length: int = 50, limit
     if not sent_messages:
         return []
 
-    # Get all active instances (previously_enabled = True)
+    # Get all instances
     active_instances_query = """
-        SELECT name, last_event_id, session_id, mapid, parent_session_id
+        SELECT name, last_event_id, session_id, mapid, parent_session_id, origin_device_id
         FROM instances
-        WHERE previously_enabled = 1 AND name != ?
+        WHERE name != ?
     """
     active_instances = conn.execute(active_instances_query, (identity.name,)).fetchall()
 
@@ -522,7 +561,29 @@ def get_read_receipts(identity: SenderIdentity, max_text_length: int = 50, limit
         return []
 
     instance_reads = {row['name']: row['last_event_id'] for row in active_instances}
-    instance_data_cache = {row['name']: {'session_id': row['session_id'], 'mapid': row['mapid'], 'parent_session_id': row['parent_session_id']} for row in active_instances}
+    instance_data_cache = {row['name']: {
+        'session_id': row['session_id'],
+        'mapid': row['mapid'],
+        'parent_session_id': row['parent_session_id'],
+        'origin_device_id': row['origin_device_id']
+    } for row in active_instances}
+
+    # For remote instances, get their max msg_ts from status events
+    remote_msg_ts = {}
+    remote_instances = [row['name'] for row in active_instances if row['origin_device_id']]
+    if remote_instances:
+        # Query max msg_ts per remote instance from their status events
+        for inst_name in remote_instances:
+            row = conn.execute("""
+                SELECT json_extract(data, '$.msg_ts') as msg_ts
+                FROM events
+                WHERE type = 'status' AND instance = ?
+                  AND json_extract(data, '$.msg_ts') IS NOT NULL
+                ORDER BY id DESC LIMIT 1
+            """, (inst_name,)).fetchone()
+            if row and row['msg_ts']:
+                remote_msg_ts[inst_name] = row['msg_ts']
+
     receipts = []
     now = datetime.now(timezone.utc)
 
@@ -536,39 +597,39 @@ def get_read_receipts(identity: SenderIdentity, max_text_length: int = 50, limit
         if 'scope' not in msg_data:
             continue
 
-        # Use snapshotted recipients from send time
-        if 'recipients' not in msg_data:
+        # Use delivered_to for read receipt denominator
+        if 'delivered_to' not in msg_data:
             continue
 
-        recipients = msg_data['recipients']
+        delivered_to = msg_data['delivered_to']
 
         # Find recipients that HAVE read this message
         read_by = []
-        for inst_name in recipients:
-            # Check if instance has advanced past this message
+        for inst_name in delivered_to:
+            inst_data = instance_data_cache.get(inst_name)
+
+            # Remote instance: compare msg_ts (timestamp-based)
+            if inst_data and inst_data.get('origin_device_id'):
+                if inst_name in remote_msg_ts and remote_msg_ts[inst_name] >= msg_timestamp:
+                    read_by.append(inst_name)
+                continue
+
+            # Local instance: compare position (ID-based)
             if instance_reads.get(inst_name, 0) >= msg_id:
                 # For external senders, only mark as read if they were @mentioned
-                # (they only receive messages they're mentioned in)
-                inst_data = instance_data_cache.get(inst_name)
                 if inst_data:
                     from ..core.instances import is_external_sender
                     if is_external_sender(inst_data):
-                        # Only count as read if @mentioned
                         if not is_mentioned(msg_text, inst_name):
                             continue
                 read_by.append(inst_name)
 
-        total_recipients = len(recipients)
+        total_recipients = len(delivered_to)
 
-        # Only include if there are recipients
         if total_recipients > 0:
             # Calculate age
-            try:
-                msg_time = datetime.fromisoformat(msg_timestamp.replace('Z', '+00:00'))
-                age_seconds = (now - msg_time).total_seconds()
-                age_str = format_age(age_seconds)
-            except (ValueError, AttributeError):
-                age_str = "?"
+            msg_time = parse_iso_timestamp(msg_timestamp)
+            age_str = format_age((now - msg_time).total_seconds()) if msg_time else "?"
 
             # Truncate text
             if len(msg_text) > max_text_length:
@@ -587,6 +648,7 @@ def get_read_receipts(identity: SenderIdentity, max_text_length: int = 50, limit
     return receipts
 
 __all__ = [
+    'format_recipients',
     'compute_scope',
     '_should_deliver',
     'unescape_bash',
