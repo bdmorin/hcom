@@ -5,19 +5,21 @@ from pathlib import Path
 from datetime import datetime, timezone
 import os
 import sys
-import socket
+import socket  # noqa: F401 (re-export)
 import shlex
 import re
 
 from ..core.paths import hcom_path, LOGS_DIR
 from ..core.config import get_config
-from ..core.instances import load_instance_position, update_instance_position
+from ..core.instances import (
+    load_instance_position,  # noqa: F401 (re-export)
+    update_instance_position,
+)
 from ..core.runtime import (
-    build_claude_env,
-    build_hcom_bootstrap_text,
-    build_launch_context,
+    build_claude_env,  # noqa: F401 (re-export)
+    build_hcom_bootstrap_text,  # noqa: F401 (re-export)
     notify_instance,
-    notify_all_instances,
+    notify_all_instances,  # noqa: F401 (re-export)
 )
 
 # Platform detection

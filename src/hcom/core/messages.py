@@ -7,7 +7,7 @@ from .instances import (
 )
 from .config import get_config
 from ..shared import MENTION_PATTERN, SENDER, SenderIdentity, parse_iso_timestamp, format_age
-from .helpers import in_same_group_by_id, validate_scope, get_group_session_id, is_mentioned
+from .helpers import in_same_group_by_id, validate_scope, is_mentioned
 import sys
 
 # ==================== Formatting Helpers ====================
@@ -70,8 +70,10 @@ def compute_scope(identity: SenderIdentity, message: str, enabled_instances: lis
                               if name.lower().startswith(mention.lower())]
                 else:
                     # Mention is bare name - only match local instances (no : in name)
+                    # Don't match across underscore boundary (reserved for subagent hierarchy)
                     matches = [name for name in enabled_instances
-                              if ':' not in name and name.lower().startswith(mention.lower())]
+                              if ':' not in name and name.lower().startswith(mention.lower())
+                              and (len(name) == len(mention) or name[len(mention)] != '_')]
                 if matches:
                     matched_instances.extend(matches)
                 else:
@@ -79,10 +81,14 @@ def compute_scope(identity: SenderIdentity, message: str, enabled_instances: lis
 
             # STRICT: fail loud on unmatched mentions (non-existent OR disabled)
             if unmatched:
-                print(
-                    f"Error: @mentions to non-existent or stopped instances: {', '.join(f'@{m}' for m in unmatched)}",
-                    file=sys.stderr
-                )
+                # Special case: literal "@mention" in message text
+                if 'mention' in unmatched:
+                    print("Error: The literal text '@mention' is not a valid target - use actual instance names", file=sys.stderr)
+                else:
+                    print(
+                        f"Error: @mentions to non-existent or stopped instances: {', '.join(f'@{m}' for m in unmatched)}",
+                        file=sys.stderr
+                    )
                 # Show available (enabled) instances
                 display = format_recipients(enabled_instances)
                 print(f"Available: {display}", file=sys.stderr)
@@ -326,7 +332,8 @@ def get_unread_messages(instance_name: str, update_position: bool = False) -> tu
                 messages.append({
                     'timestamp': event['timestamp'],
                     'from': sender_name,
-                    'message': event_data['text']
+                    'message': event_data['text'],
+                    'delivered_to': event_data.get('delivered_to', [])
                 })
         except ValueError as e:
             print(
@@ -368,7 +375,7 @@ def should_deliver_message(event_data: dict, receiver_name: str, sender_name: st
 
     # Extract and validate scope
     if 'scope' not in event_data:
-        raise KeyError(f"Message missing 'scope' field (old format)")
+        raise KeyError("Message missing 'scope' field (old format)")
 
     scope = event_data['scope']
     validate_scope(scope)  # Raises ValueError if invalid
@@ -498,12 +505,34 @@ def get_subagent_messages(parent_name: str, since_id: int = 0, limit: int = 0) -
 # ==================== Message Formatting ====================
 
 def format_hook_messages(messages: list[dict[str, str]], instance_name: str) -> str:
-    """Format messages for hook feedback"""
+    """Format messages for hook feedback.
+
+    Single message uses verbose format: "sender → you + N others"
+    Multiple messages use compact format: "sender → you (+N)"
+    """
+    def _others_count(msg: dict) -> int:
+        """Count other recipients (excluding self)"""
+        delivered_to = msg.get('delivered_to', [])
+        # Others = total recipients minus self
+        return max(0, len(delivered_to) - 1)
+
     if len(messages) == 1:
         msg = messages[0]
-        reason = f"[new message] {msg['from']} → {instance_name}: {msg['message']}"
+        others = _others_count(msg)
+        if others > 0:
+            recipient = f"{instance_name} (+{others} other{'s' if others > 1 else ''})"
+        else:
+            recipient = instance_name
+        reason = f"[new message] {msg['from']} → {recipient}: {msg['message']}"
     else:
-        parts = [f"{msg['from']} → {instance_name}: {msg['message']}" for msg in messages]
+        parts = []
+        for msg in messages:
+            others = _others_count(msg)
+            if others > 0:
+                recipient = f"{instance_name} (+{others})"
+            else:
+                recipient = instance_name
+            parts.append(f"{msg['from']} → {recipient}: {msg['message']}")
         reason = f"[{len(messages)} new messages] | {' | '.join(parts)}"
 
     # Only append hints to messages
@@ -523,7 +552,6 @@ def get_read_receipts(identity: SenderIdentity, max_text_length: int = 50, limit
         List of dicts with keys: id, age, text, read_by, total_recipients
     """
     from .db import get_db
-    from ..shared import format_age
     from datetime import datetime, timezone
     import json
 

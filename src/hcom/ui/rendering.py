@@ -3,7 +3,7 @@ import re
 import shutil
 import textwrap
 import unicodedata
-from typing import List, Tuple
+from typing import Tuple
 
 # Import ANSI codes from shared
 from ..shared import (
@@ -109,6 +109,31 @@ def smart_truncate_name(name: str, width: int) -> str:
     return name[:prefix_len] + '…' + name[-suffix_len:] if suffix_len > 0 else name[:prefix_len] + '…'
 
 
+def truncate_path(path: str, max_len: int) -> str:
+    """
+    Truncate file path preserving filename at end.
+    Example: "/Users/anno/Dev/hook-comms/src/hcom/ui/rendering.py" → "…/ui/rendering.py"
+    """
+    if len(path) <= max_len:
+        return path
+    if max_len < 8:
+        return '…' + path[-(max_len - 1):]
+
+    # Split into directory and filename
+    sep = '/' if '/' in path else '\\'
+    parts = path.rsplit(sep, 1)
+    if len(parts) == 2:
+        dirname, filename = parts
+        # If filename alone is too long, truncate it from start
+        if len(filename) >= max_len - 2:
+            return '…' + sep + filename[-(max_len - 2):]
+        # Otherwise keep filename, truncate directory
+        remaining = max_len - len(filename) - 2  # "…" + sep
+        return '…' + dirname[-remaining:] + sep + filename
+    # No separator - just truncate from start
+    return '…' + path[-(max_len - 1):]
+
+
 class AnsiTextWrapper(textwrap.TextWrapper):
     """TextWrapper that handles ANSI escape codes correctly"""
 
@@ -126,10 +151,10 @@ class AnsiTextWrapper(textwrap.TextWrapper):
             width = self.width - ansi_len(indent)
 
             while chunks:
-                l = ansi_len(chunks[-1])
-                if cur_len + l <= width:
+                chunk_len = ansi_len(chunks[-1])
+                if cur_len + chunk_len <= width:
                     cur_line.append(chunks.pop())
-                    cur_len += l
+                    cur_len += chunk_len
                 else:
                     break
 

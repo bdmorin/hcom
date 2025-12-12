@@ -25,8 +25,8 @@ from .input import (
 # Import from shared
 from ..shared import (
     RESET, BOLD, DIM,
-    FG_WHITE, FG_GRAY, FG_YELLOW, FG_LIGHTGRAY, FG_ORANGE, FG_GOLD, FG_DELIVER,
-    FG_GREEN, FG_RED,
+    FG_WHITE, FG_GRAY, FG_YELLOW, FG_LIGHTGRAY, FG_ORANGE, FG_DELIVER,
+    FG_RED,
     BG_CHARCOAL, BG_GRAY,
     STATUS_MAP, STATUS_FG,
     format_age, shorten_path, parse_iso_timestamp,
@@ -62,7 +62,7 @@ class ManageScreen:
 
     def _render_instance_row(self, name: str, info: dict, display_idx: int, name_col_width: int, width: int, is_remote: bool = False) -> str:
         """Render a single instance row"""
-        from ..core.instances import is_external_sender, is_remote_instance
+        from ..core.instances import is_external_sender
 
         enabled = info.get('enabled', False)
         status = info.get('status', "unknown")
@@ -149,18 +149,21 @@ class ManageScreen:
         # Calculate layout using shared function
         instance_rows, message_rows, input_rows = self.calculate_layout(layout_height, width)
 
-        # Launch status banner (if active batch not yet ready)
+        # Launch status rows (if active batch not yet ready)
         if self.state.launch_batch:
             batch = self.state.launch_batch
             if self.state.launch_batch_failed and time.time() < self.state.launch_batch_failed_until:
                 # Failed state - red banner for 5s
                 banner = f"{FG_RED}Launch failed: {batch['ready']}/{batch['expected']} ready (timed out){RESET}"
+                lines.append(banner)
+                instance_rows -= 1
             else:
-                # Normal launching state - yellow with dots
-                dots = '.' * (1 + int(time.time()) % 3)
-                banner = f"{FG_YELLOW}Launching{dots} {batch['ready']}/{batch['expected']} ready{RESET}"
-            lines.append(banner)
-            instance_rows -= 1  # Reserve row for banner
+                # Normal launching state - one row per pending instance
+                spinner = '◎○'[int(time.time() * 2) % 2]
+                pending = batch['expected'] - batch['ready']
+                for _ in range(pending):
+                    lines.append(f"{FG_YELLOW}{spinner} launching{RESET}")
+                    instance_rows -= 1
 
         from ..core.instances import is_remote_instance
 
@@ -321,8 +324,10 @@ class ManageScreen:
             has_external = any(is_external_sender(info.get('data', {})) for _, info in all_for_width)
             # Calculate max badge length: " [headless]" (11) + " [external]" (11) = 22
             badge_len = 0
-            if has_background: badge_len += 11
-            if has_external: badge_len += 11
+            if has_background:
+                badge_len += 11
+            if has_external:
+                badge_len += 11
             # Add space for state symbol on cursor row (2 chars: " +")
             name_col_width = max_instance_name_len + badge_len + 2
             # Set bounds: min 20, max based on terminal width
@@ -372,23 +377,23 @@ class ManageScreen:
                     is_cursor = (display_idx == self.state.cursor)
                     arrow = "▼" if self.state.show_remote else "▶"
 
-                    # Build sync status when expanded: relay (ALIAS:1m, ALIAS:2s) ▼
+                    # Build sync status when expanded: relay (BOXE:1m, CATA:2s) ▼
                     if self.state.show_remote and self.state.device_sync_times:
-                        # Build device_id -> alias mapping from remote instances
-                        device_aliases = {}
+                        # Build device_id -> suffix mapping from remote instances
+                        device_suffixes = {}
                         for name, info in remote_instances:
                             origin_device = info.get('data', {}).get('origin_device_id', '')
                             if origin_device and ':' in name:
-                                alias = name.rsplit(':', 1)[1]
-                                device_aliases[origin_device] = alias
+                                suffix = name.rsplit(':', 1)[1]
+                                device_suffixes[origin_device] = suffix
 
                         sync_parts = []
                         for device, sync_time in sorted(self.state.device_sync_times.items()):
                             if sync_time:
                                 sync_age = time.time() - sync_time
-                                alias = device_aliases.get(device, device[:4].upper())
+                                suffix = device_suffixes.get(device, device[:4].upper())
                                 color = get_device_sync_color(sync_age)
-                                sync_parts.append(f"{color}{alias}:{format_age(sync_age)}{FG_GRAY}")
+                                sync_parts.append(f"{color}{suffix}:{format_age(sync_age)}{FG_GRAY}")
 
                         if sync_parts:
                             sep_text = f" relay ({', '.join(sync_parts)}) {arrow} "
@@ -704,8 +709,6 @@ class ManageScreen:
         """Handle keys in Manage mode"""
         # Build display lists
         enabled, stopped, remote, display_count = self._get_display_lists()
-        stopped_count = len(stopped)
-        remote_count = len(remote)
         stopped_sep, remote_sep = self._get_separator_positions(enabled, stopped, remote)
 
         if key == 'UP':
@@ -866,7 +869,7 @@ class ManageScreen:
                             # DEBUG: Log TUI toggle action
                             from ..hooks.utils import log_hook_error
                             parent_name = info['data'].get('parent_name', 'none')
-                            log_hook_error(f'tui:toggle_stop', f'TUI calling cmd_stop for {name} (parent={parent_name}, enabled={is_enabled})')
+                            log_hook_error('tui:toggle_stop', f'TUI calling cmd_stop for {name} (parent={parent_name}, enabled={is_enabled})')
 
                             # Suppress CLI output to prevent TUI corruption
                             with _suppress_output():
@@ -1009,9 +1012,8 @@ class ManageScreen:
 
     def build_instance_detail(self, name: str, width: int) -> List[str]:
         """Build instance metadata display (similar to hcom list --verbose)"""
-        import os
         import time
-        from ..core.instances import is_external_sender, is_remote_instance
+        from ..core.instances import is_remote_instance
 
         lines = []
 

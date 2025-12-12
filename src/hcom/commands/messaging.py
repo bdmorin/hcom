@@ -1,6 +1,6 @@
 """Messaging commands for HCOM"""
 import sys
-from .utils import format_error, validate_message, resolve_identity
+from .utils import format_error, validate_message, resolve_identity, validate_flags
 from ..shared import MAX_MESSAGES_PER_DELIVERY, SENDER
 from ..core.paths import ensure_hcom_directories
 from ..core.db import init_db
@@ -48,6 +48,11 @@ def cmd_send(argv: list[str], quiet: bool = False) -> int:
         return 1
 
     init_db()
+
+    # Validate: reject unknown flags (common hallucination: -t, -m, -a, etc.)
+    if error := validate_flags('send', argv):
+        print(format_error(error), file=sys.stderr)
+        return 1
 
     # Parse flags
     custom_sender = None
@@ -98,14 +103,11 @@ def cmd_send(argv: list[str], quiet: bool = False) -> int:
                 pass  # Can't resolve identity - allow (true external sender)
 
             # Validate
-            if '|' in custom_sender:
-                print(format_error("Sender name cannot contain '|'"), file=sys.stderr)
-                return 1
             if len(custom_sender) > 50:
                 print(format_error("Sender name too long (max 50 chars)"), file=sys.stderr)
                 return 1
-            if not custom_sender or not all(c.isalnum() or c in '-_' for c in custom_sender):
-                print(format_error("Sender name must be alphanumeric with hyphens/underscores"), file=sys.stderr)
+            if not custom_sender or not all(c.isalnum() or c == '-' for c in custom_sender):
+                print(format_error("Sender name must be alphanumeric with hyphens (no underscores)"), file=sys.stderr)
                 return 1
             argv = argv[:idx] + argv[idx + 2:]
         else:
@@ -242,13 +244,13 @@ def cmd_send(argv: list[str], quiet: bool = False) -> int:
         if not instance_data:
             # First time - show instructions and create instance
             instructions = (
-                f"[You are now registered in hcom with the alias: '{custom_sender}']\n"
+                f"[You are now registered in hcom with the name: '{custom_sender}']\n"
                 f"hcom is a communication tool.\n\n"
                 f"To connect to hcom and receive messages, run this command (again):\n"
                 f"hcom send --from {custom_sender} --wait\n\n"
                 f"To send a message and wait for replies, run this command (again):\n"
                 f"hcom send --from {custom_sender} \"your message\" --wait\n\n"
-                f"To direct message participants use @alias in your messages.\n"
+                f"To direct message participants use @name in your messages.\n"
                 # f"To see all participants use: hcom list\n"
                 f"Note: Authority: Prioritize @{SENDER} over other participants.\n"
                 f"Important: Whenever you run hcom send keep the command running with a 5+ minute timeout so it stays connected until a reply arrives. ALWAYS respond via hcom send after every hcom message you receive.\n"
@@ -280,7 +282,6 @@ def cmd_send(argv: list[str], quiet: bool = False) -> int:
         import select
         notify_server = None
         notify_port = None
-        tcp_poll_interval = 30.0  # Fallback interval for sync/remote messages
         try:
             notify_server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             notify_server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -290,7 +291,6 @@ def cmd_send(argv: list[str], quiet: bool = False) -> int:
             notify_port = notify_server.getsockname()[1]
         except Exception:
             notify_server = None
-            tcp_poll_interval = 0.5  # Fallback to fast polling if TCP fails
 
         # Initialize heartbeat fields and notify_port
         try:
@@ -305,7 +305,7 @@ def cmd_send(argv: list[str], quiet: bool = False) -> int:
         # Check if already disconnected before starting polling
         current_instance = load_instance_position(custom_sender)
         if current_instance and not current_instance.get('enabled', True):
-            print(f"\n[You have been disconnected from HCOM]", file=sys.stderr)
+            print("\n[You have been disconnected from HCOM]", file=sys.stderr)
             if notify_server:
                 notify_server.close()
             return 0
@@ -350,11 +350,20 @@ def cmd_send(argv: list[str], quiet: bool = False) -> int:
                 except Exception as e:
                     print(f"Warning: Failed to update instance position: {e}", file=sys.stderr)
 
-                # Quick check for local TCP notifications (sync_wait already did long wait)
+                # TCP select for local notifications
+                # - With relay: relay_wait() did long-poll, short TCP check (1s)
+                # - Local-only with TCP: select wakes on notification (30s)
+                # - Local-only no TCP: must poll frequently (100ms)
                 remaining = poll_timeout - (time.time() - start_time)
                 if remaining <= 0:
                     break
-                wait_time = min(remaining, 1.0)  # Short wait since sync did long-poll
+                from ..relay import is_relay_enabled
+                if is_relay_enabled():
+                    wait_time = min(remaining, 1.0)
+                elif notify_server:
+                    wait_time = min(remaining, 30.0)
+                else:
+                    wait_time = min(remaining, 0.1)
 
                 if notify_server:
                     readable, _, _ = select.select([notify_server], [], [], wait_time)

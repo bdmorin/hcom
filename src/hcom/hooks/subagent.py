@@ -12,10 +12,11 @@ from .family import check_external_stop_notification
 # ============ TASK CONTEXT TRACKING ============
 
 def in_subagent_context(session_id_or_name: str) -> bool:
-    """Check if session/instance is in subagent context (Task active, parent frozen)
+    """Check if session/instance is in subagent context (Task active).
 
     Uses database running_tasks.active field for cross-process detection.
     Task is active if running_tasks JSON has active=true.
+    Note: Parent frozen only for foreground Tasks; background Tasks allow live bidirectional comms.
 
     Args:
         session_id_or_name: Either session_id (from hooks) or instance_name (from commands)
@@ -41,6 +42,104 @@ def in_subagent_context(session_id_or_name: str) -> bool:
         return running_tasks.get('active', False)
     except (json.JSONDecodeError, AttributeError):
         return False
+
+
+def check_dead_subagents(transcript_path: str, running_tasks: dict) -> list[str]:
+    """Return list of dead subagent agent_ids by checking multiple signals
+
+    Called by UserPromptSubmit to clean up stale subagents.
+    """
+    from pathlib import Path
+    import time
+
+    dead = []
+    transcript_dir = Path(transcript_path).parent if transcript_path else None
+    conn = get_db()
+    # Subagent dead if transcript unchanged for 2x timeout (session ended before SubagentStop cleanup)
+    stale_threshold = get_config().subagent_timeout * 2
+
+    for subagent in running_tasks.get('subagents', []):
+        agent_id = subagent.get('agent_id')
+        if not agent_id:
+            continue
+
+        # Rare: instance disabled but still in running_tasks (SubagentStop cleanup failed)
+        row = conn.execute(
+            "SELECT enabled FROM instances WHERE agent_id = ?",
+            (agent_id,)
+        ).fetchone()
+        if row and not row['enabled']:
+            dead.append(agent_id)
+            continue
+
+        if not transcript_dir:
+            dead.append(agent_id)
+            continue
+
+        agent_transcript = transcript_dir / f'agent-{agent_id}.jsonl'
+        try:
+            if not agent_transcript.exists():
+                dead.append(agent_id)
+                continue
+
+            # Stale: transcript not modified in 2x timeout = session ended without cleanup
+            mtime = agent_transcript.stat().st_mtime
+            if time.time() - mtime > stale_threshold:
+                dead.append(agent_id)
+                continue
+
+            # Check last 4KB for interrupt marker
+            with open(agent_transcript, 'rb') as f:
+                f.seek(0, 2)
+                size = f.tell()
+                f.seek(max(0, size - 4096))
+                tail = f.read().decode('utf-8', errors='ignore')
+                if '[Request interrupted by user]' in tail:
+                    dead.append(agent_id)
+        except Exception:
+            dead.append(agent_id)  # Can't read = assume dead
+
+    return dead
+
+
+def cleanup_dead_subagents(session_id: str, transcript_path: str) -> None:
+    """Check and remove dead subagents from running_tasks
+
+    Called by UserPromptSubmit when in subagent context.
+    """
+    from .utils import log_hook_error
+
+    instance_name = find_instance_by_session(session_id)
+    if not instance_name:
+        log_hook_error('cleanup_dead:no_instance', session_id)
+        return
+
+    instance_data = load_instance_position(instance_name)
+    if not instance_data:
+        log_hook_error('cleanup_dead:no_data', instance_name)
+        return
+
+    running_tasks = parse_running_tasks(instance_data.get('running_tasks', ''))
+    if not running_tasks.get('subagents'):
+        log_hook_error('cleanup_dead:no_subagents', instance_name)
+        return
+
+    log_hook_error('cleanup_dead:checking', f'{instance_name} subagents={running_tasks.get("subagents")} transcript={transcript_path}')
+    dead_ids = check_dead_subagents(transcript_path, running_tasks)
+    log_hook_error('cleanup_dead:result', f'dead_ids={dead_ids}')
+    if not dead_ids:
+        return
+
+    # Remove dead subagents
+    for agent_id in dead_ids:
+        _remove_subagent_from_parent(instance_name, agent_id)
+        # Also disable the subagent instance if it exists
+        conn = get_db()
+        row = conn.execute("SELECT name FROM instances WHERE agent_id = ?", (agent_id,)).fetchone()
+        if row:
+            from .utils import disable_instance
+            disable_instance(row['name'], initiated_by='system', reason='exit:interrupted')
+            set_status(row['name'], 'inactive', 'exit:interrupted')
 
 
 def track_subagent(parent_session_id: str, agent_id: str, agent_type: str) -> None:
@@ -186,8 +285,8 @@ def subagent_start(hook_data: dict[str, Any]) -> None:
 
     # Minimal hint - cmd_start resolves parent from identity and looks up type from running_tasks
     hcom_cmd = build_hcom_command()
-    hint = f"[HCOM INFORMATION] hcom is a communication tool for interacting with other claude code instances.\n"
-    hint += f"To use hcom, you must run this command first: '{hcom_cmd} start --agentid {agent_id}'\n"
+    hint = "[HCOM INFORMATION] hcom is a communication tool for interacting with other claude code instances.\n"
+    hint += f"To use hcom, you MUST run this command first: '{hcom_cmd} start --agentid {agent_id}'\n"
     hint += f"If you have been prompted to run any hcom commands, assume you must add --agentid {agent_id} to every command\n"
     hint += f"Important: hcom will not work until you first register with: '{hcom_cmd} start --agentid {agent_id}'"
 

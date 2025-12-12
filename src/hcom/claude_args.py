@@ -43,6 +43,8 @@ _BOOLEAN_FLAGS = {
     "--fork-session",
     "--ide",
     "--strict-mcp-config",
+    "--no-session-persistence",
+    "--disable-slash-commands",
     "-v", "--version",
     "-h", "--help",
 }
@@ -85,6 +87,7 @@ _VALUE_FLAGS = {
     "--fallback-model",
     "--input-format",
     "--json-schema",
+    "--max-budget-usd",
     "--max-turns",
     "--mcp-config",
     "--model",
@@ -111,6 +114,7 @@ _VALUE_FLAG_PREFIXES = {
     "--fallback-model=",
     "--input-format=",
     "--json-schema=",
+    "--max-budget-usd=",
     "--max-turns=",
     "--mcp-config=",
     "--model=",
@@ -569,8 +573,6 @@ def _parse_tokens(
     pending_generic_flag: str | None = None
     after_double_dash = False
 
-    system_flag: str | None = None
-    system_value: str | None = None
     user_system: str | None = None
     user_append: str | None = None
     is_background = False
@@ -590,8 +592,6 @@ def _parse_tokens(
                 advance = False
             else:
                 system_entries.append((pending_system, token))
-                system_flag = pending_system
-                system_value = token
                 if pending_system == "--system-prompt":
                     user_system = token
                 else:
@@ -666,8 +666,6 @@ def _parse_tokens(
         if system_assignment:
             assigned_flag, value = system_assignment
             system_entries.append((assigned_flag, value))
-            system_flag = assigned_flag
-            system_value = value
             if assigned_flag == "--system-prompt":
                 user_system = value
             else:

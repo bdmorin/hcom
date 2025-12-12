@@ -8,25 +8,15 @@ import os
 import sys
 import json
 import io
-import tempfile
 import shutil
-import shlex
-import re
-import subprocess
 import time
-import select
-import platform
-import random
 from pathlib import Path
-from datetime import datetime, timedelta
-from typing import Any, Callable, NamedTuple, TextIO
-from dataclasses import dataclass
-from contextlib import contextmanager
+from typing import Any
 
 if os.name == 'nt':
-    import msvcrt
+    pass
 else:
-    import fcntl
+    pass
 
 # Import from shared module
 from .shared import (
@@ -61,21 +51,22 @@ from .core.runtime import build_claude_env
 # Import command implementations
 from .commands import (
     cmd_launch,
-    cmd_stop,
-    cmd_start,
-    cmd_send,
-    cmd_events,
-    cmd_reset,
+    cmd_stop,  # noqa: F401 (used dynamically via globals())
+    cmd_start,  # noqa: F401 (used dynamically via globals())
+    cmd_send,  # noqa: F401 (used dynamically via globals())
+    cmd_events,  # noqa: F401 (used dynamically via globals())
+    cmd_reset,  # noqa: F401 (used dynamically via globals())
     cmd_help,
-    cmd_list,
-    cmd_relay,
-    cmd_config,
+    cmd_list,  # noqa: F401 (used dynamically via globals())
+    cmd_relay,  # noqa: F401 (used dynamically via globals())
+    cmd_config,  # noqa: F401 (used dynamically via globals())
+    cmd_thread,  # noqa: F401 (used dynamically via globals())
     CLIError,
     format_error,
 )
 
 # Commands that support --help (maps to cmd_* functions)
-COMMANDS = ('events', 'send', 'stop', 'start', 'reset', 'list', 'config', 'relay')
+COMMANDS = ('events', 'send', 'stop', 'start', 'reset', 'list', 'config', 'relay', 'thread')
 
 
 def _run_command(name: str, argv: list[str]) -> int:
@@ -444,17 +435,26 @@ def main(argv: list[str] | None = None) -> int | None:
     check_and_migrate_legacy_messages()
 
     # Subagent context: require --agentid for all commands
+    # Both subagents (--agentid <uuid>) and parent (--agentid parent) must identify
     if argv and '--agentid' not in argv and os.environ.get('CLAUDECODE') == '1':
         try:
             from .commands.utils import resolve_identity
-            from .hooks.subagent import in_subagent_context
+            from .hooks.subagent import in_subagent_context, cleanup_dead_subagents
+            from .core.instances import load_instance_position
             identity = resolve_identity()
             if identity.name and in_subagent_context(identity.name):
-                print(format_error(
-                    "Task subagent must provide --agentid",
-                    f"Use: hcom {argv[0]} --agentid <agent_id> ..."
-                ), file=sys.stderr)
-                return 1
+                # Cleanup stale subagents before blocking (mtime check catches session-ended cases)
+                instance_data = load_instance_position(identity.name)
+                transcript_path = instance_data.get('transcript_path', '') if instance_data else ''
+                if transcript_path and identity.session_id:
+                    cleanup_dead_subagents(identity.session_id, transcript_path)
+                # Re-check after cleanup
+                if in_subagent_context(identity.name):
+                    print(format_error(
+                        "Subagent context active - explicit identity required",
+                        f"Use: hcom {argv[0]} --agentid parent (for parent) or --agentid <uuid> (for subagent)"
+                    ), file=sys.stderr)
+                    return 1
         except ValueError:
             pass  # Can't resolve identity - not relevant
 

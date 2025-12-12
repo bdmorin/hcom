@@ -86,11 +86,11 @@ def init_db(conn: Optional[sqlite3.Connection] = None) -> None:
         - id: autoincrement primary key for position tracking
         - timestamp: ISO 8601 datetime for time-based queries
         - type: event type ('message', 'status', 'life')
-        - instance: instance alias (sender for messages, subject for status/life)
+        - instance: instance name (sender for messages, subject for status/life)
         - data: JSON blob with type-specific fields
 
         instances(name, session_id, parent_session_id, ...)
-        - name: instance alias (primary key)
+        - name: instance name (primary key)
         - session_id: unique session identifier (NULL for vanilla)
         - parent_session_id: parent's session_id for subagents
 
@@ -132,6 +132,7 @@ def init_db(conn: Optional[sqlite3.Connection] = None) -> None:
             status TEXT DEFAULT 'unknown',
             status_time INTEGER DEFAULT 0,
             status_context TEXT DEFAULT '',
+            status_detail TEXT DEFAULT '',
             last_stop INTEGER DEFAULT 0,
             directory TEXT,
             created_at REAL NOT NULL,
@@ -141,7 +142,7 @@ def init_db(conn: Optional[sqlite3.Connection] = None) -> None:
             notify_port INTEGER,
             background INTEGER DEFAULT 0,
             background_log_file TEXT DEFAULT '',
-            alias_announced INTEGER DEFAULT 0,
+            name_announced INTEGER DEFAULT 0,
             launch_context_announced INTEGER DEFAULT 0,
             external_stop_pending INTEGER DEFAULT 0,
             session_ended INTEGER DEFAULT 0,
@@ -189,6 +190,25 @@ def init_db(conn: Optional[sqlite3.Connection] = None) -> None:
             if 'duplicate column' not in str(e).lower():
                 raise
 
+    # Migrate existing databases: add status_detail column if missing
+    cursor = conn.execute("PRAGMA table_info(instances)")
+    columns = {row['name'] for row in cursor.fetchall()}
+    if 'status_detail' not in columns:
+        try:
+            conn.execute("ALTER TABLE instances ADD COLUMN status_detail TEXT DEFAULT ''")
+            conn.commit()
+        except sqlite3.OperationalError as e:
+            if 'duplicate column' not in str(e).lower():
+                raise
+
+    # Migrate existing databases: rename alias_announced -> name_announced
+    # (Python 3.10+ always bundles SQLite >= 3.37, which supports RENAME COLUMN)
+    cursor = conn.execute("PRAGMA table_info(instances)")
+    columns = {row['name'] for row in cursor.fetchall()}
+    if 'alias_announced' in columns and 'name_announced' not in columns:
+        conn.execute("ALTER TABLE instances RENAME COLUMN alias_announced TO name_announced")
+        conn.commit()
+
     # Create indexes for common query patterns
     conn.execute("CREATE INDEX IF NOT EXISTS idx_timestamp ON events(timestamp)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_type ON events(type)")
@@ -207,6 +227,31 @@ def init_db(conn: Optional[sqlite3.Connection] = None) -> None:
 
     # Create mapid_sessions index
     conn.execute("CREATE INDEX IF NOT EXISTS idx_mapid_sessions_updated ON mapid_sessions(updated_at DESC)")
+
+    # Create flattened events view for simpler SQL queries
+    # Claude can write: msg_from = 'alice' instead of json_extract(data, '$.from') = 'alice'
+    conn.execute("""
+        CREATE VIEW IF NOT EXISTS events_v AS
+        SELECT
+            id, timestamp, type, instance, data,
+            -- message fields
+            json_extract(data, '$.from') as msg_from,
+            json_extract(data, '$.text') as msg_text,
+            json_extract(data, '$.scope') as msg_scope,
+            json_extract(data, '$.sender_kind') as msg_sender_kind,
+            json_extract(data, '$.delivered_to') as msg_delivered_to,
+            json_extract(data, '$.mentions') as msg_mentions,
+            -- status fields
+            json_extract(data, '$.status') as status_val,
+            json_extract(data, '$.context') as status_context,
+            json_extract(data, '$.detail') as status_detail,
+            -- life fields
+            json_extract(data, '$.action') as life_action,
+            json_extract(data, '$.by') as life_by,
+            json_extract(data, '$.batch_id') as life_batch_id,
+            json_extract(data, '$.reason') as life_reason
+        FROM events
+    """)
 
     conn.commit()
 
@@ -257,7 +302,7 @@ def log_event(
 
     Args:
         event_type: Event type ('message', 'status', 'life')
-        instance: Instance alias (sender for messages, subject for status/life)
+        instance: Instance name (sender for messages, subject for status/life)
         data: Type-specific event data
         timestamp: Optional ISO 8601 timestamp (defaults to now)
 
@@ -275,6 +320,9 @@ def log_event(
         )
         conn.commit()
         event_id = cursor.lastrowid
+
+    # Check event subscriptions (inline, no daemon)
+    _check_event_subscriptions(event_id, event_type, instance, data, timestamp)
 
     # Sync export moved to hook dispatcher (rate-limited, builds from SQLite)
     # No duplicate JSONL append needed - single source of truth
@@ -634,6 +682,143 @@ def kv_set(key: str, value: str | None) -> None:
                 (key, value)
             )
         conn.commit()
+
+
+# ==================== Event Subscriptions ====================
+
+
+def _log_sub_error(sub_id: str, error: str, exc: Exception | None = None) -> None:
+    """Log subscription errors to hooks.log."""
+    from .paths import hcom_path, LOGS_DIR
+    import traceback
+    try:
+        log_file = hcom_path(LOGS_DIR) / "hooks.log"
+        ts = datetime.now(timezone.utc).isoformat()
+        msg = f"{ts}|sub:{sub_id}|{error}"
+        if exc:
+            tb = ''.join(traceback.format_exception(type(exc), exc, exc.__traceback__))
+            msg += f": {exc}\n{tb}"
+        with open(log_file, 'a') as f:
+            f.write(msg + "\n")
+    except (OSError, PermissionError):
+        pass
+
+
+def _format_sub_notification(sub_id: str, event_id: int, event_type: str, instance: str, data: dict[str, Any]) -> str:
+    """Format event notification - concise pipe-delimited for readability."""
+    # Preset-specific prefixes
+    if sub_id.startswith('collision'):
+        prefix = "COLLISION WARNING: "
+    else:
+        prefix = ""
+
+    parts = [f"[sub:{sub_id}]", f"#{event_id}", event_type, instance]
+
+    if event_type == 'message':
+        text = data.get('text', '')
+        if len(text) > 60:
+            text = text[:57] + '...'
+        parts.append(f"from:{data.get('from', '?')}")
+        parts.append(f'"{text}"')
+    elif event_type == 'status':
+        parts.append(data.get('status', '?'))
+        if ctx := data.get('context', ''):
+            parts.append(ctx)
+        if detail := data.get('detail', ''):
+            if len(detail) > 40:
+                detail = '...' + detail[-37:]
+            parts.append(detail)
+    elif event_type == 'life':
+        parts.append(data.get('action', '?'))
+        if by := data.get('by', ''):
+            parts.append(f"by:{by}")
+
+    return prefix + ' | '.join(parts)
+
+
+def _check_event_subscriptions(
+    event_id: int,
+    event_type: str,
+    instance: str,
+    data: dict[str, Any],
+    timestamp: str
+) -> None:
+    """Check subscriptions and send matching events to subscribers.
+
+    Called inline from log_event(). Errors logged to hooks.log.
+    """
+    # Recursion guard: skip system messages (prevents notification loops)
+    if instance.startswith('sys_'):
+        return
+
+    conn = get_db()
+    try:
+        rows = conn.execute(
+            "SELECT key, value FROM kv WHERE key LIKE 'events_sub:%'"
+        ).fetchall()
+    except Exception as e:
+        _log_sub_error('*', 'query failed', e)
+        return
+
+    if not rows:
+        return
+
+    for row in rows:
+        sub_id = '?'
+        try:
+            sub = json.loads(row['value'])
+            sub_id = sub.get('id', row['key'])
+
+            # Skip already processed
+            if event_id <= sub.get('last_id', 0):
+                continue
+
+            # Check SQL filter
+            sql = sub.get('sql', '')
+            if sql:
+                try:
+                    match = conn.execute(
+                        f"SELECT 1 FROM events_v WHERE id = ? AND ({sql})",
+                        (event_id,)
+                    ).fetchone()
+                except Exception as e:
+                    _log_sub_error(sub_id, f'SQL error: {sql[:50]}', e)
+                    continue
+                if not match:
+                    continue
+
+            # Match - send notification
+            caller = sub.get('caller', '')
+            if not caller:
+                _log_sub_error(sub_id, 'no caller')
+                continue
+
+            notification = _format_sub_notification(sub_id, event_id, event_type, instance, data)
+            if not _send_sub_notification(caller, notification):
+                _log_sub_error(sub_id, f'notify {caller} failed')
+
+            # Update last_id or remove if --once
+            if sub.get('once'):
+                kv_set(row['key'], None)
+            else:
+                sub['last_id'] = event_id
+                kv_set(row['key'], json.dumps(sub))
+
+        except json.JSONDecodeError as e:
+            _log_sub_error(sub_id, 'corrupt JSON', e)
+        except Exception as e:
+            _log_sub_error(sub_id, 'unexpected error', e)
+
+
+def _send_sub_notification(caller: str, message: str) -> bool:
+    """Send subscription notification. Returns True on success."""
+    from .messages import send_system_message
+    try:
+        result = send_system_message('[hcom-events]', f"@{caller} {message}")
+        return result is not None
+    except Exception:
+        return False
+
 
 __all__ = [
     # Events

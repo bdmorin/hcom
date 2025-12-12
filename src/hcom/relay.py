@@ -515,7 +515,7 @@ def send_control(action: str, target: str, device_short_id: str) -> bool:
 def _handle_control_events(events: list[dict], own_short_id: str, source_device: str) -> None:
     """Process control events targeting this device."""
     from .hooks.utils import disable_instance
-    from .core.instances import enable_instance, update_instance_position
+    from .core.instances import enable_instance
 
     # Dedup: skip already-processed control events from this device
     last_ctrl_ts = float(kv_get(f'relay_ctrl_{source_device}') or 0)

@@ -25,7 +25,7 @@ FG_CLAUDE_ORANGE = '\033[38;5;214m'  # Light orange for Claude section
 FG_CUSTOM_ENV = '\033[38;5;141m'  # Light purple for Custom Env section
 
 # Parse config defaults from shared.py
-from ..shared import DEFAULT_CONFIG_DEFAULTS
+from ..shared import DEFAULT_CONFIG_DEFAULTS  # noqa: E402
 
 CONFIG_DEFAULTS = {}
 for line in DEFAULT_CONFIG_DEFAULTS:
@@ -78,7 +78,7 @@ CONFIG_FIELD_OVERRIDES = {
     },
 }
 
-from .tui import HcomTUI
+from .tui import HcomTUI  # noqa: E402
 
 def run_tui(hcom_dir: Path) -> int:
     """Public API: run TUI application"""

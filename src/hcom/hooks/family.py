@@ -94,8 +94,7 @@ def poll_messages(
         if not instance_data or not instance_data.get('enabled', False):
             if instance_data and not instance_data.get('enabled'):
                 # DEBUG: Log disabled instance detected
-                from .utils import log_hook_error
-                log_hook_error(f'poll_messages:disabled', f'Instance {instance_id} is disabled, exiting poll')
+                log_hook_error('poll_messages:disabled', f'Instance {instance_id} is disabled, exiting poll')
                 set_status(instance_id, 'inactive', 'exit:disabled')
             return (0, None, False)
 
@@ -174,8 +173,16 @@ def poll_messages(
                     break
 
                 # TCP select for local notifications
-                # relay_wait() already did long-poll, so just short check here
-                wait_time = min(remaining, 1.0)
+                # - With relay: relay_wait() did long-poll, short TCP check (1s)
+                # - Local-only with TCP: select wakes on notification (30s)
+                # - Local-only no TCP: must poll frequently (100ms)
+                from ..relay import is_relay_enabled
+                if is_relay_enabled():
+                    wait_time = min(remaining, 1.0)
+                elif notify_server:
+                    wait_time = min(remaining, 30.0)
+                else:
+                    wait_time = min(remaining, 0.1)
 
                 if notify_server:
                     import select

@@ -13,7 +13,7 @@ from ..core.paths import read_file_with_retry
 HOOK_CONFIGS = [
     ('SessionStart', '', 'sessionstart', None),
     ('UserPromptSubmit', '', 'userpromptsubmit', None),
-    ('PreToolUse', 'Bash|Task', 'pre', None),
+    ('PreToolUse', 'Bash|Task|Write|Edit', 'pre', None),
     ('PostToolUse', '', 'post', 86400),
     ('Stop', '', 'poll', 86400),          # Poll for messages (24hr max timeout)
     ('SubagentStart', '', 'subagent-start', None),  # Subagent birth hook (test)

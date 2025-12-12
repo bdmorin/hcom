@@ -73,7 +73,7 @@ def update_instance_position(instance_name: str, update_fields: dict[str, Any]) 
         # Convert booleans to integers for SQLite
         update_copy = update_fields.copy()
         for bool_field in ['enabled', 'tcp_mode', 'background',
-                           'alias_announced', 'launch_context_announced',
+                           'name_announced', 'launch_context_announced',
                            'external_stop_pending', 'session_ended']:
             if bool_field in update_copy and isinstance(update_copy[bool_field], bool):
                 update_copy[bool_field] = int(update_copy[bool_field])
@@ -205,10 +205,12 @@ def get_status_description(status: str, context: str = '') -> str:
         return f"inactive: {context}" if context else "inactive"
     return "unknown"
 
-def set_status(instance_name: str, status: str, context: str = '', msg_ts: str = ''):
+def set_status(instance_name: str, status: str, context: str = '', detail: str = '', msg_ts: str = ''):
     """Set instance status with timestamp and log status change event.
 
     Args:
+        context: Type token (tool:Bash, deliver:alice, exit:timeout)
+        detail: Value for the context (command string, file path, task prompt)
         msg_ts: Timestamp of last message read (for cross-device read receipts)
     """
     from .db import log_event
@@ -220,7 +222,8 @@ def set_status(instance_name: str, status: str, context: str = '', msg_ts: str =
     update_instance_position(instance_name, {
         'status': status,
         'status_time': int(time.time()),
-        'status_context': context
+        'status_context': context,
+        'status_detail': detail
     })
 
     if is_new:
@@ -309,6 +312,8 @@ def set_status(instance_name: str, status: str, context: str = '', msg_ts: str =
     try:
         position = current_data.get('last_event_id', 0) if current_data else 0
         data = {'status': status, 'context': context, 'position': position}
+        if detail:
+            data['detail'] = detail
         if msg_ts:
             data['msg_ts'] = msg_ts
         log_event(event_type='status', instance=instance_name, data=data)
@@ -511,7 +516,7 @@ def initialize_instance_in_position_file(instance_name: str, session_id: str | N
             "session_id": session_id if session_id else None,  # NULL not empty string
             "mapid": mapid or "",
             "transcript_path": "",
-            "alias_announced": 0,
+            "name_announced": 0,
             "tag": None,
             "status": "inactive",
             # status_context="new" triggers ready event on first status update (see set_status)

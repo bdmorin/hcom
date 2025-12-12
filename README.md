@@ -1,41 +1,37 @@
 # hcom - Claude Hook Comms
 
 [![PyPI - Version](https://img.shields.io/pypi/v/hcom)](https://pypi.org/project/hcom/)
-[![PyPI - License](https://img.shields.io/pypi/l/hcom)](https://opensource.org/license/MIT) [![Python Version](https://img.shields.io/badge/python-3.10+-blue.svg)](https://python.org) [![DeepWiki](https://img.shields.io/badge/DeepWiki-aannoo%2Fclaude--hook--comms-blue.svg?logo=data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAACwAAAAyCAYAAAAnWDnqAAAAAXNSR0IArs4c6QAAA05JREFUaEPtmUtyEzEQhtWTQyQLHNak2AB7ZnyXZMEjXMGeK/AIi+QuHrMnbChYY7MIh8g01fJoopFb0uhhEqqcbWTp06/uv1saEDv4O3n3dV60RfP947Mm9/SQc0ICFQgzfc4CYZoTPAswgSJCCUJUnAAoRHOAUOcATwbmVLWdGoH//PB8mnKqScAhsD0kYP3j/Yt5LPQe2KvcXmGvRHcDnpxfL2zOYJ1mFwrryWTz0advv1Ut4CJgf5uhDuDj5eUcAUoahrdY/56ebRWeraTjMt/00Sh3UDtjgHtQNHwcRGOC98BJEAEymycmYcWwOprTgcB6VZ5JK5TAJ+fXGLBm3FDAmn6oPPjR4rKCAoJCal2eAiQp2x0vxTPB3ALO2CRkwmDy5WohzBDwSEFKRwPbknEggCPB/imwrycgxX2NzoMCHhPkDwqYMr9tRcP5qNrMZHkVnOjRMWwLCcr8ohBVb1OMjxLwGCvjTikrsBOiA6fNyCrm8V1rP93iVPpwaE+gO0SsWmPiXB+jikdf6SizrT5qKasx5j8ABbHpFTx+vFXp9EnYQmLx02h1QTTrl6eDqxLnGjporxl3NL3agEvXdT0WmEost648sQOYAeJS9Q7bfUVoMGnjo4AZdUMQku50McDcMWcBPvr0SzbTAFDfvJqwLzgxwATnCgnp4wDl6Aa+Ax283gghmj+vj7feE2KBBRMW3FzOpLOADl0Isb5587h/U4gGvkt5v60Z1VLG8BhYjbzRwyQZemwAd6cCR5/XFWLYZRIMpX39AR0tjaGGiGzLVyhse5C9RKC6ai42ppWPKiBagOvaYk8lO7DajerabOZP46Lby5wKjw1HCRx7p9sVMOWGzb/vA1hwiWc6jm3MvQDTogQkiqIhJV0nBQBTU+3okKCFDy9WwferkHjtxib7t3xIUQtHxnIwtx4mpg26/HfwVNVDb4oI9RHmx5WGelRVlrtiw43zboCLaxv46AZeB3IlTkwouebTr1y2NjSpHz68WNFjHvupy3q8TFn3Hos2IAk4Ju5dCo8B3wP7VPr/FGaKiG+T+v+TQqIrOqMTL1VdWV1DdmcbO8KXBz6esmYWYKPwDL5b5FA1a0hwapHiom0r/cKaoqr+27/XcrS5UwSMbQAAAABJRU5ErkJggg==)](https://deepwiki.com/aannoo/claude-hook-comms)
+[![PyPI - License](https://img.shields.io/pypi/l/hcom)](https://opensource.org/license/MIT) [![Python Version](https://img.shields.io/badge/python-3.10+-blue.svg)](https://python.org) [![DeepWiki](https://img.shields.io/badge/DeepWiki-docs-blue.svg)](https://deepwiki.com/aannoo/claude-hook-comms)
 
 Real-time communication layer for Claude Code via hooks.
 
 ![Demo](https://raw.githubusercontent.com/aannoo/claude-hook-comms/main/screencapture.gif)
 
-## Start
+## Install
 
 ```bash
-pip install hcom && hcom 2
+pip install hcom && hcom
 ```
 
 
-## What
+## What it does
 
 ```
-┌──────────┐  hcom send "hi"  ┌────────────────┐
-│ Claude A │─────────────────►│ Claude B (idle)│──► wakes instantly:
-└──────────┘        │         └────────────────┘           sees "hi"
-- interactive       │
-- headless          │         ┌──────────────────┐
-- subagent          └────────►│Claude C (working)│──► after current tool:
-- external tools              └──────────────────┘              sees "hi"
+                              ┌───────────┐
+┌──────────┐ hcom send 'hi'   │ Claude B  │──► wakes instantly:
+│ Claude A │────────┬────────►│ (idle)    │    [new message] 'hi'
+│   and    │        │         └───────────┘
+│ friends* │        │         ┌───────────┐
+└──────────┘        └────────►│ Claude C  │──► after current tool:
+                              │ (working) │    [new message] 'hi'
+                              └───────────┘
 ```
+> ***Friends** == interactive claude terminals, headless (-p) instances, task tool subagents, the TUI, any external process. not real friends.
 
 - Any Claude can join (`hcom start`) or leave (`hcom stop`) at runtime.
 - Normal `claude` sessions are unaffected until you opt in.
-- Works on Mac, Linux, Windows/WSL, Android, Claude Code Web.
+- Works on Mac, Linux, Windows/WSL, Android.
 
-## How
-
-- Claude Code's Stop hook fires when Claude finishes responding.
-- HCOM blocks there with `select()` turning idle into listening.
-- TCP socket wakes instances instantly when messages arrive in SQLite.
-- Hook exits with code 2 → stderr injected into Claude's context as a message.
 
 **What gets installed:**
 - `~/.hcom/` — database, config, logs
@@ -44,122 +40,268 @@ pip install hcom && hcom 2
 Safely remove with `hcom reset all`
 
 
+## How It Works
+
+When Claude finishes doing some work, the stop hook runs and Claude asks it "Can I stop now?" expecting a quick yes/no. hcom never answers. It waits, sitting in select(), until a message shows up. Then it wakes up and says:
+
+"NO, you can't stop, because john says hi"
+
+`{"decision": "block", "reason": "[new message] john -> you: hi"}`
+
+Claude reads the "reason" it can't stop - which is just the message - and keeps going.
+
+Hooks also log all activity as events Claude can subscribe to. Example:
+
+- ClaudeA edits `hi.txt` → hook → logged
+- ClaudeB edits `hi.txt` 5s later → hook → collision detected → both get notified
+
+
+## Features
+
+### "Instant" Messaging
+```bash
+hcom send "hello everyone"          # broadcast
+hcom send "@john check this"        # direct message
+
+HCOM_TAG=backend hcom 2             # Group: 2 backend- instances
+HCOM_TAG=frontend hcom 2            # Group: 2 frontend- instances
+hcom send "@backend scale up"       # Message entire backend group
+```
+
+### Subagent Communication
+Task tool subagents get their own identities and can talk to each other:
+```
+Parent: alice
+  ├── alice_reviewer_1  ──┐
+  ├── alice_explorer_1  ──┼── can message each other AND parent
+  └── alice_planner_1   ──┘
+```
+Subagents stay alive after they finish their task (configurable timeout).
+Parents can communicate with subagents when they're in the background.
+
+**Example:** 
+
+`"Use background task subagents to compare 3 different codebases, have each use hcom to send updates and you send follow-ups via hcom to steer and cross‑question them, then synthesize a final comparison"`
+
+### External Tools
+Any process can join the conversation:
+```bash
+hcom send --from ci "build passed"              # one-shot
+hcom send --from gemini "analysis done" --wait  # block until reply
+```
+External senders appear in the TUI like any other instance
+
+### Cross-Device Sync
+
+Send and receive messages between machines via a lightweight HTTP relay.
+
+**Setup with HuggingFace Spaces:**
+```bash
+hcom relay hf <token>   # get write token from huggingface.co/settings/tokens
+hcom relay hf           # or use existing huggingface-cli login
+```
+Creates a free, private Space on your HuggingFace account.
+
+```bash
+hcom relay              # check if it's working
+```
+
+### Events
+
+Everything is logged to SQLite. Query and subscribe.
+
+**View events:**
+```bash
+hcom events                                   # recent events
+hcom events --sql "instance='john'"           # filter with SQL
+```
+
+**"Push" notification subscriptions:**
+
+When a matching event occurs, claude receives a system message with the event data.
+
+```bash
+# Instances are notified when another instance edits the same file within ~20s
+hcom events sub collision
+```
+
+Prompt claude: `"Detect when john finished and spam them with more work"`
+```bash
+# claude creates subscription
+hcom events sub "type='status' AND status_val='idle' AND instance='john'"
+
+# Agent goes active→idle = finished their task. notification!
+hcom send 'get back to work john!'
+```
+
+
+### Transcript Sharing
+
+View conversation history for any instance:
+
+```bash
+hcom thread @john
+```
+
+Example use: background eavesdropping.
+
+Prompt: `Create a hcom subscription for every time @john edits a file and review the code changes by looking at hcom thread`
+
+
+### Launch terminal windows
+
+`ENV_VARS hcom <N> [claude <ARGS...>]`
+
+Launches terminals with claude connected to hcom
+
+```bash
+hcom 3                                       # 3 terminals with claude
+hcom 3 claude -p                             # + headless
+HCOM_TAG=api hcom 3 claude -p                # + @-mention group tag
+hcom 3 claude --agent reviewer "review PR"   # + .claude/agents + prompt
+etc...
+```
+
+
+
+### TUI Dashboard
+
+A terminal UI:
+
+![TUI Dashboard](tui.png)
+
+**Screens**
+
+1. **MANAGE** — See all instances, status, send messages, start/stop instances
+
+2. **LAUNCH** — Configure count, env vars, claude args, hcom settings
+
+3. **EVENTS** — Live event stream and filter (messages, status changes, lifecycle)
+
+   
+---
+
+
+## Examples
+
+### Code + Reviewer Pattern
+
+One instance writes code, another reviews in real-time:
+
+```bash
+# Terminal 1: coder
+HCOM_TAG=coder hcom 1 'implement the cool feature. do a little bit then wait for review, fix, and continue'
+
+# Terminal 2: reviewer (headless)
+HCOM_TAG=reviewer hcom 1 claude -p 'analyze codebase then subscribe to events where coder status changes to idle, then review diff, send feedback via hcom'
+```
+The reviewer pings the coder: `@coder found big problem in cool.py line 42`
+
+
+### Multi-Agent Debate
+
+
+```bash
+# Launch debaters with different roles
+hcom 1 claude -p --agent role1
+hcom 1 claude -p --agent role2
+hcom 1 claude -p --agent role3
+
+'You are the role1. Debate 5 rounds with role2 and role3 about this architecture decision...'
+```
+
+
+### Task Management
+
+hcom provides real-time communication, other tools provide structure for long running / larger workflows.
+
+Multiple instances in the same codebase; turn on collision detection: `hcom events sub collision`
+
+#### Beads
+
+[Beads](https://github.com/steveyegge/beads) is a dependency issue tracker.
+
+**Identity** — link hcom name to bd audit trail:
+```bash
+hcom config name_export BD_ACTOR
+```
+
+**Notifications** — instances can subscribe to get notifications when bd activity occurs.
+```bash
+hcom events sub "status_detail LIKE 'bd close%'"      # work completed
+hcom events sub "status_detail LIKE 'bd create%' OR status_detail LIKE 'bd close%' OR status_detail LIKE 'bd update%'" # state changes
+```
+
+#### Backlog.md
+
+[Backlog](https://github.com/MrLesk/Backlog.md) is a task management tool.
+
+Use CLI and subscribe instances to Bash tool events so they see what each other are doing in real time and can coordinate tasks.
+
+```bash
+hcom events sub "status_detail LIKE 'backlog %'" 
+# all backlog activity, edit the sql to whatever bash commands you want to subscribe to
+```
+
+---
+
 ## Commands
 
 | Command | Description |
 |---------|-------------|
 | `hcom` | TUI dashboard |
 | `hcom <n>` | Launch `n` instances |
-| `hcom start/stop` | Toggle participation from any claude session |
+| `hcom start/stop` | Toggle participation |
+| `hcom list` | View status, read receipts  |
+| `hcom events` | View event history JSON|
+| `hcom events sub/unsub` | Get "push" notifications in Claude |
+| `hcom thread [name]` | View conversation transcript of instance |
+| `hcom config` | Get/set `~/.hcom/config.env` values |
+| `hcom relay hf [token]` | Setup cross-device chat |
+| `hcom reset` | Archive and clear database
 
+* `hcom --help` for more details
 
 ---
 
-## Features
+## Configuration
 
-<details>
-<summary><strong>Instant Messaging</strong> — @mentions, groups, broadcasts</summary>
+### Environment Variables
 
-```bash
-hcom send "hello everyone"          # Broadcast to all
-hcom send "@john check this"        # Direct message
+Set in `~/.hcom/config.env` or as environment variables:
 
-HCOM_TAG=backend hcom 2              # Creates backend-*, backend-*
-HCOM_TAG=frontend hcom 2             # Creates frontend-*, frontend-*
-hcom send "@backend scale up"        # Message entire backend group
-```
-</details>
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `HCOM_TIMEOUT` | 1800 | Parent instance idle timeout (seconds) |
+| `HCOM_SUBAGENT_TIMEOUT` | 30 | Subagent idle timeout (seconds) |
+| `HCOM_TAG` | — | Group tag prefix for instance names |
+| `HCOM_TERMINAL` | new | Terminal mode: `new` / `here` / custom |
+| `HCOM_HINTS` | — | Text appended to all received messages |
+| `HCOM_CLAUDE_ARGS` | — | Default Claude CLI arguments |
+| `HCOM_NAME_EXPORT` | — | Export name to environment variable |
 
-<details>
-<summary><strong>Persistent Headless Instances</strong></summary>
-
-Run Claude instances in the background that stay alive waiting for follow up tasks
+**Precedence:** environment variable > config.env > defaults
 
 ```bash
-hcom 1 claude -p                     # Headless with 30min timeout
-HCOM_TIMEOUT=3600 hcom 1 claude -p   # 1 hour timeout
-hcom                                 # Monitor from dashboard
+# Persist settings
+hcom config timeout 3600
 
-hcom 1 claude -p 'monitor [x] and send message via hcom if [y]'
+# One-time override
+HCOM_TAG=poo hcom 2
 ```
 
-</details>
+---
 
+
+## Platforms
+
+### Claude Code Web
+
+**1. Add these hooks to your repo in `.claude/settings.json`:**
 
 <details>
-<summary><strong>Subagent Communication</strong></summary>
+<summary>hooks</summary>
 
-When Claude uses the Task tool, subagents can run `hcom start` to get unique HCOM identities. They can communicate with each other during execution, and the parent sees the full conversation after completion.
-
-```bash
-# Inside Claude:
-'use 3x task tool with task: debate x topic via hcom'
-# Each subagent gets identity and can @mention each other during the task
-```
-
-</details>
-
-<details>
-<summary><strong>External Integration</strong> — any process can send/receive</summary>
-
-Any process can send messages to Claude instances. Use `--from` to identify the sender. Use `--wait` to block until a reply (useful for external AI tools like Gemini or Codex).
-
-```bash
-# One-shot notification
-hcom send --from ci-pipeline "build complete"
-
-# Polling mode - block until Claude replies
-hcom send --from gemini "analyze this code" --wait
-# Returns when Claude responds, prints the reply
-```
-
-</details>
-
-<details>
-<summary><strong>Cross-Device Communication</strong></summary>
-
-Relay messages between machines via HuggingFace Spaces (free, private).
-
-**Setup:**
-```bash
-hcom relay hf <token>      # Get write token from huggingface.co/settings/tokens
-hcom relay hf              # Or if already logged in via `huggingface-cli login`
-```
-Creates a private Space on your HuggingFace account (~15 sec build).
-
-Run on each device. Remote instances appear in the TUI as `name:XXXX`.
-
-**Status:**
-```bash
-hcom relay                 # Check sync status
-hcom relay on/off          # Enable/disable
-```
-
-</details>
-
-<details>
-<summary><strong>Dynamic Opt-In/Out</strong></summary>
-
-Any Claude Code instance can join or leave the chat at runtime. Normal `claude` stays unaffected until you explicitly opt in. Stopping doesn't kill the instance—it just disconnects from HCOM.
-
-```bash
-# From inside Claude Code:
-'run hcom start'                     # Join the chat
-'run hcom stop'                      # Leave chat, keep working
-
-# From outside:
-hcom start alice                     # Enable specific instance
-hcom stop all                        # Disconnect all instances
-```
-
-</details>
-
-## Config
-
-<details>
-<summary><strong>Claude Code Web</strong></summary>
-
-**1. Add hooks to your repo** (`.claude/settings.json`):
 ```json
 {
   "hooks": {
@@ -176,201 +318,242 @@ hcom stop all                        # Disconnect all instances
   "env": {"HCOM": "hcom"}
 }
 ```
+</details>
+
 
 **2. Configure environment** in Claude Code Web settings:
 - Set `HF_TOKEN` - get a write token from [huggingface.co/settings/tokens](https://huggingface.co/settings/tokens)
-- Set network access to **Full** (relay needs huggingface.co, not in default allowlist)
-
-A private HuggingFace Space is auto-created on first session.
+- Set network access to Full
 
 **3. In Claude Code Web**, prompt: `run hcom start`
 
-</details>
 
-<details>
-<summary><strong>Custom Terminal</strong></summary>
+### Mac/Windows/Linux
 
-### Defaults
+#### Defaults
 
 - **macOS**: Terminal.app
 - **Linux**: gnome-terminal, konsole, or xterm
 - **Windows (native) & WSL**: Windows Terminal
-- **Android**: Termux
 
-### Modes
+#### Modes
 
 - `HCOM_TERMINAL=new` - New terminal windows (default)
 - `HCOM_TERMINAL=here` - Current terminal window
-- `HCOM_TERMINAL="open -a iTerm {script}"` - Custom terminal
 
-### Setup
+#### Use any terminal
 
 HCOM generates a bash script containing env setup + claude command. Your custom terminal just needs to execute it. Use `{script}` as the placeholder for the script path.
 
-#### Examples
+<details>
+<summary><strong>Custom Terminal Examples</strong></summary>
 
 ```bash
 # Open Terminal.app or WT in new tab
-HCOM_TERMINAL="ttab {script}"              # macOS: github.com/mklement0/ttab
-HCOM_TERMINAL="wttab {script}"             # Windows: github.com/lalilaloe/wttab
+HCOM_TERMINAL="ttab {script}"           # macOS: github.com/mklement0/ttab
+HCOM_TERMINAL="wttab {script}"          # Windows: github.com/lalilaloe/wttab
+
+# iTerm
+HCOM_TERMINAL="open -a iTerm {script}"
 
 # Wave Terminal Mac/Linux/Windows. From within Wave Terminal:
 HCOM_TERMINAL="wsh run -- bash {script}"
 
-# Alacritty macOS:
-HCOM_TERMINAL="open -n -a Alacritty.app --args -e bash {script}"
-
-# Alacritty Linux:
-HCOM_TERMINAL="alacritty -e bash {script}"
-
-# Kitty macOS:
-HCOM_TERMINAL="open -n -a kitty.app --args {script}"
-
-# Kitty Linux
-HCOM_TERMINAL="kitty {script}"
-
 # tmux with split panes and 3 claude instances in hcom chat
 HCOM_TERMINAL="tmux split-window -h {script}" hcom 3
 
-# WezTerm Linux/Windows
-HCOM_TERMINAL="wezterm start -- bash {script}"
+# Alacritty:
+HCOM_TERMINAL="open -n -a Alacritty.app --args -e bash {script}" # macOS
+HCOM_TERMINAL="alacritty -e bash {script}" # linux
 
-# Tabs from within WezTerm
-HCOM_TERMINAL="wezterm cli spawn -- bash {script}"
+# Kitty:
+HCOM_TERMINAL="open -n -a kitty.app --args {script}" # macOS
+HCOM_TERMINAL="kitty {script}" #Linux
 
-# WezTerm macOS:
-HCOM_TERMINAL="open -n -a WezTerm.app --args start -- bash {script}"
-
-# Tabs from within WezTerm macOS
-HCOM_TERMINAL="/Applications/WezTerm.app/Contents/MacOS/wezterm cli spawn -- bash {script}"
+# WezTerm 
+HCOM_TERMINAL="wezterm start -- bash {script}" # Linux/Windows
+HCOM_TERMINAL="open -n -a WezTerm.app --args start -- bash {script}" # macOS
+HCOM_TERMINAL="wezterm cli spawn -- bash {script}" # Tabs from within WezTerm
+HCOM_TERMINAL="/Applications/WezTerm.app/Contents/MacOS/wezterm cli spawn -- bash {script}" # Tabs from within WezTerm macOS
 ```
 </details>
 
-<details>
-<summary><strong>Android</strong></summary>
+
+### Android
 
 1. Install Termux from **F-Droid** (not Google Play)
-
 2. Setup:
    ```bash
    pkg install python nodejs
    npm install -g @anthropic-ai/claude-cli
    pip install hcom
    ```
-
 3. Enable external apps:
    ```bash
    echo "allow-external-apps=true" >> ~/.termux/termux.properties
    termux-reload-settings
    ```
-
-4. Grant "Display over other apps" permission in Android settings for visible terminals
-
+4. Grant "Display over other apps" permission in Android settings
 5. Run: `hcom 2`
-
-</details>
-
-<details>
-<summary><strong>Environment Variables</strong></summary>
-
-Settings in `~/.hcom/config.env` or environment variables.
-
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `HCOM_TIMEOUT` | 1800 | Instance idle timeout (seconds) |
-| `HCOM_SUBAGENT_TIMEOUT` | 30 | Subagent idle timeout (seconds) |
-| `HCOM_TAG` | — | Group tag (creates tag-* instances) |
-| `HCOM_TERMINAL` | new | Terminal mode: new\|here\|print\|custom |
-| `HCOM_HINTS` | — | Text appended to all received messages |
-| `HCOM_CLAUDE_ARGS` | — | Default Claude CLI arguments (e.g., `--agent reviewer`) |
-
-**Precedence**: env var > config.env > defaults
-
-```bash
-# Persist settings
-hcom config timeout 3600
-hcom config tag backend
-
-# One-time override
-HCOM_TAG=api hcom 2
-```
-
-</details>
 
 ---
 
 ## Reference
 
 <details>
-<summary><code>hcom --help</code></summary>
+<summary><code>hcom --help</code> (all commands)</summary>
 
-```bash
-Usage: hcom                           # TUI dashboard
-       [ENV_VARS] hcom <COUNT> [claude <ARGS>...]
-       hcom events [--last N] [--wait SEC] [--sql EXPR]
-       hcom list [--json] [-v|--verbose]
-       hcom send "message"
-       hcom stop [alias|all]
-       hcom start [alias]
-       hcom reset [hooks|all]
+### Main Help
+```
+hcom v0.6.8 - Hook-based communication for Claude Code instances
 
-Launch Examples:
-  hcom 3             open 3 terminals with claude connected to hcom
-  hcom 3 claude -p                                       + headless
-  HCOM_TAG=api hcom 3 claude -p               + @-mention group tag
-  claude 'run hcom start'        claude code with prompt also works
+Usage:
+  hcom                               TUI dashboard
+  [env vars] hcom <N> [claude ...]   Launch instances
+  hcom <command>                     Run command
 
 Commands:
-  events              Query recent events (JSON)
-    --last N          Limit to last N events (default: 20)
-    --wait [SEC]      Block until matching event (default: 60s timeout)
-    --sql EXPR        SQL WHERE clause filter
+  send      Send message to your buddies
+  list      Show participants, status, read receipts
+  start     Enable hcom participation
+  stop      Disable hcom participation
+  events    Query events / subscribe for push notifications
+  thread    View other instance's conversation transcript
+  config    Get/set config environment variables
+  relay     Cross-device live chat
+  reset     Archive and clear database or hooks
 
-  list                List current instances status
-    -v, --verbose     Show detailed metadata
-    --json            Emit JSON with detailed data
-
-  send "msg"          Send message to all instances
-  send "@alias msg"   Send to specific instance/group
-    --from <name>     Custom external identity
-    --wait            Block until reply with --from
-
-  stop                Stop current instance (from inside Claude)
-  stop <alias>        Stop specific instance
-  stop all            Stop all instances
-
-  start               Start current instance (from inside Claude)
-  start <alias>       Start specific instance
-
-  reset               Clear database (archive conversation)
-  reset hooks         Remove hooks only
-  reset all           Stop all + clear db + remove hooks + reset config
-
-  config              Show all config settings
-  config <key>        Get single config value
-  config <key> <val>  Set config value
-    --json            JSON output
-    --edit            Open config in $EDITOR
-    --reset           Reset config to defaults
-
-  relay               Show relay status
-  relay on            Enable relay sync
-  relay off           Disable relay sync
-  relay pull          Manual relay pull
-  relay hf [token]    Setup HuggingFace relay
-
-Environment Variables:
-  HCOM_TAG=name               Group tag (creates name-* instances)
-  HCOM_TERMINAL=mode          Terminal: new|here|print|"custom {script}"
-  HCOM_HINTS=text             Text appended to all messages received by instance
-  HCOM_TIMEOUT=secs           Time until disconnected from hcom chat (default: 1800s / 30m)
-  HCOM_SUBAGENT_TIMEOUT=secs  Subagent idle timeout (default: 30s)
-  HCOM_CLAUDE_ARGS=args       Claude CLI defaults (e.g., '-p --model opus --agent reviewer')
-
-  ANTHROPIC_MODEL=opus # Any env var passed through to Claude Code
-
-  Persist Env Vars in `~/.hcom/config.env` or use `hcom config`
+Run 'hcom <command> --help' for details.
 ```
+
+### hcom send
+```
+Usage:
+  hcom send "msg"         Send message to all your best buddies
+  hcom send "@name msg"   Send to specific instance/group
+    --from <name>      Identity for non-Claude tools (Gemini, scripts)
+    --wait             Poll for @mentions (use with --from)
+```
+
+### hcom list
+```
+Usage:
+  hcom list               All instances
+  hcom list -v            Verbose output of all instances
+  hcom list --json        Verbose JSON output of all instances
+
+  hcom list [self|<name>] Instance details
+    [field]            Print specific field (status, directory, session_id, etc)
+    --json             Output as JSON
+    --sh               Shell exports: eval "$(hcom list self --sh)"
+```
+
+### hcom start
+```
+Usage:
+  hcom start              Enable hcom for current instance
+  hcom start <name>       Re-enable stopped instance
+```
+
+### hcom stop
+```
+Usage:
+  hcom stop               Disable hcom for current instance
+  hcom stop <name>        Disable hcom for specific instance
+  hcom stop all           Disable hcom for all instances
+```
+
+### hcom events
+```
+Usage:
+  Query the event stream (messages, status changes, file edits, lifecycle)
+
+Query:
+    events             Recent events as JSON
+    --last N           Limit count (default: 20)
+    --sql EXPR         SQL WHERE filter (columns: id, timestamp, type, instance, data)
+    --wait [SEC]       Block until match (default: 60s)
+
+Subscribe:
+    events sub         List subscriptions
+    events sub "sql"   Create subscription for push notification when event matches SQL
+    events sub collision Alert when instances edit same file
+    --once             Auto-remove sub after first match
+    --for <name>       Subscribe for another instance
+    events unsub <id>  Remove by ID
+    events unsub collision Disable collision alerts
+
+Flat fields (events_v view):
+    message            msg_from, msg_text, msg_scope, msg_sender_kind, msg_delivered_to, msg_mentions
+    status             status_val, status_context, status_detail
+    life               life_action, life_by, life_batch_id, life_reason
+
+  Base columns: id, timestamp, type, instance
+  Example: msg_from = 'alice' AND type = 'message'
+  Use <> instead of != for SQL negation
+```
+
+### hcom thread
+```
+Usage:
+  hcom thread             Show your conversation thread
+  hcom thread @instance   See what another instance is doing
+    --last N           Limit to last N exchanges (default: 10)
+    --range N-M        Show exchanges N through M (1-indexed)
+    --full             Show full assistant responses
+    --detailed         Show tool I/O, edits, errors
+    --json             JSON output
+```
+
+### hcom config
+```
+Usage:
+  hcom config             Show all config values
+  hcom config <key>       Get single config value
+  hcom config <key> <val> Set config value
+    --json             JSON output
+    --edit             Open config in $EDITOR
+    --reset            Reset config to defaults
+
+Settings:
+    HCOM_TAG           Group tag (creates tag-* instances)
+    HCOM_TERMINAL      Terminal: new|here|"custom {script}"
+    HCOM_HINTS         Text appended to messages received by instance
+    HCOM_TIMEOUT       Idle timeout in seconds (default: 1800)
+    HCOM_SUBAGENT_TIMEOUT Subagent timeout in seconds (default: 30)
+    HCOM_CLAUDE_ARGS   Default claude args (e.g. "-p --model opus")
+    HCOM_RELAY         Relay server URL
+    HCOM_RELAY_TOKEN   Relay auth token
+    HCOM_RELAY_ENABLED Enable relay sync (1|0)
+    HCOM_NAME_EXPORT   Also export instance name to this var
+
+  Non-HCOM_* vars in config.env pass through to Claude Code
+  e.g. ANTHROPIC_MODEL=opus
+
+Precedence: HCOM defaults < config.env < shell env vars
+  Each resolves independently
+```
+
+### hcom relay
+```
+Usage:
+  hcom relay              Show relay status
+  hcom relay on           Enable cross-device chat
+  hcom relay off          Disable cross-device chat
+  hcom relay pull         Fetch from other devices now
+  hcom relay hf [token]   Connect to relay server on HuggingFace
+  (finds or creates a free private space on your HuggingFace account
+  provide HF_TOKEN or login with hf cli first)
+```
+
+### hcom reset
+```
+Usage:
+  hcom reset              Clear database (archive conversation)
+  hcom reset hooks        Remove hooks only
+  hcom reset all          Stop all + clear db + remove hooks + reset config
+```
+
 </details>
 
 
@@ -379,4 +562,3 @@ Environment Variables:
 ## License
 
 MIT
-

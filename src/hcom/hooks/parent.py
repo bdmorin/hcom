@@ -17,9 +17,25 @@ from .family import check_external_stop_notification
 from ..core.db import get_db, get_events_since
 
 from .utils import (
-    build_hcom_bootstrap_text, build_launch_context, build_hcom_command,
+    build_hcom_bootstrap_text, build_hcom_command,
     disable_instance, log_hook_error, notify_instance
 )
+
+
+def _extract_tool_detail(tool_name: str, tool_input: dict[str, Any]) -> str:
+    """Extract status detail from tool input based on tool type.
+
+    Only handles tools in PreToolUse matcher (Bash|Task|Write|Edit).
+    """
+    match tool_name:
+        case 'Bash':
+            return tool_input.get('command', '')
+        case 'Write' | 'Edit':
+            return tool_input.get('file_path', '')
+        case 'Task':
+            return tool_input.get('prompt', '')
+        case _:
+            return ''
 
 
 def get_real_session_id(hook_data: dict[str, Any], env_file: str | None) -> str:
@@ -64,13 +80,15 @@ def handle_stop_pending(hook_type: str, hook_data: dict[str, Any], instance_name
 
     match hook_type:
         case 'pre':
-            set_status(instance_name, 'active', f'tool:{tool_name}')
+            detail = _extract_tool_detail(tool_name, hook_data.get('tool_input', {}))
+            set_status(instance_name, 'active', f'tool:{tool_name}', detail=detail)
         case 'post':
             if instance_data.get('status') == 'blocked':
                 set_status(instance_name, 'active', f'approved:{tool_name}')
         case 'notify':
             message = hook_data.get('message', '')
-            if not (message == "Claude is waiting for your input" and instance_data.get('status') == 'idle'):
+            # Filter out generic "waiting for input" - not a meaningful status change
+            if message != "Claude is waiting for your input":
                 set_status(instance_name, 'blocked', message)
         case 'poll':
             stop(instance_name, instance_data)
@@ -91,11 +109,34 @@ def sessionstart(hook_data: dict[str, Any]) -> None:
     # to work around CC fork bug where hook_data.session_id is wrong
     session_id = hook_data.get('session_id')
     env_file = os.environ.get('CLAUDE_ENV_FILE')
+    source = hook_data.get('source', '')
+
+    # Handle compaction: reset name_announced so bootstrap is re-injected
+    # After compaction, Claude loses the bootstrap context - re-inject on next PostToolUse
+    if source == 'compact' and session_id:
+        try:
+            from ..core.db import find_instance_by_session
+            instance_name = find_instance_by_session(session_id)
+            if instance_name:
+                update_instance_position(instance_name, {'name_announced': False})
+        except Exception as e:
+            log_hook_error('sessionstart:compact_reset', e)
 
     if session_id and env_file:
         try:
+            from ..core.instances import resolve_instance_name
+            instance_name, _ = resolve_instance_name(session_id, get_config().tag)
+
+            lines = [f'\nexport HCOM_SESSION_ID={session_id}']
+            lines.append(f'export HCOM_NAME={instance_name}')
+
+            # Export to additional env var if configured
+            name_export = os.environ.get('HCOM_NAME_EXPORT')
+            if name_export:
+                lines.append(f'export {name_export}={instance_name}')
+
             with open(env_file, 'a', newline='\n') as f:
-                f.write(f'\nexport HCOM_SESSION_ID={session_id}\n')
+                f.write('\n'.join(lines) + '\n')
         except Exception as e:
             log_hook_error('sessionstart:env_file_write', e)
 
@@ -125,6 +166,14 @@ def sessionstart(hook_data: dict[str, Any]) -> None:
                 mapid=MAPID,
                 enabled=True  # HCOM-launched = opted in
             )
+            # Set terminal window and tab title (write directly to tty to bypass Claude's output capture)
+            # OSC 1 = tab/icon, OSC 2 = window (same value for both to avoid duplication)
+            try:
+                title = f'hcom: {instance_name}'
+                with open('/dev/tty', 'w') as tty:
+                    tty.write(f'\033]1;{title}\007\033]2;{title}\007')
+            except (OSError, IOError):
+                pass  # No tty (background mode, etc.)
         except Exception as e:
             log_hook_error('sessionstart:create_instance', e)
 
@@ -177,19 +226,20 @@ def start_task(session_id: str, hook_data: dict[str, Any]) -> None:
     running_tasks['active'] = True
     update_instance_position(instance_name, {'running_tasks': json.dumps(running_tasks)})
 
-    # Set status for enabled instances only
+    # Set status for enabled instances only (with task prompt as detail)
     instance_data = load_instance_position(instance_name)
     if instance_data and instance_data.get('enabled', False):
-        set_status(instance_name, 'active', 'tool:Task')
+        detail = _extract_tool_detail('Task', hook_data.get('tool_input', {}))
+        set_status(instance_name, 'active', 'tool:Task', detail=detail)
 
 
 def end_task(session_id: str, hook_data: dict[str, Any], interrupted: bool = False) -> None:
-    """Task ended - exit subagent context, optionally deliver freeze messages
+    """Task ended - deliver freeze messages (foreground only), cleanup handled by SubagentStop
 
     Args:
         session_id: Parent's session ID
         hook_data: Hook data from dispatcher
-        interrupted: True if Task was interrupted (no message delivery), False for normal completion
+        interrupted: True if Task was interrupted (UserPromptSubmit handles cleanup)
     """
     from ..core.db import find_instance_by_session
 
@@ -202,15 +252,15 @@ def end_task(session_id: str, hook_data: dict[str, Any], interrupted: bool = Fal
     if not instance_data:
         return
 
-    if not interrupted:
-        # Completed: deliver freeze messages (last_event_id handles deduplication for parallel Tasks)
-        freeze_event_id = instance_data.get('last_event_id', 0)
-        last_event_id = _deliver_freeze_messages(instance_name, freeze_event_id)
-        update_instance_position(instance_name, {'last_event_id': last_event_id})
-    else:
-        # Interrupted: disable tracked subagents and clear running_tasks
-        _disable_tracked_subagents(instance_name, instance_data)
-        update_instance_position(instance_name, {'running_tasks': ''})
+    if interrupted:
+        # Interrupted via UserPromptSubmit - don't clear here
+        # UserPromptSubmit will check transcripts and clean up dead subagents
+        return
+
+    # Deliver freeze messages (SubagentStop handles running_tasks cleanup)
+    freeze_event_id = instance_data.get('last_event_id', 0)
+    last_event_id = _deliver_freeze_messages(instance_name, freeze_event_id)
+    update_instance_position(instance_name, {'last_event_id': last_event_id})
 
 
 def _disable_tracked_subagents(instance_name: str, instance_data: dict[str, Any]) -> None:
@@ -240,8 +290,9 @@ def _disable_tracked_subagents(instance_name: str, instance_data: dict[str, Any]
 
 
 def _deliver_freeze_messages(instance_name: str, freeze_event_id: int) -> int:
-    """Deliver messages from Task freeze period
+    """Deliver messages from Task freeze period (foreground Tasks only).
 
+    Background Tasks use live delivery instead - parent isn't frozen so messages flow in real-time.
     Returns the last event ID processed (for updating parent position).
     """
     from ..core.messages import should_deliver_message
@@ -338,12 +389,20 @@ def _deliver_freeze_messages(instance_name: str, freeze_event_id: int) -> int:
     return last_id
 
 
-def pretooluse(_hook_data: dict[str, Any], instance_name: str, tool_name: str) -> None:
-    """Parent PreToolUse: status tracking only (Task creation in dispatcher)
+def pretooluse(hook_data: dict[str, Any], instance_name: str, tool_name: str) -> None:
+    """Parent PreToolUse: status tracking with tool-specific detail
 
     Called only for enabled instances with validated existence.
+    File collision detection handled via event subscriptions (hcom events collision).
     """
-    set_status(instance_name, 'active', f'tool:{tool_name}')
+    detail = _extract_tool_detail(tool_name, hook_data.get('tool_input', {}))
+
+    # Skip status update for Claude's internal memory operations
+    # These Edit calls on session-memory/ files happen while Claude appears idle
+    if tool_name in ('Edit', 'Write') and 'session-memory/' in detail:
+        return
+
+    set_status(instance_name, 'active', f'tool:{tool_name}', detail=detail)
 
 
 def update_status(instance_name: str, tool_name: str) -> None:
@@ -405,10 +464,6 @@ def posttooluse(hook_data: dict[str, Any], instance_name: str, instance_data: di
     if tool_name == 'Bash':
         command = tool_input.get('command', '')
 
-        # Launch context
-        if output := _inject_launch_context_if_needed(instance_name, command, instance_data):
-            outputs_to_combine.append(output)
-
         # Check hcom command pattern - bootstrap and updates on hcom commands
         matches = list(re.finditer(HCOM_COMMAND_PATTERN, command))
         if matches:
@@ -433,45 +488,16 @@ def posttooluse(hook_data: dict[str, Any], instance_name: str, instance_data: di
     sys.exit(0)
 
 
-def _inject_launch_context_if_needed(instance_name: str, command: str, instance_data: dict[str, Any]) -> dict[str, Any] | None:
-    """Parent context: inject launch context for help/launch commands
-
-    Returns hook output dict or None.
-    """
-    # Match all hcom invocation variants (hcom, uvx hcom, python -m hcom, .pyz)
-    import re
-    launch_pattern = re.compile(
-        rf'({HCOM_INVOCATION_PATTERN})\s+'
-        r'(?:(?:help|--help|-h)\b|\d+)'
-    )
-    if not launch_pattern.search(command):
-        return None
-
-    if instance_data.get('launch_context_announced', False):
-        return None
-
-    msg = build_launch_context(instance_name)
-    update_instance_position(instance_name, {'launch_context_announced': True})
-
-    return {
-        "systemMessage": "[HCOM launch info shown to instance]",
-        "hookSpecificOutput": {
-            "hookEventName": "PostToolUse",
-            "additionalContext": msg
-        }
-    }
-
-
 def _inject_bootstrap_if_needed(instance_name: str, instance_data: dict[str, Any]) -> dict[str, Any] | None:
     """Parent context: inject bootstrap text if not announced
 
     Returns hook output dict or None.
     """
-    if instance_data.get('alias_announced', False):
+    if instance_data.get('name_announced', False):
         return None
 
     msg = build_hcom_bootstrap_text(instance_name)
-    update_instance_position(instance_name, {'alias_announced': True})
+    update_instance_position(instance_name, {'name_announced': True})
 
     # Track bootstrap count for first-time user hints
     from ..core.paths import increment_flag_counter
@@ -544,7 +570,7 @@ def userpromptsubmit(_hook_data: dict[str, Any], instance_name: str, updates: di
     """Parent UserPromptSubmit: timestamp, bootstrap"""
 
     # Instance guaranteed to exist by dispatcher
-    alias_announced = instance_data.get('alias_announced', False)
+    name_announced = instance_data.get('name_announced', False)
 
     # Session_ended prevents user receiving messages(?) so reset it.
     if is_matched_resume and instance_data.get('session_ended'):
@@ -556,7 +582,7 @@ def userpromptsubmit(_hook_data: dict[str, Any], instance_name: str, updates: di
     show_bootstrap = False
     msg = None
 
-    if not alias_announced:
+    if not name_announced:
         # Only HCOM-launched instances show bootstrap in UserPromptSubmit
         if os.environ.get('HCOM_LAUNCHED') == '1':
             msg = build_hcom_bootstrap_text(instance_name)
@@ -574,7 +600,7 @@ def userpromptsubmit(_hook_data: dict[str, Any], instance_name: str, updates: di
 
     # Mark bootstrap as shown
     if show_bootstrap:
-        update_instance_position(instance_name, {'alias_announced': True})
+        update_instance_position(instance_name, {'name_announced': True})
         # Track bootstrap count for first-time user hints
         from ..core.paths import increment_flag_counter
         increment_flag_counter('instance_count')
@@ -591,11 +617,9 @@ def notify(hook_data: dict[str, Any], instance_name: str, updates: dict[str, Any
     """Parent Notification: update status to blocked (parent only, handler filters subagent context)"""
     message = hook_data.get('message', '')
 
-    # Filter generic "waiting for input" when already idle
+    # Filter out generic "waiting for input" - not a meaningful status change
     if message == "Claude is waiting for your input":
-        current_status = instance_data.get('status', '')
-        if current_status == 'idle':
-            return  # Instance is idle, Stop hook will maintain idle status
+        return
 
     if updates:
         update_instance_position(instance_name, updates)

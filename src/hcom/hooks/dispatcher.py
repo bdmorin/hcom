@@ -8,7 +8,7 @@ import re
 
 from ..core.paths import ensure_hcom_directories
 from ..core.instances import load_instance_position
-from ..core.db import get_db, find_instance_by_session
+from ..core.db import get_db
 from . import subagent, parent
 from .utils import init_hook_context, log_hook_error
 
@@ -51,16 +51,15 @@ def handle_hook(hook_type: str) -> None:
       into normal Claude Code usage when user has hcom installed but not using it
     - Participants (enabled): errors surface normally
     """
-    # The try/except below is commented out during development to see errors.
-    # In production, it catches pre-gate errors (before we know if instance exists/enabled).
 
-    # try:
-    _handle_hook_impl(hook_type)
-    # except Exception as e:
-    #     # Pre-gate error (before instance context resolved) - must be silent
-    #     # because we don't know if user is even using hcom
-    #     log_hook_error(f'handle_hook:{hook_type}', e)
-    #     sys.exit(0)
+    # catches pre-gate errors (before we know if instance exists/enabled).
+    try:
+        _handle_hook_impl(hook_type)
+    except Exception as e:
+        # Pre-gate error (before instance context resolved) - must be silent
+        # because we don't know if user is even using hcom
+        log_hook_error(f'handle_hook:{hook_type}', e)
+        sys.exit(0)
 
 def _handle_hook_impl(hook_type: str) -> None:
     """Hook dispatcher implementation"""
@@ -68,6 +67,11 @@ def _handle_hook_impl(hook_type: str) -> None:
     # ============ SETUP, LOAD, AUTO-APPROVE, SYNC (BOTH CONTEXTS) ============
 
     hook_data = json.load(sys.stdin)
+
+    # Log payload for debugging
+    log_hook_error(f'PAYLOAD:{hook_type}', json.dumps(hook_data, indent=2, default=str))
+    log_hook_error(f'PID:{hook_type}', f'pid={os.getpid()} ppid={os.getppid()} session_id={hook_data.get("session_id")} tool={hook_data.get("tool_name")} agent_id={hook_data.get("agent_id")}')
+
     tool_name = hook_data.get('tool_name', '')
 
     # Get real session_id from CLAUDE_ENV_FILE path (workaround for CC fork bug)
@@ -95,21 +99,22 @@ def _handle_hook_impl(hook_type: str) -> None:
         parent.start_task(session_id, hook_data)
         sys.exit(0)
 
-    # Task end (completed) - exit subagent context
+    # Task end - deliver freeze messages (SubagentStop handles cleanup)
     if hook_type == 'post' and tool_name == 'Task':
         parent.end_task(session_id, hook_data, interrupted=False)
         sys.exit(0)
 
-    # Task end (interrupted) - exit subagent context
-    if subagent.in_subagent_context(session_id) and hook_type == 'userpromptsubmit':
-        parent.end_task(session_id, hook_data, interrupted=True)
-        # Fall through to parent handling
+    # ============ SUBAGENT CONTEXT HOOKS ============
 
-    # ============ SUBAGENT INSTANCE HOOKS ============
-
-    # subagent gate 
     if subagent.in_subagent_context(session_id):
 
+        # UserPromptSubmit: check for dead subagents (interrupt detection)
+        if hook_type == 'userpromptsubmit':
+            transcript_path = hook_data.get('transcript_path', '')
+            subagent.cleanup_dead_subagents(session_id, transcript_path)
+            # Fall through to parent handling
+
+        # SubagentStart/SubagentStop: have agent_id in payload
         match hook_type:
             case 'subagent-start':
                 agent_id = hook_data.get('agent_id')
@@ -120,46 +125,78 @@ def _handle_hook_impl(hook_type: str) -> None:
             case 'subagent-stop':
                 subagent.subagent_stop(hook_data)
                 sys.exit(0)
-            case 'post':
-                subagent.posttooluse(hook_data, '', None)
+
+        # Pre/Post: require explicit --agentid
+        if hook_type in ('pre', 'post') and tool_name == 'Bash':
+            tool_input = hook_data.get('tool_input', {})
+            command = tool_input.get('command', '')
+            agentid = _extract_agentid(command)
+
+            if agentid == 'parent':
+                pass  # Fall through to parent handling below
+            elif agentid:
+                # Identified subagent
+                if hook_type == 'post':
+                    subagent.posttooluse(hook_data, '', None)
                 sys.exit(0)
+            else:
+                # No identity - skip silently
+                sys.exit(0)
+        elif hook_type in ('pre', 'post'):
+            # Non-Bash pre/post during subagent context: skip
+            sys.exit(0)
+
+        # Other hooks (poll, notify, sessionend) fall through to parent
 
     # ============  PARENT INSTANCE HOOKS ============
-    else:
-        
-        if hook_type == 'sessionstart':
-            parent.sessionstart(hook_data)
-            sys.exit(0)
 
-        # Resolve instance for parent hooks
-        instance_name, updates, is_matched_resume = init_hook_context(hook_data, hook_type)
-        instance_data = load_instance_position(instance_name)
+    if hook_type == 'sessionstart':
+        parent.sessionstart(hook_data)
+        sys.exit(0)
 
-        # exists gate
-        if not instance_data:
-            sys.exit(0)
+    # Resolve instance for parent hooks
+    instance_name, updates, is_matched_resume = init_hook_context(hook_data, hook_type)
+    instance_data = load_instance_position(instance_name)
 
-        # Status-only for stop pending (disabled but awaiting exit)
-        if not instance_data.get('enabled') and instance_data.get('external_stop_pending'):
-            parent.handle_stop_pending(hook_type, hook_data, instance_name, instance_data)
-            sys.exit(0)
+    # exists gate
+    if not instance_data:
+        sys.exit(0)
 
-        # enabled gate
-        if not instance_data.get('enabled', False):
-            sys.exit(0)
+    # Status-only for stop pending (disabled but awaiting exit)
+    if not instance_data.get('enabled') and instance_data.get('external_stop_pending'):
+        parent.handle_stop_pending(hook_type, hook_data, instance_name, instance_data)
+        sys.exit(0)
 
-        match hook_type:
-            case 'pre':
-                parent.pretooluse(hook_data, instance_name, tool_name)
-            case 'post':
-                parent.posttooluse(hook_data, instance_name, instance_data, updates)
-            case 'poll':
-                parent.stop(instance_name, instance_data)
-            case 'notify':
-                parent.notify(hook_data, instance_name, updates, instance_data)
-            case 'userpromptsubmit':
-                parent.userpromptsubmit(hook_data, instance_name, updates, is_matched_resume, instance_data)
-            case 'sessionend':
-                parent.sessionend(hook_data, instance_name, updates)
+    # enabled gate
+    if not instance_data.get('enabled', False):
+        sys.exit(0)
+
+    match hook_type:
+        case 'pre':
+            parent.pretooluse(hook_data, instance_name, tool_name)
+        case 'post':
+            parent.posttooluse(hook_data, instance_name, instance_data, updates)
+        case 'poll':
+            parent.stop(instance_name, instance_data)
+        case 'notify':
+            parent.notify(hook_data, instance_name, updates, instance_data)
+        case 'userpromptsubmit':
+            parent.userpromptsubmit(hook_data, instance_name, updates, is_matched_resume, instance_data)
+        case 'sessionend':
+            parent.sessionend(hook_data, instance_name, updates)
 
     sys.exit(0)
+
+
+def _extract_agentid(command: str) -> str | None:
+    """Extract --agentid value from command string
+
+    Returns:
+        'parent' if --agentid parent
+        agent_id string if --agentid <uuid>
+        None if no --agentid flag
+    """
+    match = re.search(r'--agentid\s+(\S+)', command)
+    if match:
+        return match.group(1)
+    return None

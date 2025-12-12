@@ -1,7 +1,6 @@
 """File system utilities and path management"""
 from __future__ import annotations
 import os
-import sys
 import time
 import json
 import tempfile
@@ -15,7 +14,7 @@ FILE_RETRY_DELAY = 0.01  # 10ms delay for file lock retries
 
 # Path constants
 LOGS_DIR = ".tmp/logs"
-SCRIPTS_DIR = ".tmp/scripts"
+LAUNCH_DIR = ".tmp/launch"
 FLAGS_DIR = ".tmp/flags"
 CONFIG_FILE = "config.env"
 ARCHIVE_DIR = "archive"
@@ -48,7 +47,7 @@ def ensure_hcom_directories() -> bool:
     Called at hook entry to support opt-in scenarios where hooks execute before CLI commands.
     Returns True on success, False on failure."""
     try:
-        for dir_name in [LOGS_DIR, SCRIPTS_DIR, FLAGS_DIR, ARCHIVE_DIR]:
+        for dir_name in [LOGS_DIR, LAUNCH_DIR, FLAGS_DIR, ARCHIVE_DIR]:
             hcom_path(dir_name).mkdir(parents=True, exist_ok=True)
         return True
     except (OSError, PermissionError):
@@ -152,7 +151,7 @@ __all__ = [
     'get_flag_counter',
     # Path constants
     'LOGS_DIR',
-    'SCRIPTS_DIR',
+    'LAUNCH_DIR',
     'FLAGS_DIR',
     'CONFIG_FILE',
     'ARCHIVE_DIR',

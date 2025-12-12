@@ -5,7 +5,7 @@ import time
 import random
 import uuid
 from pathlib import Path
-from .utils import CLIError, format_error, is_interactive, resolve_identity
+from .utils import CLIError, format_error, is_interactive, resolve_identity, validate_flags
 from ..shared import FG_YELLOW, RESET, IS_WINDOWS
 from ..claude_args import resolve_claude_args, merge_claude_args, add_background_defaults, validate_conflicts
 from ..core.config import get_config
@@ -173,7 +173,7 @@ def cmd_launch(argv: list[str]) -> int:
             print(f"Launched {launched} Claude instance{'s' if launched != 1 else ''}")
 
         print(f"Batch id: {batch_id}")
-        print(f"Check status of all launches + wait and notify when they're ready: hcom events launch")
+        print(f"Check status of launch + block until instance{'s are' if launched != 1 else 'is'} ready: hcom events launch")
 
         # Log launch event
         if launched > 0:
@@ -221,7 +221,7 @@ def cmd_launch(argv: list[str]) -> int:
                     if launcher_enabled:
                         tips.append(f"You'll be automatically notified when all {launched} instances are launched & ready")
                     else:
-                        tips.append(f"Run 'hcom start' to receive automatic notifications/messages from instances")
+                        tips.append("Run 'hcom start' to receive automatic notifications/messages from instances")
                 else:
                     tips.append("Check status: hcom list")
 
@@ -239,7 +239,12 @@ def cmd_launch(argv: list[str]) -> int:
 
 
 def cmd_stop(argv: list[str]) -> int:
-    """Stop instances: hcom stop [alias|all]"""
+    """Stop instances: hcom stop [name|all]"""
+
+    # Validate flags
+    if error := validate_flags('stop', argv):
+        print(format_error(error), file=sys.stderr)
+        return 1
 
     # Remove flags to get target
     args_without_flags = [a for a in argv if not a.startswith('--')]
@@ -309,7 +314,7 @@ def cmd_stop(argv: list[str]) -> int:
 
     # Error handling
     if not instance_name:
-        raise CLIError("Cannot determine instance identity\nUsage: hcom stop <alias> | hcom stop all | prompt Claude to run 'hcom stop'")
+        raise CLIError("Cannot determine instance identity\nUsage: hcom stop <name> | hcom stop all | prompt Claude to run 'hcom stop'")
 
     position = load_instance_position(instance_name)
     if not position:
@@ -359,8 +364,13 @@ def cmd_stop(argv: list[str]) -> int:
 
 
 def cmd_start(argv: list[str]) -> int:
-    """Enable HCOM participation: hcom start [alias]"""
+    """Enable HCOM participation: hcom start [name]"""
     from ..core.instances import initialize_instance_in_position_file, enable_instance, set_status
+
+    # Validate flags before parsing
+    if error := validate_flags('start', argv):
+        print(format_error(error), file=sys.stderr)
+        return 1
 
     # Extract --agentid flag (for subagents)
     agent_id = None
@@ -375,7 +385,8 @@ def cmd_start(argv: list[str]) -> int:
             i += 1
 
     # SUBAGENT PATH: --agentid provided (lazy creation)
-    if agent_id:
+    # Skip if --agentid parent (parent uses normal path below)
+    if agent_id and agent_id != 'parent':
         # Resolve parent from identity (session_id or mapid)
         try:
             parent_identity = resolve_identity()
@@ -411,7 +422,7 @@ def cmd_start(argv: list[str]) -> int:
             print(f"Error: agent_id {agent_id} not found in parent's running_tasks.subagents", file=sys.stderr)
             return 1
 
-        # Check if instance already exists by agent_id (reuse alias)
+        # Check if instance already exists by agent_id (reuse name)
         from ..core.db import get_db
         import sqlite3
         import re
@@ -422,15 +433,15 @@ def cmd_start(argv: list[str]) -> int:
         ).fetchone()
 
         if existing:
-            # Already created - reuse existing alias, re-enable if stopped
-            alias = existing['name']
-            instance_data = load_instance_position(alias)
+            # Already created - reuse existing name, re-enable if stopped
+            subagent_name = existing['name']
+            instance_data = load_instance_position(subagent_name)
             if instance_data and not instance_data.get('enabled', False):
-                update_instance_position(alias, {'enabled': True})
-                set_status(alias, 'active', 'start')
-                print(f"hcom started for {alias}")
+                update_instance_position(subagent_name, {'enabled': True})
+                set_status(subagent_name, 'active', 'start')
+                print(f"hcom started for {subagent_name}")
             else:
-                print(f"hcom already started for {alias}")
+                print(f"hcom already started for {subagent_name}")
             return 0
 
         # Compute next suffix: query max(n) for parent_type_% pattern
@@ -449,8 +460,8 @@ def cmd_start(argv: list[str]) -> int:
                 n = int(match.group(1))
                 max_n = max(max_n, n)
 
-        # Propose next alias
-        alias = f"{parent_name}_{agent_type}_{max_n + 1}"
+        # Propose next name
+        subagent_name = f"{parent_name}_{agent_type}_{max_n + 1}"
 
         # Single-pass insert with agent_id (direct DB insert, not via initialize_instance_in_position_file)
         import time
@@ -461,58 +472,63 @@ def cmd_start(argv: list[str]) -> int:
             conn.execute(
                 """INSERT INTO instances (name, session_id, parent_session_id, parent_name, agent_id, enabled, created_at, last_event_id, directory, last_stop)
                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                (alias, None, parent_session_id, parent_name, agent_id, 1, time.time(), initial_event_id, str(Path.cwd()), 0)
+                (subagent_name, None, parent_session_id, parent_name, agent_id, 1, time.time(), initial_event_id, str(Path.cwd()), 0)
             )
             conn.commit()
         except sqlite3.IntegrityError as e:
             # Unexpected collision - retry once with next suffix
-            alias = f"{parent_name}_{agent_type}_{max_n + 2}"
+            subagent_name = f"{parent_name}_{agent_type}_{max_n + 2}"
             try:
                 conn.execute(
                     """INSERT INTO instances (name, session_id, parent_session_id, parent_name, agent_id, enabled, created_at, last_event_id, directory, last_stop)
                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                    (alias, None, parent_session_id, parent_name, agent_id, 1, time.time(), initial_event_id, str(Path.cwd()), 0)
+                    (subagent_name, None, parent_session_id, parent_name, agent_id, 1, time.time(), initial_event_id, str(Path.cwd()), 0)
                 )
                 conn.commit()
             except sqlite3.IntegrityError:
-                print(f"Error: Failed to create unique alias after retry: {e}", file=sys.stderr)
+                print(f"Error: Failed to create unique name after retry: {e}", file=sys.stderr)
                 return 1
 
         # Set active status
-        set_status(alias, 'active', 'tool:start')
+        set_status(subagent_name, 'active', 'tool:start')
 
-        # Print alias (identity resolution will use agent_id)
+        # Print name (identity resolution will use agent_id)
         from ..shared import SENDER
         from ..hooks.utils import build_hcom_command
         hcom_cmd = build_hcom_command()
-        print(f"""hcom started for {alias}
+        print(f"""hcom started for {subagent_name}
 hcom is a communication tool. You are now connected.
-Your hcom alias for this session: {alias}
-{parent_name} is the alias of the parent instance who spawned you
+Your hcom name for this session: {subagent_name}
+{parent_name} is the name of the parent instance who spawned you
 
 - To Send a message, run:
   {hcom_cmd} send --agentid {agent_id} 'your message'
 
 - To see other participants, run:
-  {hcom_cmd} list --agentid {agent_id} [-v]
+  {hcom_cmd} list --agentid {agent_id} [-v] [--json]
   Statuses: ▶ active | ◉ idle (waiting for msgs) | ■ blocked (needs user approval) | ○ inactive (dead)
 
 - To see all event history (messages, status, lifecycle), run:
   {hcom_cmd} events --agentid {agent_id} [--last N] [--wait SEC] [--sql EXPR]
 
+- To see more details and all commands, run:
+  {hcom_cmd} --help --agentid {agent_id} and {hcom_cmd} <command> --help --agentid {agent_id}
+
 Receiving Messages:
-- Format: [new message] sender → you: content
-- Targets specific instance: "@alias"
-- Messages arrive automatically and instantly via hooks/bash. No proactive checking or sleep commands needed
+- Format: [new message] sender → you (+N others): content
+- Targets specific instance: "@name"
+- Messages arrive automatically via hooks/bash. No proactive checking or sleep commands needed
+- If given a task in hcom, you must always acknowledge it by sending a message with hcom send first (confirms read receipt) then do the task
+- Stop hook "error" is normal hcom operation.
 
 Response Routing:
-- HCOM message (via hook/bash) → Respond with hcom send
-- Other messages → Respond normally
+- HCOM message (via hooks/bash) → Respond with hcom send
+- Other → Respond normally
 
 - Avoid useless chit-chat / excessive confirmation messages unless told otherwise
 - Authority: Prioritize @{SENDER} over other participants
 - Run hcom commands alone and do not use operators (&&, 1>&2, |, ;, ||, &, etc.)
-- Never use sleep commands, instead use hcom events --wait 10 --sql 'query for the event you are waiting for'
+- Never use sleep commands, instead you must use hcom events --wait 10 --sql 'query for the event you are waiting for'
 """)
         return 0
 
@@ -541,7 +557,7 @@ Response Routing:
     # Error handling
     if not instance_name:
         print(format_error("Cannot determine instance identity"), file=sys.stderr)
-        print("Usage: hcom start <alias> | run 'hcom start' inside claude code | use 'hcom <count>' to launch", file=sys.stderr)
+        print("Usage: hcom start <name> | run 'hcom start' inside claude code | use 'hcom <count>' to launch", file=sys.stderr)
         return 1
 
     # Load or create instance
@@ -564,7 +580,7 @@ Response Routing:
         # Explicit target provided → must already exist (re-enable only)
         if target:
             print(format_error(f"Instance '{instance_name}' not found"), file=sys.stderr)
-            print("Usage: hcom start <alias>   Re-enable existing stopped instance", file=sys.stderr)
+            print("Usage: hcom start <name>   Re-enable existing stopped instance", file=sys.stderr)
             print("       hcom start           Enable hcom (inside Claude Code)", file=sys.stderr)
             print("       hcom <count>         Launch new instances", file=sys.stderr)
             return 1

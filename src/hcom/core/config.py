@@ -72,6 +72,7 @@ class HcomConfig:
     relay: str = ''
     relay_token: str = ''
     relay_enabled: bool = True
+    name_export: str = ''
 
     def __post_init__(self):
         """Validate configuration on construction"""
@@ -254,6 +255,7 @@ def hcom_config_to_dict(config: HcomConfig) -> dict[str, str]:
         'HCOM_RELAY': config.relay,
         'HCOM_RELAY_TOKEN': config.relay_token,
         'HCOM_RELAY_ENABLED': '1' if config.relay_enabled else '0',
+        'HCOM_NAME_EXPORT': config.name_export,
     }
 
 
@@ -308,6 +310,8 @@ def dict_to_hcom_config(data: dict[str, str]) -> HcomConfig:
         kwargs['relay_token'] = data['HCOM_RELAY_TOKEN']
     if 'HCOM_RELAY_ENABLED' in data:
         kwargs['relay_enabled'] = data['HCOM_RELAY_ENABLED'] not in ('0', 'false', 'False', 'no', 'off')
+    if 'HCOM_NAME_EXPORT' in data:
+        kwargs['name_export'] = data['HCOM_NAME_EXPORT']
 
     if errors:
         raise HcomConfigError(errors)

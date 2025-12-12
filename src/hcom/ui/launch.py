@@ -13,8 +13,7 @@ from ..ui import Field, LaunchField, Mode
 
 # Import rendering utilities
 from ..ui import (
-    ansi_len, ansi_ljust, bg_ljust, truncate_ansi, get_terminal_size,
-    separator_line,
+    bg_ljust, truncate_ansi, separator_line,
 )
 
 # Import input utilities
@@ -34,7 +33,7 @@ from ..shared import (
 )
 from ..ui import CONFIG_DEFAULTS, CONFIG_FIELD_OVERRIDES, FG_CLAUDE_ORANGE, FG_CUSTOM_ENV
 from ..api import (
-    get_config, reload_config, cmd_launch,
+    reload_config, cmd_launch,
     resolve_claude_args
 )
 from ..commands.admin import reset_config
@@ -889,9 +888,6 @@ class LaunchScreen:
         if value_color is None:
             value_color = FG_ORANGE
 
-        # Determine if field is in config (for proper state display)
-        in_config = field.key in self.state.config_edit
-
         # Format value based on type
         # For Claude fields, use cached defaults from HCOM_CLAUDE_ARGS
         if field.key in ('prompt', 'system_prompt', 'append_system_prompt', 'background'):
@@ -923,7 +919,11 @@ class LaunchScreen:
                 default_normalized = str(default).strip().strip("'\"").strip()
                 is_modified = field_value_normalized != default_normalized
                 color = value_color if is_modified else FG_WHITE
-                value_str = f"{color}{field.value}{RESET}"
+                # Mask sensitive values (tokens)
+                display_value = field.value
+                if field.key == 'HCOM_RELAY_TOKEN' and field.value:
+                    display_value = f"{field.value[:4]}***" if len(field.value) > 4 else "***"
+                value_str = f"{color}{display_value}{RESET}"
             else:
                 # Empty - check what runtime will actually use
                 field_value_normalized = str(field.value).strip().strip("'\"").strip()

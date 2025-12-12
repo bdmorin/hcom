@@ -1,7 +1,6 @@
 """Helper functions for scope-based message routing"""
 from __future__ import annotations
 
-import re
 from typing import Any
 
 # Valid scope values for message routing
@@ -54,9 +53,15 @@ def is_mentioned(text: str, name: str) -> bool:
     """Check if instance name is @-mentioned in text using prefix matching.
 
     Uses same prefix matching logic as compute_scope() for consistency:
-    - @alice matches "alice" and "alice-worker" (prefix match)
+    - @alice matches "alice" and "alice-worker" (prefix match with hyphen)
+    - @alice does NOT match "alice_subagent_1" (underscore blocks prefix expansion)
+    - @alice_ matches "alice_subagent_1" (explicit underscore prefix)
     - @alice does NOT match "alice:BOXE" (bare mention excludes remote instances)
     - @alice:BOX matches "alice:BOXE" (remote mention includes device suffix)
+
+    Underscore `_` is reserved as the subagent hierarchy separator, so prefix
+    matching stops at underscore boundaries. This prevents @parent from matching
+    all subagents named parent_type_N.
 
     Args:
         text: Text to search in
@@ -68,10 +73,12 @@ def is_mentioned(text: str, name: str) -> bool:
     Examples:
         >>> is_mentioned("Hey @john, can you help?", "john")
         True
-        >>> is_mentioned("Hey @john, can you help?", "johnsmith")  # prefix match
+        >>> is_mentioned("Hey @john, can you help?", "john-worker")  # hyphen ok
         True
-        >>> is_mentioned("Hey @johnsmith, test", "john")  # doesn't match
+        >>> is_mentioned("Hey @john, can you help?", "john_subagent_1")  # underscore blocks
         False
+        >>> is_mentioned("Hey @john_, can you help?", "john_subagent_1")  # explicit underscore
+        True
         >>> is_mentioned("email@john.com", "john")  # not a mention
         False
         >>> is_mentioned("@alice", "alice:BOXE")  # bare mention excludes remote
@@ -93,8 +100,10 @@ def is_mentioned(text: str, name: str) -> bool:
                 return True
         else:
             # Bare mention - only match local instances (no : in name)
+            # Don't match across underscore boundary (reserved for subagent hierarchy)
             if ':' not in name and name.lower().startswith(mention.lower()):
-                return True
+                if len(name) == len(mention) or name[len(mention)] != '_':
+                    return True
 
     return False
 

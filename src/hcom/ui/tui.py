@@ -5,13 +5,15 @@ import shutil
 import subprocess
 import sys
 import time
+from contextlib import contextmanager
+from io import StringIO
 from pathlib import Path
 from typing import List, Optional
 
 # Import types
 from .types import Mode, UIState
 from .rendering import (
-    ansi_len, ansi_ljust, truncate_ansi, get_terminal_size,
+    ansi_len, ansi_ljust, truncate_ansi, truncate_path, get_terminal_size,
     get_message_pulse_colors, separator_line,
 )
 from .input import KeyboardInput
@@ -35,13 +37,13 @@ from ..api import (
     # Instance operations
     get_instance_status,
     # Path utilities
-    hcom_path, ensure_hcom_directories,
+    ensure_hcom_directories,
     # Configuration
-    HcomConfig, reload_config,
-    ConfigSnapshot, load_config_snapshot, save_config,
+    reload_config,
+    load_config_snapshot, save_config,
     dict_to_hcom_config, HcomConfigError,
     # Commands
-    cmd_launch, cmd_start, cmd_stop, cmd_reset, cmd_send,
+    cmd_stop, cmd_reset,
 )
 
 # Import screens
@@ -54,9 +56,6 @@ from . import CONFIG_DEFAULTS
 # TUI Layout Constants
 MESSAGE_PREVIEW_LIMIT = 100  # Keep last N messages in message preview
 
-
-from contextlib import contextmanager
-from io import StringIO
 
 @contextmanager
 def _suppress_output():
@@ -337,27 +336,30 @@ class HcomTUI:
         try:
             from ..core.db import get_launch_status, parse_iso_timestamp, LAUNCH_TIMEOUT_SECONDS
             from datetime import datetime, timezone
-            import time as time_module
 
-            # Clear failed banner after 5s timeout
-            if self.state.launch_batch_failed and time_module.time() >= self.state.launch_batch_failed_until:
-                self.state.launch_batch = None
-                self.state.launch_batch_failed = False
+            batch = get_launch_status()
+            now = datetime.now(timezone.utc).timestamp()
 
-            batch = get_launch_status()  # No launcher filter - show all pending
-            # Only show if not complete AND recent (timeout for failed launches)
             if batch and batch['ready'] < batch['expected']:
                 ts = parse_iso_timestamp(batch.get('timestamp', ''))
-                cutoff = datetime.now(timezone.utc).timestamp() - LAUNCH_TIMEOUT_SECONDS
-                if ts and ts.timestamp() > cutoff:
-                    self.state.launch_batch = batch
-                    self.state.launch_batch_failed = False
-                else:
-                    # Batch timed out - show red banner for 5s
-                    if self.state.launch_batch and not self.state.launch_batch_failed:
+                if ts:
+                    age = now - ts.timestamp()
+                    if age < LAUNCH_TIMEOUT_SECONDS:
+                        # < 30s: show yellow "Launching..."
+                        self.state.launch_batch = batch
+                        self.state.launch_batch_failed = False
+                    elif age < LAUNCH_TIMEOUT_SECONDS + 5:
+                        # 30-35s: show red "Launch failed"
+                        self.state.launch_batch = batch
                         self.state.launch_batch_failed = True
-                        self.state.launch_batch_failed_until = time_module.time() + 5.0
-                    self.state.launch_batch = batch  # Keep batch for red banner
+                        self.state.launch_batch_failed_until = time.time() + 5
+                    else:
+                        # > 35s: old news, don't show anything
+                        self.state.launch_batch = None
+                        self.state.launch_batch_failed = False
+                else:
+                    self.state.launch_batch = None
+                    self.state.launch_batch_failed = False
             else:
                 self.state.launch_batch = None
                 self.state.launch_batch_failed = False
@@ -704,7 +706,6 @@ class HcomTUI:
         # Load messages for MANAGE screen preview (with event ID caching)
         if self.mode == Mode.MANAGE:
             from ..core.db import get_last_event_id, get_events_since
-            import json
 
             try:
                 current_max_id = get_last_event_id()
@@ -1046,11 +1047,17 @@ class HcomTUI:
             print()  # Empty line between events
 
         elif event_type == 'status':
-            # Format: time name: [status] status, context
+            # Format: time name: [status] status, context: detail
             status = data.get('status', '?')
             context = data.get('context', '')
+            detail = data.get('detail', '')
             # Add comma before context if present
             ctx = f", {context}" if context else ""
+            # Add detail after colon if present (truncate long details, preserve filename)
+            if detail:
+                max_detail = 60
+                detail_display = truncate_path(detail, max_detail)
+                ctx += f": {detail_display}"
             print(f"{DIM}{FG_GRAY}{format_timestamp(timestamp)}{RESET} "
                   f"{BOLD}{FG_CYAN}{instance}{RESET}: {FG_GRAY}[{type_label}]{RESET} {status}{ctx}")
             print()  # Empty line between events
@@ -1145,7 +1152,6 @@ class HcomTUI:
                 event_type = None if self.state.event_type_filter == "all" else self.state.event_type_filter
                 events = get_events_since(0, event_type=event_type)
                 total_count = len(events)
-                has_events = bool(events)
 
                 if events:
                     # Filter and render all matching events

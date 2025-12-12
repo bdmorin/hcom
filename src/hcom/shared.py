@@ -10,7 +10,7 @@ from pathlib import Path
 from dataclasses import dataclass
 from typing import Literal
 
-__version__ = "0.6.7"
+__version__ = "0.6.8"
 
 # ===== Platform Detection =====
 IS_WINDOWS = sys.platform == 'win32'
@@ -49,6 +49,7 @@ def is_termux() -> bool:
         Path('/data/data/com.termux').exists() or     # Fallback: Path check
         'com.termux' in os.environ.get('PREFIX', '')   # Fallback: PREFIX check
     )
+
 
 # ===== Message Constants =====
 # Message patterns
@@ -104,15 +105,16 @@ HCOM_INVOCATION_PATTERN = r'(?:uvx\s+)?hcom|python3?\s+-m\s+hcom|(?:python3?\s+)
 # - hcom send (any args, including --agentid)
 # - hcom stop (no args) | hcom start (no args, or with --agentid flag)
 # - hcom help | hcom --help | hcom -h
-# - hcom list (with optional --json, -v, --verbose)
+# - hcom list (with optional --json, -v, --verbose, self)
 # - hcom events (with optional --last, --wait, --sql, --agentid)
 # - hcom relay (with optional pull, hf)
 # - hcom config (any args)
-# Negative lookahead ensures stop/start not followed by alias targets (except approved flags)
-# Allows shell operators (2>&1, >/dev/null, |, &&) but blocks identifier-like targets (myalias, 123abc)
+# - hcom thread (get conversation context)
+# Negative lookahead ensures stop/start not followed by name targets (except approved flags)
+# Allows shell operators (2>&1, >/dev/null, |, &&) but blocks identifier-like targets (myname, 123abc)
 HCOM_COMMAND_PATTERN = re.compile(
     rf'({HCOM_INVOCATION_PATTERN})\s+'
-    r'(?:send\b|stop(?!\s+(?:[a-zA-Z_]|[0-9]+[a-zA-Z_])[-\w]*(?:\s|$))|start(?:\s+--agentid\s+\S+)?(?!\s+(?:[a-zA-Z_]|[0-9]+[a-zA-Z_])[-\w]*(?:\s|$))|(?:help|--help|-h)\b|--new-terminal\b|list(?:\s+--(?:agentid|json|verbose|v)\b)*|events\b|relay\b|config\b)'
+    r'(?:send\b|stop(?!\s+(?:[a-zA-Z_]|[0-9]+[a-zA-Z_])[-\w]*(?:\s|$))|start(?:\s+--agentid\s+\S+)?(?!\s+(?:[a-zA-Z_]|[0-9]+[a-zA-Z_])[-\w]*(?:\s|$))|(?:help|--help|-h)\b|--new-terminal\b|list(?:\s+(?:self|--(?:agentid|json|verbose|v))\b)*|events\b|relay\b|config\b|thread\b)'
 )
 
 # ===== Core ANSI Codes =====
@@ -198,6 +200,7 @@ DEFAULT_CONFIG_DEFAULTS = [
     'HCOM_RELAY=',
     'HCOM_RELAY_TOKEN=',
     'HCOM_RELAY_ENABLED=1',
+    'HCOM_NAME_EXPORT=',
 ]
 
 # ===== Status Configuration =====
@@ -386,7 +389,7 @@ def parse_env_file(config_path: Path) -> dict[str, str]:
 
 # ===== Claude Args Re-exports =====
 # Re-export Claude args for backward compatibility (ui.py depends on these)
-from .claude_args import (
+from .claude_args import (  # noqa: E402
     ClaudeArgsSpec,
     resolve_claude_args,
     merge_claude_args,

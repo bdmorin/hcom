@@ -14,7 +14,7 @@ from pathlib import Path
 from typing import Any
 
 from .shared import IS_WINDOWS, CREATE_NO_WINDOW, is_wsl, is_termux
-from .core.paths import hcom_path, SCRIPTS_DIR, read_file_with_retry
+from .core.paths import hcom_path, LAUNCH_DIR, read_file_with_retry
 from .core.config import get_config
 
 # ==================== Claude Command Building ====================
@@ -322,7 +322,7 @@ def launch_terminal(command: str, env: dict[str, str], cwd: str | None = None, b
         and terminal_mode == 'new'
     )
     extension = '.command' if use_command_ext else '.sh'
-    script_file = str(hcom_path(SCRIPTS_DIR,
+    script_file = str(hcom_path(LAUNCH_DIR,
         f'hcom_{os.getpid()}_{random.randint(1000,9999)}{extension}'))
     create_bash_script(script_file, env_vars, cwd, command_str, background)
 

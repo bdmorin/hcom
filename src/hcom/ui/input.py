@@ -1,29 +1,22 @@
 """Keyboard input handling and text editing"""
 from __future__ import annotations
 import os
-import sys
 import select
+import sys
 import unicodedata
-from typing import Optional, List
-
-# Platform detection
-IS_WINDOWS = os.name == 'nt'
+from typing import List, Optional
 
 # Import from rendering module (single source of truth)
-from .rendering import ansi_len, ANSI_RE, MAX_INPUT_ROWS
-
-# Import platform-specific modules conditionally
-if IS_WINDOWS:
-    import msvcrt
-else:
-    import termios
-    import tty
+from .rendering import ANSI_RE, MAX_INPUT_ROWS, ansi_len
 
 # Import ANSI codes from shared module
 from ..shared import (
-    HIDE_CURSOR, SHOW_CURSOR,
-    FG_GRAY, FG_WHITE, FG_LIGHTGRAY, DIM, RESET, REVERSE
+    DIM, FG_GRAY, FG_LIGHTGRAY, FG_WHITE,
+    HIDE_CURSOR, RESET, REVERSE, SHOW_CURSOR,
 )
+
+# Platform detection
+IS_WINDOWS = os.name == 'nt'
 
 
 def slice_by_visual_width(text: str, max_width: int) -> tuple[str, int]:
@@ -124,10 +117,14 @@ class KeyboardInput:
                     return '\n'  # Pasted newline, keep as literal
                 else:
                     return 'ENTER'  # Manual Enter key press
-            if ch == '\x1b': return 'ESC'
-            if ch in ('\x08', '\x7f'): return 'BACKSPACE'
-            if ch == ' ': return 'SPACE'
-            if ch == '\t': return 'TAB'
+            if ch == '\x1b':
+                return 'ESC'
+            if ch in ('\x08', '\x7f'):
+                return 'BACKSPACE'
+            if ch == ' ':
+                return 'SPACE'
+            if ch == '\t':
+                return 'TAB'
             return ch if ch else None
         else:
             try:
@@ -167,13 +164,20 @@ class KeyboardInput:
                     return '\n'  # Pasted newline, keep as literal
                 else:
                     return 'ENTER'  # Manual Enter key press
-            if ch in ('\x7f', '\x08'): return 'BACKSPACE'
-            if ch == ' ': return 'SPACE'
-            if ch == '\t': return 'TAB'
-            if ch == '\x03': return 'CTRL_C'
-            if ch == '\x04': return 'CTRL_D'
-            if ch == '\x01': return 'CTRL_A'
-            if ch == '\x12': return 'CTRL_R'
+            if ch in ('\x7f', '\x08'):
+                return 'BACKSPACE'
+            if ch == ' ':
+                return 'SPACE'
+            if ch == '\t':
+                return 'TAB'
+            if ch == '\x03':
+                return 'CTRL_C'
+            if ch == '\x04':
+                return 'CTRL_D'
+            if ch == '\x01':
+                return 'CTRL_A'
+            if ch == '\x12':
+                return 'CTRL_R'
             return ch
 
 

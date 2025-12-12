@@ -5,9 +5,8 @@ import time
 import shutil
 from pathlib import Path
 from datetime import datetime
-from typing import Any
 from .utils import get_help_text, format_error
-from ..core.paths import hcom_path, SCRIPTS_DIR, LOGS_DIR, ARCHIVE_DIR
+from ..core.paths import hcom_path, LAUNCH_DIR, LOGS_DIR, ARCHIVE_DIR
 from ..core.instances import get_instance_status, is_external_sender
 from ..shared import STATUS_ICONS, format_age, shorten_path
 
@@ -25,11 +24,16 @@ def cmd_help() -> int:
     return 0
 
 
-def _cmd_events_launch(argv: list[str]) -> int:
+def _cmd_events_launch(argv: list[str], subagent_id: str | None = None) -> int:
     """Wait for launches ready, output JSON. Internal - called by launch output."""
     from ..core.db import get_launch_status, get_launch_batch, init_db
-    from .utils import resolve_identity
+    from .utils import resolve_identity, validate_flags
     import os
+
+    # Validate flags
+    if error := validate_flags('events launch', argv):
+        print(format_error(error), file=sys.stderr)
+        return 1
 
     init_db()
 
@@ -40,7 +44,7 @@ def _cmd_events_launch(argv: list[str]) -> int:
     launcher = None
     if os.environ.get('CLAUDECODE') == '1':
         try:
-            launcher = resolve_identity().name
+            launcher = resolve_identity(subagent_id=subagent_id).name
         except Exception:
             pass
 
@@ -95,25 +99,48 @@ def _cmd_events_launch(argv: list[str]) -> int:
     return 0 if status == "ready" else 1
 
 
+# Preset subscriptions (name -> sql) - use events_v flat fields
+PRESET_SUBSCRIPTIONS = {
+    # Uses 'events_v.' prefix for outer table refs (bare names don't resolve in nested subquery)
+    'collision': """type = 'status' AND status_context IN ('tool:Write', 'tool:Edit') AND EXISTS (SELECT 1 FROM events_v e WHERE e.type = 'status' AND e.status_context IN ('tool:Edit', 'tool:Write') AND e.status_detail = events_v.status_detail AND e.instance != events_v.instance AND ABS(strftime('%s', events_v.timestamp) - strftime('%s', e.timestamp)) < 20)""",
+}
+
+
 def cmd_events(argv: list[str]) -> int:
-    """Query events from SQLite: hcom events [launch] [--last N] [--wait SEC] [--sql EXPR] [--agentid ID]"""
+    """Query events from SQLite: hcom events [launch|sub|unsub] [--last N] [--wait SEC] [--sql EXPR] [--agentid ID]"""
     from ..core.db import get_db, init_db, get_last_event_id
-    from .utils import parse_agentid_flag
+    from .utils import parse_agentid_flag, validate_flags
 
     init_db()  # Ensure schema exists
 
-    # Handle 'launch' subcommand
-    if argv and argv[0] == 'launch':
-        return _cmd_events_launch(argv[1:])
-
-    # Parse --agentid flag (for subagents)
-    subagent_id, argv, agent_id_value = parse_agentid_flag(argv)
+    # Parse --agentid flag BEFORE all subcommand dispatch
+    subagent_id, argv_parsed, agent_id_value = parse_agentid_flag(argv)
 
     # Check if --agentid was provided but instance not found
     if subagent_id is None and agent_id_value is not None:
         print(format_error(f"No instance found with agent_id '{agent_id_value}'"), file=sys.stderr)
         print(f"Run 'hcom start --agentid {agent_id_value}' first", file=sys.stderr)
         return 1
+
+    # Handle 'launch' subcommand
+    if argv_parsed and argv_parsed[0] == 'launch':
+        return _cmd_events_launch(argv_parsed[1:], subagent_id=subagent_id)
+
+    # Handle 'sub' subcommand (list or subscribe)
+    if argv_parsed and argv_parsed[0] == 'sub':
+        return _events_sub(argv_parsed[1:], subagent_id=subagent_id)
+
+    # Handle 'unsub' subcommand (unsubscribe)
+    if argv_parsed and argv_parsed[0] == 'unsub':
+        return _events_unsub(argv_parsed[1:], subagent_id=subagent_id)
+
+    # Validate flags before parsing (use argv_parsed which has --agentid removed)
+    if error := validate_flags('events', argv_parsed):
+        print(format_error(error), file=sys.stderr)
+        return 1
+
+    # Use already-parsed values from above
+    argv = argv_parsed
 
     # Parse arguments
     last_n = 20  # Default: last 20 events
@@ -141,7 +168,9 @@ def cmd_events(argv: list[str]) -> int:
                 wait_timeout = 60  # Default: 60 seconds
                 i += 1
         elif argv[i] == '--sql' and i + 1 < len(argv):
-            sql_where = argv[i + 1]
+            # Fix shell escaping: bash/zsh escape ! as \! in double quotes (history expansion)
+            # SQLite doesn't use backslash escaping, so strip these artifacts
+            sql_where = argv[i + 1].replace('\\!', '!')
             i += 2
         else:
             i += 1
@@ -162,7 +191,7 @@ def cmd_events(argv: list[str]) -> int:
         # Check for matching events in last 10s (race condition window)
         from datetime import timezone
         lookback_timestamp = datetime.fromtimestamp(time.time() - 10, tz=timezone.utc).isoformat()
-        lookback_query = f"SELECT * FROM events WHERE timestamp > ?{filter_query} ORDER BY id DESC LIMIT 1"
+        lookback_query = f"SELECT * FROM events_v WHERE timestamp > ?{filter_query} ORDER BY id DESC LIMIT 1"
 
         try:
             lookback_row = db.execute(lookback_query, [lookback_timestamp]).fetchone()
@@ -188,7 +217,7 @@ def cmd_events(argv: list[str]) -> int:
         last_id = get_last_event_id()
 
         while time.time() - start_time < wait_timeout:
-            query = f"SELECT * FROM events WHERE id > ?{filter_query} ORDER BY id"
+            query = f"SELECT * FROM events_v WHERE id > ?{filter_query} ORDER BY id"
 
             try:
                 rows = db.execute(query, [last_id]).fetchall()
@@ -241,7 +270,7 @@ def cmd_events(argv: list[str]) -> int:
         return 0  # Always exit 0 so PostToolUse runs for message delivery
 
     # Snapshot mode (default)
-    query = "SELECT * FROM events WHERE 1=1"
+    query = "SELECT * FROM events_v WHERE 1=1"
     query += filter_query
     query += " ORDER BY id DESC"
     query += f" LIMIT {last_n}"
@@ -268,13 +297,279 @@ def cmd_events(argv: list[str]) -> int:
     return 0
 
 
+# ==================== Event Subscriptions ====================
+
+
+def _events_sub(argv: list[str], subagent_id: str | None = None) -> int:
+    """Subscribe to events or list subscriptions.
+
+    hcom events sub                  - list all subscriptions
+    hcom events sub "sql"            - create subscription
+    hcom events sub collision        - preset: file collision warnings
+    hcom events sub "sql" --once     - one-shot (auto-removed after first match)
+    hcom events sub "sql" --for X    - subscribe on behalf of instance X
+    """
+    from ..core.db import get_db, get_last_event_id, kv_set, kv_get
+    from ..core.instances import load_instance_position
+    from .utils import resolve_identity, validate_flags
+    from ..shared import SENDER
+    from hashlib import sha256
+
+    # Validate flags
+    if error := validate_flags('events sub', argv):
+        print(format_error(error), file=sys.stderr)
+        return 1
+
+    # Parse args
+    once = '--once' in argv
+    target_instance = None
+    i = 0
+    sql_parts = []
+    while i < len(argv):
+        if argv[i] == '--once':
+            i += 1
+        elif argv[i] == '--for':
+            if i + 1 >= len(argv):
+                print("Error: --for requires instance name", file=sys.stderr)
+                return 1
+            target_instance = argv[i + 1]
+            i += 2
+        elif not argv[i].startswith('-'):
+            sql_parts.append(argv[i])
+            i += 1
+        else:
+            i += 1
+
+    conn = get_db()
+    now = time.time()
+
+    # No args = list subscriptions
+    if not sql_parts:
+        rows = conn.execute(
+            "SELECT key, value FROM kv WHERE key LIKE 'events_sub:%'"
+        ).fetchall()
+
+        if not rows:
+            print("No active subscriptions")
+            return 0
+
+        subs = []
+        for row in rows:
+            try:
+                subs.append(json.loads(row['value']))
+            except Exception:
+                pass
+
+        if not subs:
+            print("No active subscriptions")
+            return 0
+
+        print(f"{'ID':<10} {'FOR':<12} {'MODE':<10} FILTER")
+        for sub in subs:
+            mode = 'once' if sub.get('once') else 'continuous'
+            sql_display = sub['sql'][:35] + '...' if len(sub['sql']) > 35 else sub['sql']
+            print(f"{sub['id']:<10} {sub['caller']:<12} {mode:<10} {sql_display}")
+
+        return 0
+
+    # Check for preset subscription
+    preset_name = sql_parts[0] if len(sql_parts) == 1 else None
+    if preset_name and preset_name in PRESET_SUBSCRIPTIONS:
+        # Resolve caller for preset key
+        try:
+            identity = resolve_identity(subagent_id=subagent_id)
+            caller = identity.name
+        except Exception as e:
+            print(f"Error: {e}", file=sys.stderr)
+            return 1
+
+        sub_key = f"events_sub:{preset_name}_{caller}"
+        if kv_get(sub_key):
+            print(f"{preset_name} already enabled")
+            return 0
+
+        kv_set(sub_key, json.dumps({
+            'id': f'{preset_name}_{caller}',
+            'caller': caller,
+            'sql': PRESET_SUBSCRIPTIONS[preset_name],
+            'created': now,
+            'last_id': get_last_event_id(),
+            'once': False,
+        }))
+        print(f"{preset_name} enabled")
+        return 0
+
+    # Create custom subscription
+    # Fix shell escaping: bash/zsh escape ! as \! in double quotes (history expansion)
+    sql = ' '.join(sql_parts).replace('\\!', '!')
+
+    # Validate SQL syntax (use events_v for flat field access)
+    try:
+        conn.execute(f"SELECT 1 FROM events_v WHERE ({sql}) LIMIT 0")
+    except Exception as e:
+        print(f"Invalid SQL: {e}", file=sys.stderr)
+        return 1
+
+    # Resolve target (--for) or use caller's identity
+    if target_instance:
+        # Validate target instance exists
+        target_data = load_instance_position(target_instance)
+        if not target_data:
+            # Try prefix match
+            row = conn.execute(
+                "SELECT name FROM instances WHERE name LIKE ? LIMIT 1",
+                (f"{target_instance}%",)
+            ).fetchone()
+            if row:
+                target_instance = row['name']
+                target_data = load_instance_position(target_instance)
+
+        if not target_data:
+            print(f"Instance not found: {target_instance}", file=sys.stderr)
+            print("Use 'hcom list' to see available instances", file=sys.stderr)
+            return 1
+
+        caller = target_instance
+    else:
+        # Resolve caller (fallback to bigboss if no identity)
+        try:
+            caller = resolve_identity(subagent_id=subagent_id).name
+        except Exception:
+            caller = SENDER
+
+    # Test against recent events to show what would match
+    test_count = conn.execute(
+        f"SELECT COUNT(*) FROM events_v WHERE ({sql})"
+    ).fetchone()[0]
+
+    # Generate ID
+    sub_id = f"sub-{sha256(f'{caller}{sql}{now}'.encode()).hexdigest()[:4]}"
+
+    # Store subscription
+    key = f"events_sub:{sub_id}"
+    value = json.dumps({
+        'id': sub_id,
+        'sql': sql,
+        'caller': caller,
+        'once': once,
+        'last_id': get_last_event_id(),
+        'created': now,
+    })
+    kv_set(key, value)
+
+    # Output with validation feedback
+    print(f"{sub_id}")
+    print(f"  for: {caller}")
+    print(f"  filter: {sql}")
+    if test_count > 0:
+        print(f"  historical matches: {test_count} events")
+        # Show most recent match as example
+        example = conn.execute(
+            f"SELECT timestamp, type, instance, data FROM events_v WHERE ({sql}) ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+        if example:
+            print(f"  latest match: [{example['type']}] {example['instance']} @ {example['timestamp'][:19]}")
+    else:
+        print("  historical matches: 0 (filter will apply to future events only)")
+        # Warn about json_extract paths that don't exist in recent events
+        import re
+        paths = re.findall(r"json_extract\s*\(\s*data\s*,\s*['\"](\$\.[^'\"]+)['\"]", sql)
+        if paths:
+            # Check which paths exist in recent events
+            missing = []
+            for path in set(paths):
+                exists = conn.execute(
+                    f"SELECT 1 FROM events WHERE json_extract(data, ?) IS NOT NULL LIMIT 1",
+                    (path,)
+                ).fetchone()
+                if not exists:
+                    missing.append(path)
+            if missing:
+                print(f"  Warning: field(s) not found in any events: {', '.join(missing)} \nYou should probably double check the syntax")
+
+    return 0
+
+
+def _events_unsub(argv: list[str], subagent_id: str | None = None) -> int:
+    """Remove subscription: hcom events unsub <id|preset>"""
+    from ..core.db import get_db, kv_set
+    from .utils import resolve_identity, validate_flags
+
+    # Validate flags
+    if error := validate_flags('events unsub', argv):
+        print(format_error(error), file=sys.stderr)
+        return 1
+
+    if not argv:
+        print("Usage: hcom events unsub <id>", file=sys.stderr)
+        return 1
+
+    sub_id = argv[0]
+
+    # Handle preset names (e.g., 'collision' -> 'collision_{caller}')
+    if sub_id in PRESET_SUBSCRIPTIONS:
+        try:
+            identity = resolve_identity(subagent_id=subagent_id)
+            caller = identity.name
+        except Exception as e:
+            print(f"Error: {e}", file=sys.stderr)
+            return 1
+        key = f"events_sub:{sub_id}_{caller}"
+        conn = get_db()
+        row = conn.execute("SELECT value FROM kv WHERE key = ?", (key,)).fetchone()
+        if not row:
+            print(f"{sub_id} not enabled")
+            return 0
+        kv_set(key, None)
+        print(f"{sub_id} disabled")
+        return 0
+
+    # Handle prefix match (allow 'a3f2' instead of 'sub-a3f2')
+    if not sub_id.startswith('sub-'):
+        sub_id = f"sub-{sub_id}"
+
+    key = f"events_sub:{sub_id}"
+
+    # Check exists
+    conn = get_db()
+    row = conn.execute("SELECT value FROM kv WHERE key = ?", (key,)).fetchone()
+    if not row:
+        print(f"Not found: {sub_id}", file=sys.stderr)
+        return 1
+
+    kv_set(key, None)
+    print(f"Removed {sub_id}")
+    return 0
+
+
+def _print_sh_exports(data: dict, shlex) -> None:
+    """Print shell exports for instance data."""
+    name = data.get("name", "")
+    session_id = data.get("session_id", "")
+    connected = "1" if data.get("hcom_connected") else "0"
+    status = data.get("status", "unknown")
+    directory = data.get("directory", "")
+
+    print(f'export HCOM_NAME={shlex.quote(name)}')
+    print(f'export HCOM_SID={shlex.quote(session_id)}')  # SID to avoid clash with internal HCOM_SESSION_ID
+    print(f'export HCOM_CONNECTED={shlex.quote(connected)}')
+    print(f'export HCOM_STATUS={shlex.quote(status)}')
+    print(f'export HCOM_DIRECTORY={shlex.quote(directory)}')
+
+
 def cmd_list(argv: list[str]) -> int:
-    """List instances: hcom list [--json] [-v|--verbose] [--agentid ID]"""
-    from .utils import resolve_identity, parse_agentid_flag
+    """List instances: hcom list [self|<name>] [field] [-v] [--json|--sh] [--agentid ID]"""
+    import shlex
+    from .utils import resolve_identity, parse_agentid_flag, validate_flags
     from ..core.instances import load_instance_position, set_status
     from ..core.messages import get_read_receipts
     from ..core.db import get_db
     from ..shared import SENDER
+
+    # Validate flags before parsing
+    if error := validate_flags('list', argv):
+        print(format_error(error), file=sys.stderr)
+        return 1
 
     # Parse --agentid flag (for subagents)
     subagent_id, argv, agent_id_value = parse_agentid_flag(argv)
@@ -288,12 +583,26 @@ def cmd_list(argv: list[str]) -> int:
     # Parse arguments
     json_output = False
     verbose_output = False
+    sh_output = False
+    target_name = None  # 'self' or instance name
+    field_name = None   # Optional field to extract
 
+    positionals = []
     for arg in argv:
         if arg == '--json':
             json_output = True
         elif arg in ['-v', '--verbose']:
             verbose_output = True
+        elif arg == '--sh':
+            sh_output = True
+        elif not arg.startswith('-'):
+            positionals.append(arg)
+
+    # Parse positionals: [target] [field]
+    if positionals:
+        target_name = positionals[0]
+        if len(positionals) > 1:
+            field_name = positionals[1]
 
     # Set status for subagents
     if subagent_id:
@@ -301,8 +610,75 @@ def cmd_list(argv: list[str]) -> int:
 
     # Resolve current instance identity (with subagent context)
     identity = resolve_identity(subagent_id=subagent_id)
-    current_alias = identity.name
+    current_name = identity.name
     sender_identity = identity
+
+    # Single instance query: hcom list <name|self> [field] [--json|--sh]
+    if target_name:
+        # 'self' means current instance
+        is_self = target_name == 'self'
+        query_name = current_name if is_self else target_name
+
+        # Build payload
+        if is_self:
+            # Self payload - may not have instance data yet
+            payload = {
+                "name": current_name,
+                "session_id": identity.session_id or "",
+            }
+            if current_name != SENDER:
+                current_data = load_instance_position(current_name)
+                if current_data:
+                    payload["hcom_connected"] = current_data.get('enabled', False)
+                    payload["status"] = current_data.get('status', 'unknown')
+                    payload["transcript_path"] = current_data.get('transcript_path', '')
+                    payload["directory"] = current_data.get('directory', '')
+                    payload["parent_name"] = current_data.get('parent_name', '')
+                    payload["agent_id"] = current_data.get('agent_id', '')
+                else:
+                    payload["hcom_connected"] = False
+        else:
+            # Named instance - must exist
+            data = load_instance_position(target_name)
+            if not data:
+                print(format_error(f"Instance not found: {target_name}"), file=sys.stderr)
+                return 1
+            payload = {
+                "name": target_name,
+                "session_id": data.get("session_id", ""),
+                "hcom_connected": data.get("enabled", False),
+                "status": data.get("status", "unknown"),
+                "directory": data.get("directory", ""),
+                "transcript_path": data.get("transcript_path", ""),
+                "parent_name": data.get("parent_name", ""),
+                "agent_id": data.get("agent_id", ""),
+            }
+
+        # Output based on flags
+        if field_name:
+            # Extract specific field
+            value = payload.get(field_name, '')
+            # Normalize booleans to 1/0 for shell
+            if isinstance(value, bool):
+                value = '1' if value else '0'
+            print(value if value else '')
+        elif sh_output:
+            _print_sh_exports(payload, shlex)
+        elif json_output:
+            print(json.dumps(payload))
+        elif is_self:
+            # Self without flags = just name
+            print(current_name)
+        else:
+            # Human readable for named instance
+            enabled = "yes" if payload["hcom_connected"] else "no"
+            print(f"Instance: {target_name}")
+            print(f"  Connected: {enabled}")
+            print(f"  Status: {payload.get('status', 'unknown')}")
+            print(f"  Directory: {payload['directory']}")
+            if payload["session_id"]:
+                print(f"  Session: {payload['session_id']}")
+        return 0
 
     # Load read receipts for all contexts (bigboss, instances)
     # JSON output gets all receipts; verbose gets 3; default gets 1
@@ -310,10 +686,10 @@ def cmd_list(argv: list[str]) -> int:
     read_receipts = get_read_receipts(sender_identity, limit=read_limit)
 
     # Only show connection status for actual instances (not CLI/fallback)
-    show_connection = current_alias != SENDER
+    show_connection = current_name != SENDER
     current_enabled = False
     if show_connection:
-        current_data = load_instance_position(current_alias)
+        current_data = load_instance_position(current_name)
         current_enabled = current_data.get('enabled', False) if current_data else False
 
     # Query instances (default: enabled only, -v or --json: all)
@@ -335,7 +711,7 @@ def cmd_list(argv: list[str]) -> int:
         # JSON per line - _self entry first always
         self_payload = {
             "_self": {
-                "alias": current_alias,
+                "name": current_name,
                 "read_receipts": read_receipts
             }
         }
@@ -353,6 +729,8 @@ def cmd_list(argv: list[str]) -> int:
                 name: {
                     "hcom_connected": enabled,
                     "status": status,
+                    "status_context": data.get("status_context", ""),
+                    "status_detail": data.get("status_detail", ""),
                     "status_age_seconds": int(age_seconds),
                     "description": description,
                     "headless": bool(data.get("background", False)),
@@ -369,8 +747,8 @@ def cmd_list(argv: list[str]) -> int:
             }
             print(json.dumps(payload))
     else:
-        # Human-readable - show header with alias and read receipts
-        print(f"Your alias: {current_alias}")
+        # Human-readable - show header with name and read receipts
+        print(f"Your name: {current_name}")
 
         # Show connection status only for actual instances (not bigboss)
         if show_connection:
@@ -380,7 +758,7 @@ def cmd_list(argv: list[str]) -> int:
 
         # Show read receipts if any
         if read_receipts:
-            print(f"  Read receipts:")
+            print("  Read receipts:")
             for msg in read_receipts:
                 read_count = len(msg['read_by'])
                 total = msg['total_recipients']
@@ -417,7 +795,6 @@ def cmd_list(argv: list[str]) -> int:
 
             if verbose_output:
                 # Multi-line detailed view
-                import os
                 from ..core.instances import is_remote_instance
 
                 if is_remote_instance(data):
@@ -454,6 +831,13 @@ def cmd_list(argv: list[str]) -> int:
                     status_time = data.get("status_time", 0)
                     if status_time:
                         print(f"    status_time:  {_format_time(status_time)}")
+
+                    status_detail = data.get("status_detail", "")
+                    if status_detail:
+                        # Truncate long details
+                        max_len = 60
+                        detail_display = status_detail[:max_len] + '...' if len(status_detail) > max_len else status_detail
+                        print(f"    detail:       {detail_display}")
 
                     print()
                 else:
@@ -492,6 +876,14 @@ def cmd_list(argv: list[str]) -> int:
                     if log_file != "(none)":
                         print(f"    headless log: {log_file}")
                     print(f"    transcript:   {transcript}")
+
+                    status_detail = data.get("status_detail", "")
+                    if status_detail:
+                        # Truncate long details
+                        max_len = 60
+                        detail_display = status_detail[:max_len] + '...' if len(status_detail) > max_len else status_detail
+                        print(f"    detail:       {detail_display}")
+
                     print()  # Blank line between instances
 
         # Show stopped count if any are hidden (default view hides stopped)
@@ -513,9 +905,16 @@ def clear() -> int:
     cutoff_time_24h = time.time() - (24 * 60 * 60)  # 24 hours ago
     cutoff_time_30d = time.time() - (30 * 24 * 60 * 60)  # 30 days ago
 
-    scripts_dir = hcom_path(SCRIPTS_DIR)
-    if scripts_dir.exists():
-        for f in scripts_dir.glob('*'):
+    launch_dir = hcom_path(LAUNCH_DIR)
+    if launch_dir.exists():
+        for f in launch_dir.glob('*'):
+            if f.is_file() and f.stat().st_mtime < cutoff_time_24h:
+                f.unlink(missing_ok=True)
+
+    # Clean old scripts dir (migration from SCRIPTS_DIR → LAUNCH_DIR rename)
+    old_scripts_dir = hcom_path('.tmp/scripts')
+    if old_scripts_dir.exists():
+        for f in old_scripts_dir.glob('*'):
             if f.is_file() and f.stat().st_mtime < cutoff_time_24h:
                 f.unlink(missing_ok=True)
 
@@ -654,7 +1053,7 @@ def cmd_reset(argv: list[str]) -> int:
 
     if len(argv) > 1:
         from .utils import get_command_help
-        print(f"Too many arguments\n", file=sys.stderr)
+        print("Too many arguments\n", file=sys.stderr)
         print(get_command_help('reset'), file=sys.stderr)
         return 1
 
@@ -703,8 +1102,30 @@ def cmd_reset(argv: list[str]) -> int:
     except Exception as e:
         print(f"Warning: Failed to pull remote state: {e}", file=sys.stderr)
 
-    # all: also remove hooks and reset config
+    # all: also remove hooks, reset config, clear device identity
     if target == 'all':
+        # Clear device identity (new UUID on next relay push)
+        device_id_file = hcom_path('.tmp', 'device_id')
+        if device_id_file.exists():
+            device_id_file.unlink()
+
+        # Clear instance counter (reset first-time hints)
+        from ..core.paths import FLAGS_DIR
+        instance_count_file = hcom_path(FLAGS_DIR, 'instance_count')
+        if instance_count_file.exists():
+            instance_count_file.unlink()
+
+        # Clean orphaned old scripts directory completely
+        old_scripts_dir = hcom_path('.tmp/scripts')
+        if old_scripts_dir.exists():
+            for f in old_scripts_dir.glob('*'):
+                if f.is_file():
+                    f.unlink(missing_ok=True)
+            try:
+                old_scripts_dir.rmdir()
+            except OSError:
+                pass  # Not empty or other issue
+
         if remove_global_hooks():
             print("Removed hooks")
         else:
@@ -781,7 +1202,7 @@ def _relay_status() -> int:
     import urllib.request
     from ..core.device import get_device_short_id
     from ..core.config import get_config
-    from ..core.db import kv_get, get_last_event_id
+    from ..core.db import kv_get
     from ..relay import push, pull
 
     config = get_config()
@@ -957,8 +1378,13 @@ def _relay_hf(argv: list[str]) -> int:
     import urllib.request
     import urllib.error
     import os
-    from pathlib import Path
     from ..core.config import load_config_snapshot, save_config_snapshot
+    from .utils import validate_flags
+
+    # Validate flags
+    if error := validate_flags('relay', argv):
+        print(format_error(error), file=sys.stderr)
+        return 1
 
     SOURCE_SPACE = "aannoo/hcom-relay"
 
@@ -1033,7 +1459,7 @@ def _relay_hf(argv: list[str]) -> int:
 
     # Handle --update: manual instructions (delete requires admin permission)
     if space_exists and do_update:
-        print(f"Update manually:")
+        print("Update manually:")
         print(f"  1. Edit: https://huggingface.co/spaces/{target_space}/edit/main/app.py")
         print(f"  2. Copy from: https://huggingface.co/spaces/{SOURCE_SPACE}/raw/main/app.py")
         return 0
@@ -1076,13 +1502,13 @@ def _relay_hf(argv: list[str]) -> int:
 
     print(f"\n{space_url}")
     if created:
-        print(f"\nSpace is building (~15 seconds). Check progress:")
+        print("\nSpace is building (~15 seconds). Check progress:")
         print(f"  https://huggingface.co/spaces/{target_space}")
-        print(f"\nConfig updated. Relay will work once Space is running.")
-        print(f"\nCheck status: hcom relay")
-        print(f"See active instances from other devices: hcom list")
+        print("\nConfig updated. Relay will work once Space is running.")
+        print("\nCheck status: hcom relay")
+        print("See active instances from other devices: hcom list")
     else:
-        print(f"\nConfig updated.")
+        print("\nConfig updated.")
     return 0
 
 
@@ -1105,6 +1531,12 @@ def cmd_config(argv: list[str]) -> int:
         HcomConfigError, KNOWN_CONFIG_KEYS, DEFAULT_KNOWN_VALUES,
     )
     from ..core.paths import hcom_path, CONFIG_FILE
+    from .utils import validate_flags
+
+    # Validate flags
+    if error := validate_flags('config', argv):
+        print(format_error(error), file=sys.stderr)
+        return 1
 
     # Parse flags
     json_output = '--json' in argv
@@ -1144,8 +1576,11 @@ def cmd_config(argv: list[str]) -> int:
     # No args: show all
     if not argv:
         if json_output:
-            # JSON output: core + extras
+            # JSON output: core + extras (mask sensitive values)
             output = {**core_dict, **snapshot.extras}
+            if output.get('HCOM_RELAY_TOKEN'):
+                v = output['HCOM_RELAY_TOKEN']
+                output['HCOM_RELAY_TOKEN'] = f"{v[:4]}***" if len(v) > 4 else "***"
             print(json.dumps(output, indent=2))
         else:
             # Pretty output
@@ -1158,8 +1593,11 @@ def cmd_config(argv: list[str]) -> int:
                 default = DEFAULT_KNOWN_VALUES.get(key, '')
                 is_default = (value == default) or (not value and not default)
                 marker = "" if is_default else " *"
-                # Truncate long values
-                display_val = value if len(value) <= 60 else value[:57] + "..."
+                # Mask sensitive values, truncate long values
+                if key == 'HCOM_RELAY_TOKEN' and value:
+                    display_val = f"{value[:4]}***" if len(value) > 4 else "***"
+                else:
+                    display_val = value if len(value) <= 60 else value[:57] + "..."
                 print(f"  {key}={display_val}{marker}")
 
             # Extra env vars
@@ -1171,7 +1609,7 @@ def cmd_config(argv: list[str]) -> int:
                     print(f"  {key}={display_val}")
 
             print("\n* = modified from default")
-            print(f"\nEdit: hcom config --edit")
+            print("\nEdit: hcom config --edit")
         return 0
 
     # Single arg: get value
@@ -1195,10 +1633,14 @@ def cmd_config(argv: list[str]) -> int:
                 print(get_command_help('config'), file=sys.stderr)
                 return 1
 
+        # Mask sensitive values in display
+        display_value = value
+        if key == 'HCOM_RELAY_TOKEN' and value:
+            display_value = f"{value[:4]}***" if len(value) > 4 else "***"
         if json_output:
-            print(json.dumps({key: value}))
+            print(json.dumps({key: display_value}))
         else:
-            print(value)
+            print(display_value)
         return 0
 
     # Two args: set value
@@ -1230,5 +1672,125 @@ def cmd_config(argv: list[str]) -> int:
         save_config_snapshot(snapshot)
         print(f"Set {key}={value}")
         return 0
+
+    return 0
+
+
+def cmd_thread(argv: list[str]) -> int:
+    """Get conversation thread: hcom thread [@instance] [--last N] [--json] [--full] [--detailed]"""
+    from .utils import resolve_identity, validate_flags
+    from ..core.instances import load_instance_position
+    from ..core.thread import get_thread, format_thread, format_thread_detailed
+    from ..core.db import get_db
+
+    # Validate flags
+    if error := validate_flags('thread', argv):
+        print(format_error(error), file=sys.stderr)
+        return 1
+
+    # Parse arguments
+    target = None
+    last = 10
+    json_output = False
+    full_output = False
+    detailed_output = False
+    range_tuple = None
+
+    i = 0
+    while i < len(argv):
+        arg = argv[i]
+        if arg == '--json':
+            json_output = True
+        elif arg == '--full':
+            full_output = True
+        elif arg == '--detailed':
+            detailed_output = True
+        elif arg == '--last' and i + 1 < len(argv):
+            try:
+                last = int(argv[i + 1])
+                i += 1
+            except ValueError:
+                print("Error: --last requires a number", file=sys.stderr)
+                return 1
+        elif arg == '--range' and i + 1 < len(argv):
+            try:
+                parts = argv[i + 1].split('-')
+                if len(parts) != 2:
+                    raise ValueError("need two parts")
+                start, end = int(parts[0]), int(parts[1])
+                if start < 1 or end < 1:
+                    print("Error: --range values must be >= 1 (e.g. --range 5-10)", file=sys.stderr)
+                    return 1
+                if start > end:
+                    print("Error: --range start must be <= end (e.g. --range 5-10)", file=sys.stderr)
+                    return 1
+                range_tuple = (start, end)
+                i += 1
+            except (ValueError, IndexError):
+                print("Error: --range requires N-M format (e.g. --range 5-10)", file=sys.stderr)
+                return 1
+        elif arg.startswith('@'):
+            target = arg[1:]  # Strip @
+        elif not arg.startswith('-'):
+            target = arg
+        i += 1
+
+    # Resolve target instance
+    if target:
+        # Look up by name
+        data = load_instance_position(target)
+        if not data:
+            # Try prefix match
+            conn = get_db()
+            row = conn.execute(
+                "SELECT name FROM instances WHERE name LIKE ? AND enabled = 1 LIMIT 1",
+                (f"{target}%",)
+            ).fetchone()
+            if row:
+                target = row['name']
+                data = load_instance_position(target)
+
+        if not data:
+            print(f"Error: Instance '{target}' not found", file=sys.stderr)
+            return 1
+
+        transcript_path = data.get('transcript_path', '')
+        instance_name = target
+    else:
+        # Use own transcript
+        try:
+            identity = resolve_identity()
+            instance_name = identity.name
+        except ValueError as e:
+            from .utils import get_command_help
+            print(get_command_help('thread'), file=sys.stderr)
+            return 1
+
+        data = load_instance_position(instance_name)
+        if not data:
+            print("Error: hcom not started for this session", file=sys.stderr)
+            print("Run 'hcom start' first, or use 'hcom thread @target'", file=sys.stderr)
+            return 1
+
+        transcript_path = data.get('transcript_path', '')
+
+    if not transcript_path:
+        print(f"Error: No transcript path for '{instance_name}'", file=sys.stderr)
+        return 1
+
+    # Get thread
+    thread_data = get_thread(transcript_path, last=last, detailed=detailed_output, range_tuple=range_tuple)
+
+    if thread_data.get('error'):
+        print(f"Error: {thread_data['error']}", file=sys.stderr)
+        return 1
+
+    # Output
+    if json_output:
+        print(json.dumps(thread_data, indent=2))
+    elif detailed_output:
+        print(format_thread_detailed(thread_data, instance_name))
+    else:
+        print(format_thread(thread_data, instance_name, full=full_output))
 
     return 0
