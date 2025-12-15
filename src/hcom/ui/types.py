@@ -121,3 +121,6 @@ class UIState:
     relay_enabled: bool = True             # Relay sync enabled
     relay_status: Optional[str] = None     # 'ok' | 'error' | None
     relay_error: Optional[str] = None      # Last error message
+
+    # Archive count (shown when no instances)
+    archive_count: int = 0

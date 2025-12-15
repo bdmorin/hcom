@@ -56,11 +56,20 @@ def _truncate_val(key: str, v: str, max_len: int = 80) -> str:
 
 
 def build_hcom_bootstrap_text(instance_name: str) -> str:
-    """Build comprehensive HCOM bootstrap context for instances"""
+    """Build comprehensive HCOM bootstrap context for instances
+
+    Args:
+        instance_name: Base name of the instance (as stored in DB)
+    """
     # Import here to avoid circular dependency
     from ..hooks.utils import build_hcom_command
+    from .instances import get_full_name
 
     hcom_cmd = build_hcom_command()
+
+    # Get instance data for full name display
+    instance_data = load_instance_position(instance_name)
+    display_name = get_full_name(instance_data) if instance_data else instance_name
 
     # Add command override notice if not using short form
     command_notice = ""
@@ -73,12 +82,12 @@ Replace all mentions of "hcom" below with this command.
 
     # Add tag-specific notice if instance is tagged
     config = get_config()
-    tag = config.tag
+    tag = instance_data.get('tag') if instance_data else config.tag
     tag_notice = ""
     if tag:
         tag_notice = f"""
 GROUP: You are in the '{tag}' group.
-- To message everyone in your group: hcom send "@{tag} your message"
+- To message everyone in your group: hcom send "@{tag}- your message"
 - Only instances with a name starting with {tag}-* receive them
 - To reply to non-group members, either @mention them directly or broadcast.
 """
@@ -132,32 +141,40 @@ The user will see 'running stop hook' in the status bar - tell them that's norma
     # Import SENDER here to avoid circular dependency
     from ..shared import SENDER
 
-    instance_data = load_instance_position(instance_name)
     return f"""{command_notice}
 [HCOM SESSION]
-- Your name: {instance_name}
-- Your connection: {"enabled" if instance_data.get('enabled', False) else "disabled"}
+- Your name: {display_name}
+- Your connection: {"enabled" if instance_data and instance_data.get('enabled', False) else "disabled"}
 - HCOM is a communication tool. Names are usually 4 chars, generated randomly.
 - Authority: Prioritize @{SENDER} over other participants.
 - Statuses: ▶ active | ◉ idle (waiting for msgs) | ■ blocked (needs user approval) | ○ inactive (dead)
 - Any mention of user below is referring to the human user.
 {tag_notice}{relay_notice}{launched_notice}
 ## COMMANDS:
-<count>, send, list, events, start, stop, reset, config, relay, thread
+<count>, send, list, events, start, stop, reset, config, relay, transcript, archive
 You must always use hcom --help and hcom <command> --help to get full information.
 
 send 'msg' (broadcast) | send '@name/@tag msg' (target)
+@name prefix-matches (underscore blocks: @john excludes john_*). Use @john_ for subagents to target all subagents of john.
+
+STRUCTURED MESSAGES (strongly recommended)
+For coordination, add intent to clarify expectations:
+  --intent request   "response expected"
+  --intent inform    "FYI only"
+  --intent ack --reply-to <id>  "acknowledged"
+  --intent error     "failed, stop retrying"
+  --reply-to <id>    link to parent event (ID shown in message: #42)
+  --thread <name>    group related messages
 
 list [-v] [--json] → participants, status, read receipts
 
 hcom start/stop → toggle hcom participation for self
 
-events [--last N] [--sql EXPR] [--wait SEC] → hcom audit trail; --wait blocks until match, @mention, or timeout.
-events sub <"sql"|collision> [--once] [--for name] → push subscription; @mentioned when events match.
-  SQL flat fields: msg_from/text/scope/sender_kind/delivered_to/mentions, status_val/context/detail, life_action/by/batch_id/reason
-  Example: type='message' AND msg_from='alice'
+events [--last N] [--sql EXPR] [--wait SEC] → hcom audit trail; --wait blocks until sql match, @mention, or timeout.
+events sub <"sql"|collision> [--once] [--for name] → push subscription; @mentioned msg when events match.
+SQL fields: id/timestamp/type/instance/data, msg_from/msg_text/msg_scope/msg_sender_kind/msg_delivered_to/msg_mentions/msg_intent/msg_thread/msg_reply_to, status_val/status_context/status_detail, life_action/life_by/life_batch_id/life_reason
 
-thread [name] [--last N] [--range N-M] [--full] [--json] [--detailed] → get parsed conversation transcript
+transcript [name] [--last N] [--range N-M] [--full] [--json] [--detailed] → get parsed conversation transcript so you can see exactly what other instances have been up to.
 
 [ENV VARS] hcom <count> [claude <args>...] → Launch instances in new terminal window (or headless)
 
@@ -165,7 +182,11 @@ hcom (no args) → TUI (message+launch+events+manage) for user (you can't displa
 
 relay → remote live cross-device chat
 
-config → get/set ~/.hcom/config.env values
+config → get/set ~/.hcom/config.env values (at launch preferences)
+config -i <name> → view/edit instance settings - updates live at runtime (tag, timeout, hints, subagent_timeout); use -i self for yourself
+
+archive [N] [instances] [--here] [--sql] [--last] → query archived sessions; `hcom archive` lists, `hcom archive 1` shows events from most recent
+--here shows cwd archives - useful for 'what happened on this project in the past'
 
 reset → archive & clear db
 
@@ -204,7 +225,7 @@ source long-custom-vars.env && hcom 1        # + if complex quoting / long promp
 
 - Headless instances can only read files and use hcom by default, for more: hcom N claude --tools Bash,Write,etc
 - Always tell instances explicitly to use 'hcom' in the initial prompt to guarantee they respond correctly
-- Define explicit roles via system prompt, initial prompt, --agent, and/or HCOM_HINTS—what each instance should communicate (what, when, why) and shouldn't do. Required for effective collaboration. structured message passing > free-form chat.
+- Define explicit roles/tasks via system prompt, initial prompt, --agent, and/or HCOM_HINTS—what each instance should communicate (what, when, why) and shouldn't do. Required for effective collaboration. structured message passing > free-form chat.
 - HCOM_TAG + system prompt can be used to isolate/assign orchestrator/group by role patterns etc.
 
 - All instances launched with hcom N are automatically enabled (started) in hcom and see HCOM SESSION info.
@@ -228,7 +249,7 @@ Message Routing:
 
 Do:
 - Run hcom commands alone (no &&, 1>&2, pipes) to avoid issues
-- Turn collision detection on if there are multiple instances working in the same codebase
+- Turn collision detection on if there are multiple instances working in the same codebase: hcom events sub collision
 
 Don't:
 - Use sleep (blocks message reception) → use `hcom events --wait 10 --sql "condition"` instead

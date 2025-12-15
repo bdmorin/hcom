@@ -44,10 +44,13 @@ def in_subagent_context(session_id_or_name: str) -> bool:
         return False
 
 
-def check_dead_subagents(transcript_path: str, running_tasks: dict) -> list[str]:
+def check_dead_subagents(transcript_path: str, running_tasks: dict, subagent_timeout: int | None = None) -> list[str]:
     """Return list of dead subagent agent_ids by checking multiple signals
 
     Called by UserPromptSubmit to clean up stale subagents.
+
+    Args:
+        subagent_timeout: Parent's override timeout, or None to use global config
     """
     from pathlib import Path
     import time
@@ -56,7 +59,8 @@ def check_dead_subagents(transcript_path: str, running_tasks: dict) -> list[str]
     transcript_dir = Path(transcript_path).parent if transcript_path else None
     conn = get_db()
     # Subagent dead if transcript unchanged for 2x timeout (session ended before SubagentStop cleanup)
-    stale_threshold = get_config().subagent_timeout * 2
+    timeout = subagent_timeout if subagent_timeout is not None else get_config().subagent_timeout
+    stale_threshold = timeout * 2
 
     for subagent in running_tasks.get('subagents', []):
         agent_id = subagent.get('agent_id')
@@ -125,7 +129,8 @@ def cleanup_dead_subagents(session_id: str, transcript_path: str) -> None:
         return
 
     log_hook_error('cleanup_dead:checking', f'{instance_name} subagents={running_tasks.get("subagents")} transcript={transcript_path}')
-    dead_ids = check_dead_subagents(transcript_path, running_tasks)
+    # Pass parent's subagent_timeout override to check_dead_subagents
+    dead_ids = check_dead_subagents(transcript_path, running_tasks, instance_data.get('subagent_timeout'))
     log_hook_error('cleanup_dead:result', f'dead_ids={dead_ids}')
     if not dead_ids:
         return
@@ -228,7 +233,13 @@ def posttooluse(hook_data: dict[str, Any], _instance_name: str, _instance_data: 
 
     subagent_name = row['name']
     subagent_data = load_instance_position(subagent_name)
-    if not subagent_data or not subagent_data.get('enabled', False):
+    if not subagent_data:
+        sys.exit(0)
+
+    if not subagent_data.get('enabled', False):
+        # Disabled instances don't deliver messages, but may show a one-shot external stop notification.
+        if output := check_external_stop_notification(subagent_name, subagent_data):
+            print(json.dumps(output, ensure_ascii=False))
         sys.exit(0)
 
     # Pull remote events (rate-limited)
@@ -334,7 +345,14 @@ def subagent_stop(hook_data: dict[str, Any]) -> None:
             update_instance_position(subagent_id, {'transcript_path': transcript_path})
 
     # Poll messages using shared helper
-    timeout = get_config().subagent_timeout
+    # Resolve timeout: parent instance override > global config
+    timeout = None
+    if parent_name:
+        parent_data = load_instance_position(parent_name)
+        if parent_data:
+            timeout = parent_data.get('subagent_timeout')
+    if timeout is None:
+        timeout = get_config().subagent_timeout
     from .family import poll_messages
 
     exit_code, output, timed_out = poll_messages(
@@ -357,5 +375,4 @@ def subagent_stop(hook_data: dict[str, Any]) -> None:
             _remove_subagent_from_parent(parent_name, agent_id)
 
     sys.exit(exit_code)
-
 

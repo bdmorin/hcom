@@ -1,17 +1,19 @@
 """SQLite event storage - unified database for messages, status, and lifecycle events"""
 from __future__ import annotations
 import sqlite3
+import shutil
 import json
 import os
 import threading
 from typing import Any, Optional
 from datetime import datetime, timezone
 
-from .paths import hcom_path
+from .paths import hcom_path, ARCHIVE_DIR
 from ..shared import parse_iso_timestamp
 
 # Database configuration
 DB_FILE = "hcom.db"
+SCHEMA_VERSION = 4  # Bump when schema changes incompatibly (triggers archive + fresh DB)
 _thread_local = threading.local()  # Per-thread connection storage
 _write_lock = threading.Lock()  # Protect concurrent writes
 
@@ -62,6 +64,11 @@ def get_db() -> sqlite3.Connection:
         _thread_local.conn.execute("PRAGMA wal_autocheckpoint=1000")
         _thread_local.conn.execute("PRAGMA busy_timeout=5000")
 
+        # Check schema version - archives and reconnects if outdated
+        if not check_schema_version(_thread_local.conn):
+            # Reconnect after archive (recursive call with fresh DB)
+            return get_db()
+
         init_db(_thread_local.conn)
 
     return _thread_local.conn
@@ -76,33 +83,175 @@ def close_db() -> None:
         _thread_local.conn.close()
         _thread_local.conn = None
 
+
+def get_archive_timestamp() -> str:
+    """Get timestamp for archive files."""
+    return datetime.now().strftime("%Y-%m-%d_%H%M%S")
+
+
+def archive_db(reason: str = "schema") -> str | None:
+    """Archive current database and return archive path.
+
+    Creates archive in ~/.hcom/archive/session-{timestamp}/ with:
+    - hcom.db (main database)
+    - hcom.db-wal (WAL file if exists)
+    - hcom.db-shm (shared memory file if exists)
+
+    Thread-safe: Uses _write_lock to prevent concurrent archive within process.
+    Multi-process: No cross-process lock. Concurrent processes may create duplicate
+    archives (harmless - just extra copies). Acceptable for ephemeral session data.
+
+    Windows: If delete fails (PermissionError), returns None to signal incomplete.
+    Caller should raise/fail rather than recurse.
+
+    Args:
+        reason: Why archiving (for logging) - "schema", "reset", "manual"
+
+    Returns:
+        Archive path on success, None if delete failed (Windows lock)
+    """
+    db_file = hcom_path(DB_FILE)
+    db_wal = hcom_path(f'{DB_FILE}-wal')
+    db_shm = hcom_path(f'{DB_FILE}-shm')
+
+    with _write_lock:
+        if not db_file.exists():
+            return None
+
+        # Close connection before archiving
+        close_db()
+
+        timestamp = get_archive_timestamp()
+        session_archive = hcom_path(ARCHIVE_DIR, f'session-{timestamp}')
+        session_archive.mkdir(parents=True, exist_ok=True)
+
+        try:
+            # Checkpoint WAL before archiving (PASSIVE mode doesn't block readers)
+            temp_conn = sqlite3.connect(str(db_file))
+            temp_conn.execute("PRAGMA wal_checkpoint(PASSIVE)")
+            temp_conn.close()
+        except Exception:
+            pass  # Checkpoint optional
+
+        # Copy all DB files to archive (copy before delete - archive safe even if delete fails)
+        shutil.copy2(db_file, session_archive / DB_FILE)
+        if db_wal.exists():
+            shutil.copy2(db_wal, session_archive / f'{DB_FILE}-wal')
+        if db_shm.exists():
+            shutil.copy2(db_shm, session_archive / f'{DB_FILE}-shm')
+
+        # Delete main DB and WAL/SHM files
+        # On Windows, may fail if other process has handle
+        try:
+            db_file.unlink()
+            db_wal.unlink(missing_ok=True)
+            db_shm.unlink(missing_ok=True)
+        except PermissionError:
+            # Can't delete - return None to signal incomplete archive
+            # Prevents recursive get_db() spin. Next separate process will handle it.
+            import sys
+            print(f"hcom: Archived to {session_archive} (DB locked, delete pending)", file=sys.stderr)
+            return None
+
+        return str(session_archive)
+
+
+def check_schema_version(conn: sqlite3.Connection) -> bool:
+    """Check if DB schema version matches current. Returns True if compatible.
+
+    Checks both:
+    1. user_version pragma matches SCHEMA_VERSION
+    2. Required tables exist (events, instances, kv)
+
+    If incompatible or tables missing, archives the DB and returns False.
+
+    Special case: user_version=0 with existing tables = pre-versioned DB, needs archive.
+    user_version=0 with no tables = fresh DB, safe to initialize.
+    """
+    try:
+        version = conn.execute("PRAGMA user_version").fetchone()[0]
+    except Exception:
+        version = 0
+
+    # Check what tables exist
+    try:
+        tables = {r[0] for r in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table'"
+        ).fetchall()}
+    except Exception:
+        tables = set()
+
+    required = {'events', 'instances', 'kv'}
+
+    if version == 0:
+        # Fresh DB (no tables) - safe to initialize
+        if not tables:
+            return True
+        # Pre-versioned DB with tables - archive it (incompatible schema)
+        if tables.intersection(required):
+            import sys
+            print("hcom: Pre-versioned DB found, archiving...", file=sys.stderr)
+            conn.close()
+            _thread_local.conn = None
+            archive_path = archive_db("schema")
+            if archive_path:
+                print(f"hcom: Archived to {archive_path}", file=sys.stderr)
+                print("       Query with: hcom archive 1", file=sys.stderr)
+                log_reset_event()  # Log to fresh DB
+                return False
+            else:
+                raise RuntimeError("hcom: DB locked by another process. Close other hcom instances and retry.")
+        # Has tables but not ours - fresh enough
+        return True
+
+    # Check version matches
+    if version != SCHEMA_VERSION:
+        import sys
+        print(f"hcom: DB schema v{version} → v{SCHEMA_VERSION}, archiving old data...", file=sys.stderr)
+        conn.close()
+        _thread_local.conn = None
+        archive_path = archive_db("schema")
+        if archive_path:
+            print(f"hcom: Archived to {archive_path}", file=sys.stderr)
+            print("       Query with: hcom archive 1", file=sys.stderr)
+            log_reset_event()  # Log to fresh DB
+            return False
+        else:
+            # archive_db returned None = couldn't delete (Windows lock)
+            # Raise to prevent spin; user should close other hcom processes
+            raise RuntimeError("hcom: DB locked by another process. Close other hcom instances and retry.")
+
+    # Verify required tables exist (catches corruption/partial states)
+    if not required.issubset(tables):
+        import sys
+        missing = required - tables
+        print(f"hcom: DB missing tables {missing}, archiving...", file=sys.stderr)
+        conn.close()
+        _thread_local.conn = None
+        archive_path = archive_db("corruption")
+        if archive_path:
+            print(f"hcom: Archived to {archive_path}", file=sys.stderr)
+            log_reset_event()  # Log to fresh DB
+            return False
+        else:
+            raise RuntimeError("hcom: DB locked by another process. Close other hcom instances and retry.")
+
+    return True
+
+
 # ==================== Schema Management ====================
 
 def init_db(conn: Optional[sqlite3.Connection] = None) -> None:
     """Create database schema if not exists. Idempotent.
 
+    Schema versioning: check_schema_version() handles incompatible changes by archiving.
+    No ALTER TABLE migrations - bump SCHEMA_VERSION instead for clean slate.
+
     Schema:
         events(id, timestamp, type, instance, data)
-        - id: autoincrement primary key for position tracking
-        - timestamp: ISO 8601 datetime for time-based queries
-        - type: event type ('message', 'status', 'life')
-        - instance: instance name (sender for messages, subject for status/life)
-        - data: JSON blob with type-specific fields
-
         instances(name, session_id, parent_session_id, ...)
-        - name: instance name (primary key)
-        - session_id: unique session identifier (NULL for vanilla)
-        - parent_session_id: parent's session_id for subagents
-
-    Indexes:
-        - timestamp for time-range queries
-        - type for filtering by event type
-        - instance for per-instance queries
-        - type+instance composite for common filtered queries
-        - session_id, parent_session_id, enabled, created_at, status, mapid
-
-    Note: Foreign key constraints are enabled per-connection in get_db(),
-    not here (PRAGMA settings are connection-specific).
+        mapid_sessions(mapid, session_id, updated_at)
+        kv(key, value)
     """
     if conn is None:
         conn = get_db()
@@ -118,7 +267,7 @@ def init_db(conn: Optional[sqlite3.Connection] = None) -> None:
         )
     """)
 
-    # Create instances table with JSON columns for complex fields
+    # Create instances table
     conn.execute("""
         CREATE TABLE IF NOT EXISTS instances (
             name TEXT PRIMARY KEY,
@@ -144,12 +293,27 @@ def init_db(conn: Optional[sqlite3.Connection] = None) -> None:
             background_log_file TEXT DEFAULT '',
             name_announced INTEGER DEFAULT 0,
             launch_context_announced INTEGER DEFAULT 0,
-            external_stop_pending INTEGER DEFAULT 0,
+            stop_pending INTEGER DEFAULT 0,
+            stop_notified INTEGER DEFAULT 0,
             session_ended INTEGER DEFAULT 0,
             agent_id TEXT UNIQUE,
+            running_tasks TEXT DEFAULT '',
+            origin_device_id TEXT DEFAULT '',
+            hints TEXT DEFAULT '',
+            subagent_timeout INTEGER,
             FOREIGN KEY (parent_session_id) REFERENCES instances(session_id) ON DELETE SET NULL
         )
     """)
+
+    # Soft migration: add columns if they don't exist (for existing DBs)
+    try:
+        conn.execute("ALTER TABLE instances ADD COLUMN hints TEXT DEFAULT ''")
+    except sqlite3.OperationalError:
+        pass  # Column already exists
+    try:
+        conn.execute("ALTER TABLE instances ADD COLUMN subagent_timeout INTEGER")
+    except sqlite3.OperationalError:
+        pass  # Column already exists
 
     # Create MAPID → session_id mapping table for Windows identity resolution
     conn.execute("""
@@ -160,54 +324,8 @@ def init_db(conn: Optional[sqlite3.Connection] = None) -> None:
         )
     """)
 
-    # Migrate existing databases: add mapid column if missing
-    cursor = conn.execute("PRAGMA table_info(instances)")
-    columns = {row['name'] for row in cursor.fetchall()}
-    if 'mapid' not in columns:
-        conn.execute("ALTER TABLE instances ADD COLUMN mapid TEXT DEFAULT ''")
-        conn.commit()
-
-    # Migrate existing databases: add agent_id column if missing
-    cursor = conn.execute("PRAGMA table_info(instances)")
-    columns = {row['name'] for row in cursor.fetchall()}
-    if 'agent_id' not in columns:
-        try:
-            conn.execute("ALTER TABLE instances ADD COLUMN agent_id TEXT")
-            conn.commit()
-        except sqlite3.OperationalError as e:
-            # Concurrent process may have added it - ignore if duplicate column error
-            if 'duplicate column' not in str(e).lower():
-                raise
-
-    # Migrate existing databases: add running_tasks column if missing
-    cursor = conn.execute("PRAGMA table_info(instances)")
-    columns = {row['name'] for row in cursor.fetchall()}
-    if 'running_tasks' not in columns:
-        try:
-            conn.execute("ALTER TABLE instances ADD COLUMN running_tasks TEXT DEFAULT ''")
-            conn.commit()
-        except sqlite3.OperationalError as e:
-            if 'duplicate column' not in str(e).lower():
-                raise
-
-    # Migrate existing databases: add status_detail column if missing
-    cursor = conn.execute("PRAGMA table_info(instances)")
-    columns = {row['name'] for row in cursor.fetchall()}
-    if 'status_detail' not in columns:
-        try:
-            conn.execute("ALTER TABLE instances ADD COLUMN status_detail TEXT DEFAULT ''")
-            conn.commit()
-        except sqlite3.OperationalError as e:
-            if 'duplicate column' not in str(e).lower():
-                raise
-
-    # Migrate existing databases: rename alias_announced -> name_announced
-    # (Python 3.10+ always bundles SQLite >= 3.37, which supports RENAME COLUMN)
-    cursor = conn.execute("PRAGMA table_info(instances)")
-    columns = {row['name'] for row in cursor.fetchall()}
-    if 'alias_announced' in columns and 'name_announced' not in columns:
-        conn.execute("ALTER TABLE instances RENAME COLUMN alias_announced TO name_announced")
-        conn.commit()
+    # KV table for relay state and config
+    conn.execute("CREATE TABLE IF NOT EXISTS kv (key TEXT PRIMARY KEY, value TEXT)")
 
     # Create indexes for common query patterns
     conn.execute("CREATE INDEX IF NOT EXISTS idx_timestamp ON events(timestamp)")
@@ -224,12 +342,14 @@ def init_db(conn: Optional[sqlite3.Connection] = None) -> None:
     conn.execute("CREATE INDEX IF NOT EXISTS idx_status ON instances(status)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_mapid ON instances(mapid) WHERE mapid != ''")
     conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_agent_id_unique ON instances(agent_id) WHERE agent_id IS NOT NULL")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_instances_origin ON instances(origin_device_id)")
 
     # Create mapid_sessions index
     conn.execute("CREATE INDEX IF NOT EXISTS idx_mapid_sessions_updated ON mapid_sessions(updated_at DESC)")
 
     # Create flattened events view for simpler SQL queries
-    # Claude can write: msg_from = 'alice' instead of json_extract(data, '$.from') = 'alice'
+    # DROP first to ensure schema changes are applied (CREATE VIEW IF NOT EXISTS won't update)
+    conn.execute("DROP VIEW IF EXISTS events_v")
     conn.execute("""
         CREATE VIEW IF NOT EXISTS events_v AS
         SELECT
@@ -241,6 +361,11 @@ def init_db(conn: Optional[sqlite3.Connection] = None) -> None:
             json_extract(data, '$.sender_kind') as msg_sender_kind,
             json_extract(data, '$.delivered_to') as msg_delivered_to,
             json_extract(data, '$.mentions') as msg_mentions,
+            -- message envelope fields
+            json_extract(data, '$.intent') as msg_intent,
+            json_extract(data, '$.thread') as msg_thread,
+            json_extract(data, '$.reply_to') as msg_reply_to,
+            json_extract(data, '$.reply_to_local') as msg_reply_to_local,
             -- status fields
             json_extract(data, '$.status') as status_val,
             json_extract(data, '$.context') as status_context,
@@ -253,40 +378,9 @@ def init_db(conn: Optional[sqlite3.Connection] = None) -> None:
         FROM events
     """)
 
+    # Set schema version
+    conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
     conn.commit()
-
-    # Run schema migration (idempotent)
-    migrate_sync_schema(conn)
-
-def migrate_sync_schema(conn: Optional[sqlite3.Connection] = None) -> None:
-    """Run schema migration (idempotent). Adds origin_device_id and kv table."""
-    if conn is None:
-        conn = get_db()
-
-    version = conn.execute("PRAGMA user_version").fetchone()[0]
-
-    if version < 2:
-        # Add origin_device_id to instances
-        with _write_lock:
-            columns = [row[1] for row in conn.execute("PRAGMA table_info(instances)")]
-            if 'origin_device_id' not in columns:
-                try:
-                    conn.execute("ALTER TABLE instances ADD COLUMN origin_device_id TEXT DEFAULT ''")
-                    conn.execute("CREATE INDEX IF NOT EXISTS idx_instances_origin ON instances(origin_device_id)")
-                    conn.commit()
-                except sqlite3.OperationalError as e:
-                    # Concurrent process may have added it
-                    if 'duplicate column' not in str(e).lower():
-                        raise
-
-        with _write_lock:
-            conn.execute("PRAGMA user_version = 2")
-            conn.commit()
-
-    # kv table for relay state
-    with _write_lock:
-        conn.execute("CREATE TABLE IF NOT EXISTS kv (key TEXT PRIMARY KEY, value TEXT)")
-        conn.commit()
 
 # ==================== Event Operations ====================
 
@@ -327,6 +421,16 @@ def log_event(
     # Sync export moved to hook dispatcher (rate-limited, builds from SQLite)
     # No duplicate JSONL append needed - single source of truth
     return event_id
+
+
+def log_reset_event() -> None:
+    """Log _device reset event + set relay timestamp. Call after any DB archive/reset."""
+    import time
+    from .device import get_device_uuid
+
+    log_event('life', '_device', {'action': 'reset', 'device': get_device_uuid()})
+    kv_set('relay_local_reset_ts', str(time.time()))
+
 
 def get_events_since(
     last_event_id: int = 0,
@@ -726,7 +830,12 @@ def _format_sub_notification(sub_id: str, event_id: int, event_type: str, instan
             parts.append(ctx)
         if detail := data.get('detail', ''):
             if len(detail) > 40:
-                detail = '...' + detail[-37:]
+                # Commands: keep start (see what command)
+                # Files: keep end (see filename)
+                if ctx and 'Bash' in ctx:
+                    detail = detail[:37] + '...'
+                else:
+                    detail = '...' + detail[-37:]
             parts.append(detail)
     elif event_type == 'life':
         parts.append(data.get('action', '?'))
@@ -821,14 +930,19 @@ def _send_sub_notification(caller: str, message: str) -> bool:
 
 
 __all__ = [
-    # Events
+    # Database management
     'get_db',
     'close_db',
     'init_db',
+    'archive_db',
+    'check_schema_version',
+    'DB_FILE',
+    'SCHEMA_VERSION',
+    # Events
     'log_event',
+    'log_reset_event',
     'get_events_since',
     'get_last_event_id',
-    'DB_FILE',
     # Instances (low-level)
     'get_instance',
     'save_instance',

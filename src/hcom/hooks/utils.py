@@ -123,12 +123,10 @@ def disable_instance(instance_name: str, initiated_by: str = 'unknown', reason: 
     Setting status directly here would be lying about the actual hook/session state.
     """
     updates = {
-        'enabled': False
+        'enabled': False,
+        'stop_pending': True,   # Allows cleanup hooks to run and set final status
+        'stop_notified': False, # One-shot external stop notification
     }
-
-    # External stops need notification flag (instance notified via PostToolUse)
-    if reason in ('stop_all', 'external', 'remote'):
-        updates['external_stop_pending'] = True
 
     update_instance_position(instance_name, updates)
     # Notify instance to wake and see enabled=false
@@ -176,7 +174,7 @@ def init_hook_context(hook_data: dict[str, Any], hook_type: str | None = None) -
         'directory': str(Path.cwd()),
     }
 
-    # Set tag only at creation (prevents tag field drifting from name prefix)
+    # Set tag only at creation - runtime changes via 'hcom config -i self tag'
     if not existing_data and tag:
         updates['tag'] = tag
 
@@ -302,5 +300,4 @@ def is_safe_hcom_command(command: str) -> bool:
             return False
 
     return True
-
 

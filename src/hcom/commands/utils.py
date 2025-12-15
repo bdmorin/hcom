@@ -2,7 +2,7 @@
 import sys
 import re
 import os
-from ..shared import __version__, MAX_MESSAGE_SIZE, SenderIdentity, SENDER
+from ..shared import __version__, MAX_MESSAGE_SIZE, SenderIdentity, SENDER, HcomError
 
 
 class CLIError(Exception):
@@ -32,7 +32,7 @@ COMMAND_HELP: dict[str, list[tuple[str, str]]] = {
         ('', ''),
         ('SQL columns (events_v view):', ''),
         ('  Base', 'id, timestamp, type, instance'),
-        ('  msg_*', 'from, text, scope, sender_kind, delivered_to, mentions'),
+        ('  msg_*', 'from, text, scope, sender_kind, delivered_to, mentions, intent, thread, reply_to'),
         ('  status_*', 'val, context, detail'),
         ('  life_*', 'action, by, batch_id, reason'),
         ('', ''),
@@ -54,6 +54,10 @@ COMMAND_HELP: dict[str, list[tuple[str, str]]] = {
         ('send "@name msg"', 'Send to specific instance/group'),
         ('  --from <name>', 'Identity for non-Claude tools (Gemini, scripts)'),
         ('  --wait', 'Poll for @mentions (use with --from)'),
+        ('Envelope (optional):', ''),
+        ('  --intent <type>', 'request|inform|ack|error'),
+        ('  --reply-to <id>', 'Link to event (42 or 42:BOXE for remote)'),
+        ('  --thread <name>', 'Group related messages'),
     ],
     'stop': [
         ('stop', 'Disable hcom for current instance'),
@@ -76,7 +80,13 @@ COMMAND_HELP: dict[str, list[tuple[str, str]]] = {
         ('  --json', 'JSON output'),
         ('  --edit', 'Open config in $EDITOR'),
         ('  --reset', 'Reset config to defaults'),
-        ('Settings:', ''),
+        ('Instance config:', ''),
+        ('config -i <name>', 'Show instance config'),
+        ('config -i <name> <key>', 'Get instance config value'),
+        ('config -i <name> <key> <val>', 'Set instance config value'),
+        ('  -i self', 'Current instance (requires Claude context)'),
+        ('  keys: tag, timeout, hints, subagent_timeout', ''),
+        ('Global settings:', ''),
         ('  HCOM_TAG', 'Group tag (creates tag-* instances)'),
         ('  HCOM_TERMINAL', 'Terminal: new|here|"custom {script}"'),
         ('  HCOM_HINTS', 'Text appended to messages received by instance'),
@@ -103,13 +113,25 @@ COMMAND_HELP: dict[str, list[tuple[str, str]]] = {
         ('', '(finds or creates a free private space on your HuggingFace account'),
         ('', 'provide HF_TOKEN or login with hf cli first)'),
     ],
-    'thread': [
-        ('thread', 'Show your conversation thread'),
-        ('thread @instance', 'See what another instance is doing'),
-        ('  --last N', 'Limit to last N exchanges (default: 10)'),
-        ('  --range N-M', 'Show exchanges N through M (absolute positions)'),
+    'transcript': [
+        ('transcript', 'Show your conversation transcript (last 10)'),
+        ('transcript N', 'Show exchange N (absolute position)'),
+        ('transcript N-M', 'Show exchanges N through M'),
+        ('transcript @instance', 'See another instance\'s transcript'),
+        ('transcript @instance N', 'Exchange N of another instance'),
+        ('  --last N', 'Limit to last N exchanges'),
         ('  --full', 'Show full assistant responses'),
         ('  --detailed', 'Show tool I/O, edits, errors'),
+        ('  --json', 'JSON output'),
+    ],
+    'archive': [
+        ('archive', 'List archived sessions (numbered)'),
+        ('archive <N>', 'Query events from archive (1 = most recent)'),
+        ('archive <N> instances', 'Query instances from archive'),
+        ('archive <name>', 'Query by stable name (prefix match works)'),
+        ('  --here', 'Filter to archives with current directory'),
+        ('  --sql "expr"', 'SQL WHERE filter'),
+        ('  --last N', 'Limit to last N events (default: 20)'),
         ('  --json', 'JSON output'),
     ],
 }
@@ -160,9 +182,10 @@ Commands:
   start     Enable hcom participation
   stop      Disable hcom participation
   events    Query events / subscribe for push notifications
-  thread    View other instance's conversation transcript
+  transcript View conversation transcript
   config    Get/set config environment variables
   relay     Cross-device live chat
+  archive   Query archived sessions
   reset     Archive and clear database or hooks
 
 Run 'hcom <command> --help' for details.
@@ -172,7 +195,7 @@ Run 'hcom <command> --help' for details.
 # Known flags per command - for validation against hallucinated flags
 # --agentid required for subagents to identify themselves
 KNOWN_FLAGS: dict[str, set[str]] = {
-    'send': {'--agentid', '--from', '--wait'},
+    'send': {'--agentid', '--from', '--wait', '--intent', '--reply-to', '--thread'},
     'events': {'--last', '--wait', '--sql', '--agentid'},
     'events sub': {'--once', '--for'},
     'events unsub': set(),
@@ -180,10 +203,11 @@ KNOWN_FLAGS: dict[str, set[str]] = {
     'list': {'--json', '-v', '--verbose', '--sh', '--agentid'},
     'start': {'--agentid'},
     'stop': {'--agentid'},
-    'thread': {'--last', '--range', '--json', '--full', '--detailed', '--agentid'},
-    'config': {'--json', '--edit', '--reset'},
+    'transcript': {'--last', '--range', '--json', '--full', '--detailed', '--agentid'},
+    'config': {'--json', '--edit', '--reset', '-i'},
     'reset': set(),  # Just subcommands
     'relay': {'--name', '--update'},  # For relay hf
+    'archive': {'--json', '--here', '--sql', '--last', '--agentid'},
 }
 
 
@@ -247,7 +271,7 @@ def resolve_identity(subagent_id: str | None = None, custom_from: str | None = N
         data = load_instance_position(subagent_id)
         if not data:
             # This shouldn't happen - cmd_send validates before calling
-            raise ValueError(f"Subagent '{subagent_id}' position data missing")
+            raise HcomError(f"Subagent '{subagent_id}' position data missing")
         return SenderIdentity(kind='instance', name=subagent_id, instance_data=data, session_id=data.get('session_id'))
 
     # CLI context (not in Claude Code)
@@ -287,7 +311,7 @@ def resolve_identity(subagent_id: str | None = None, custom_from: str | None = N
             return SenderIdentity(kind='instance', name=name, instance_data=data, session_id=session_id)
 
     # No identity available - fail with error directing to --from
-    raise ValueError("Cannot resolve identity - use: hcom send --from <yourname> \"message\"")
+    raise HcomError("Cannot resolve identity - use: hcom send --from <yourname> \"message\"")
 
 
 def validate_message(message: str) -> str | None:

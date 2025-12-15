@@ -17,6 +17,7 @@ def _auto_approve_hcom_bash(hook_data: dict[str, Any]) -> None:
     """Auto-approve safe hcom bash commands (fast path, no instance needed).
 
     Allows vanilla instances to run 'hcom start' and disabled instances to re-enable.
+    Sets status for enabled instances before exiting.
     Exits if approved.
     """
     tool_name = hook_data.get('tool_name', '')
@@ -33,6 +34,20 @@ def _auto_approve_hcom_bash(hook_data: dict[str, Any]) -> None:
 
     matches = list(re.finditer(HCOM_COMMAND_PATTERN, command))
     if matches and is_safe_hcom_command(command):
+        # Set status for enabled instances (best effort - don't block on errors)
+        session_id = hook_data.get('session_id', '')
+        if session_id:
+            try:
+                from ..core.db import find_instance_by_session
+                from ..core.instances import set_status
+                instance_name = find_instance_by_session(session_id)
+                if instance_name:
+                    instance_data = load_instance_position(instance_name)
+                    if instance_data and instance_data.get('enabled'):
+                        set_status(instance_name, 'active', 'tool:Bash', detail=command)
+            except Exception as e:
+                log_hook_error('auto_approve:set_status', e)
+
         output = {
             "hookSpecificOutput": {
                 "hookEventName": "PreToolUse",
@@ -163,7 +178,7 @@ def _handle_hook_impl(hook_type: str) -> None:
         sys.exit(0)
 
     # Status-only for stop pending (disabled but awaiting exit)
-    if not instance_data.get('enabled') and instance_data.get('external_stop_pending'):
+    if not instance_data.get('enabled') and instance_data.get('stop_pending'):
         parent.handle_stop_pending(hook_type, hook_data, instance_name, instance_data)
         sys.exit(0)
 

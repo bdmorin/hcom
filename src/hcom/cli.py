@@ -60,13 +60,14 @@ from .commands import (
     cmd_list,  # noqa: F401 (used dynamically via globals())
     cmd_relay,  # noqa: F401 (used dynamically via globals())
     cmd_config,  # noqa: F401 (used dynamically via globals())
-    cmd_thread,  # noqa: F401 (used dynamically via globals())
+    cmd_transcript,  # noqa: F401 (used dynamically via globals())
+    cmd_archive,  # noqa: F401 (used dynamically via globals())
     CLIError,
     format_error,
 )
 
 # Commands that support --help (maps to cmd_* functions)
-COMMANDS = ('events', 'send', 'stop', 'start', 'reset', 'list', 'config', 'relay', 'thread')
+COMMANDS = ('events', 'send', 'stop', 'start', 'reset', 'list', 'config', 'relay', 'transcript', 'archive')
 
 
 def _run_command(name: str, argv: list[str]) -> int:
@@ -356,47 +357,6 @@ def ensure_hooks_current() -> bool:
 
 # ==================== Main Entry Point ====================
 
-def check_and_migrate_legacy_messages() -> None:
-    """Check for messages without scope field and automatically migrate.
-
-    Automatically archives and clears old messages, then allows command to proceed.
-    Wrapped in try/except to not crash on DB errors.
-    """
-    try:
-        from .core.db import get_db
-        from .commands.admin import clear
-
-        conn = get_db()
-
-        # Query for messages with old format:
-        # - Missing scope field (pre-0.6.4)
-        # - Old field names: mentioned_instances (now: mentions), recipients (now: delivered_to)
-        result = conn.execute("""
-            SELECT COUNT(*) as count
-            FROM events
-            WHERE type = 'message'
-              AND (json_extract(data, '$.scope') IS NULL
-                   OR json_extract(data, '$.mentioned_instances') IS NOT NULL
-                   OR json_extract(data, '$.recipients') IS NOT NULL)
-        """).fetchone()
-
-        if result and result['count'] > 0:
-            print("\n" + "=" * 60, file=sys.stderr)
-            print("hcom v0.6.4 Auto-Migration", file=sys.stderr)
-            print("=" * 60, file=sys.stderr)
-            print(f"\nFound {result['count']} message(s) in old format.", file=sys.stderr)
-            print("Archiving and clearing old database...", file=sys.stderr)
-
-            # Perform automatic reset (calls same logic as 'hcom reset logs')
-            clear()
-
-            print("✓ Migration complete. Continuing with command...", file=sys.stderr)
-            print("=" * 60 + "\n", file=sys.stderr)
-
-    except Exception as e:
-        # DB error - don't block CLI, just warn
-        print(f"Warning: Could not migrate legacy messages: {e}", file=sys.stderr)
-
 def main(argv: list[str] | None = None) -> int | None:
     """Main command dispatcher"""
     # Apply UTF-8 encoding for Windows and WSL (Git Bash, MSYS use cp1252 by default)
@@ -430,9 +390,6 @@ def main(argv: list[str] | None = None) -> int | None:
 
     # Ensure hooks current (warns but never blocks)
     ensure_hooks_current()
-
-    # Auto-migrate legacy messages (v0.6.3 → v0.6.4)
-    check_and_migrate_legacy_messages()
 
     # Subagent context: require --agentid for all commands
     # Both subagents (--agentid <uuid>) and parent (--agentid parent) must identify
@@ -487,7 +444,7 @@ def main(argv: list[str] | None = None) -> int | None:
                 "Run 'hcom --help' for usage"
             ), file=sys.stderr)
             return 1
-    except (CLIError, ValueError) as exc:
+    except (CLIError, ValueError, RuntimeError) as exc:
         print(str(exc), file=sys.stderr)
         return 1
 

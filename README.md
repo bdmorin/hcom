@@ -140,17 +140,17 @@ hcom send 'get back to work john!'
 View conversation history for any instance:
 
 ```bash
-hcom thread @john
+hcom transcript @john
 ```
 
 Example use: background eavesdropping.
 
-Prompt: `Create a hcom subscription for every time @john edits a file and review the code changes by looking at hcom thread`
+Prompt: `Create a hcom subscription for every time @john edits a file and review the code changes by looking at hcom transcript`
 
 
 ### Launch terminal windows
 
-`ENV_VARS hcom <N> [claude <ARGS...>]`
+`[ENV VARS] hcom <N> [claude <ARGS...>]`
 
 Launches terminals with claude connected to hcom
 
@@ -255,10 +255,11 @@ hcom events sub "status_detail LIKE 'backlog %'"
 | `hcom list` | View status, read receipts  |
 | `hcom events` | View event history JSON|
 | `hcom events sub/unsub` | Get "push" notifications in Claude |
-| `hcom thread [name]` | View conversation transcript of instance |
+| `hcom transcript [name]` | View conversation transcript of instance |
 | `hcom config` | Get/set `~/.hcom/config.env` values |
 | `hcom relay hf [token]` | Setup cross-device chat |
-| `hcom reset` | Archive and clear database
+| `hcom reset` | Archive and clear database |
+| `hcom archive` | Query archived sessions |
 
 * `hcom --help` for more details
 
@@ -396,6 +397,44 @@ HCOM_TERMINAL="/Applications/WezTerm.app/Contents/MacOS/wezterm cli spawn -- bas
 4. Grant "Display over other apps" permission in Android settings
 5. Run: `hcom 2`
 
+
+---
+
+## Python API
+
+For scripts and automation:
+
+```python
+from hcom import api
+
+# Identity
+api.whoami()                    # {"name": "alice", "connected": True, ...}
+api.instances()                 # [{"name": "bob", "status": "active"}, ...]
+
+# Messaging
+api.send("@bob check this")     # -> ["bob"]
+api.send("done", sender="ci")   # external tool identity
+api.send("review", to="bob", intent="request", thread="pr-123")
+api.send("done", to="alice", intent="ack", reply_to="42")
+api.messages()                  # recent messages for me
+
+# Events
+api.events(sql="type='message'")
+api.wait("msg_from='bob'", timeout=30)  # block until match
+
+# Subscriptions
+sub_id = api.subscribe("type='status' AND status_val='idle'")
+api.unsubscribe(sub_id)
+
+# Lifecycle
+api.stop()                      # disable self
+api.start(name="bob")           # re-enable bob
+api.launch(3, tag="worker", background=True)
+```
+
+All functions raise `HcomError` on failure. External tools use `sender=` param.
+
+
 ---
 
 ## Reference
@@ -405,7 +444,7 @@ HCOM_TERMINAL="/Applications/WezTerm.app/Contents/MacOS/wezterm cli spawn -- bas
 
 ### Main Help
 ```
-hcom v0.6.8 - Hook-based communication for Claude Code instances
+hcom v0.6.9 - Hook-based communication for Claude Code instances
 
 Usage:
   hcom                               TUI dashboard
@@ -418,9 +457,10 @@ Commands:
   start     Enable hcom participation
   stop      Disable hcom participation
   events    Query events / subscribe for push notifications
-  thread    View other instance's conversation transcript
+  transcript View other instance's conversation transcript
   config    Get/set config environment variables
   relay     Cross-device live chat
+  archive   Query archived sessions
   reset     Archive and clear database or hooks
 
 Run 'hcom <command> --help' for details.
@@ -433,6 +473,10 @@ Usage:
   hcom send "@name msg"   Send to specific instance/group
     --from <name>      Identity for non-Claude tools (Gemini, scripts)
     --wait             Poll for @mentions (use with --from)
+Envelope (optional):
+    --intent <type>    request|inform|ack|error
+    --reply-to <id>    Link to event (42 or 42:BOXE for remote)
+    --thread <name>    Group related messages
 ```
 
 ### hcom list
@@ -484,7 +528,7 @@ Subscribe:
     events unsub collision Disable collision alerts
 
 Flat fields (events_v view):
-    message            msg_from, msg_text, msg_scope, msg_sender_kind, msg_delivered_to, msg_mentions
+    message            msg_from, msg_text, msg_scope, msg_sender_kind, msg_delivered_to, msg_mentions, msg_intent, msg_thread, msg_reply_to
     status             status_val, status_context, status_detail
     life               life_action, life_by, life_batch_id, life_reason
 
@@ -493,13 +537,15 @@ Flat fields (events_v view):
   Use <> instead of != for SQL negation
 ```
 
-### hcom thread
+### hcom transcript
 ```
 Usage:
-  hcom thread             Show your conversation thread
-  hcom thread @instance   See what another instance is doing
-    --last N           Limit to last N exchanges (default: 10)
-    --range N-M        Show exchanges N through M (1-indexed)
+  hcom transcript             Show your conversation transcript (last 10)
+  hcom transcript N           Show exchange N (absolute position)
+  hcom transcript N-M         Show exchanges N through M
+  hcom transcript @instance   See another instance's transcript
+  hcom transcript @instance N Exchange N of another instance
+    --last N           Limit to last N exchanges
     --full             Show full assistant responses
     --detailed         Show tool I/O, edits, errors
     --json             JSON output
@@ -515,7 +561,13 @@ Usage:
     --edit             Open config in $EDITOR
     --reset            Reset config to defaults
 
-Settings:
+Instance runtime config:
+  hcom config -i <name>   Show instance config
+  hcom config -i <name> <key> <val>  Set instance value
+    -i self            Current instance (requires Claude context)
+    keys: tag, timeout, hints, subagent_timeout
+
+Global settings:
     HCOM_TAG           Group tag (creates tag-* instances)
     HCOM_TERMINAL      Terminal: new|here|"custom {script}"
     HCOM_HINTS         Text appended to messages received by instance
@@ -544,6 +596,18 @@ Usage:
   hcom relay hf [token]   Connect to relay server on HuggingFace
   (finds or creates a free private space on your HuggingFace account
   provide HF_TOKEN or login with hf cli first)
+```
+
+### hcom archive
+```
+Usage:
+  hcom archive            List archived sessions (numbered, most recent = 1)
+  hcom archive <N>        Show events from archive N
+  hcom archive <N> instances Show instances from archive N
+    --sql EXPR            SQL WHERE filter
+    --last N              Limit event count (default: 20)
+    --here                Only archives with instances in current directory
+    --json                JSON output
 ```
 
 ### hcom reset

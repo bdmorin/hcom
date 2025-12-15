@@ -1,7 +1,7 @@
 """Messaging commands for HCOM"""
 import sys
 from .utils import format_error, validate_message, resolve_identity, validate_flags
-from ..shared import MAX_MESSAGES_PER_DELIVERY, SENDER
+from ..shared import MAX_MESSAGES_PER_DELIVERY, SENDER, HcomError
 from ..core.paths import ensure_hcom_directories
 from ..core.db import init_db
 from ..core.instances import load_instance_position, set_status, get_instance_status, initialize_instance_in_position_file
@@ -99,7 +99,7 @@ def cmd_send(argv: list[str], quiet: bool = False) -> int:
                             "Run 'hcom start --agentid <agent_id>' first, then 'hcom send \"msg\" --agentid <agent_id>'"
                         ), file=sys.stderr)
                         return 1
-            except ValueError:
+            except HcomError:
                 pass  # Can't resolve identity - allow (true external sender)
 
             # Validate
@@ -130,6 +130,73 @@ def cmd_send(argv: list[str], quiet: bool = False) -> int:
             # No timeout specified, use default (30 minutes)
             wait_timeout = 1800
             argv = argv[:idx] + argv[idx + 1:]
+
+    # Extract envelope flags (optional structured messaging)
+    envelope = {}
+
+    # --intent {request|inform|ack|error}
+    if '--intent' in argv:
+        idx = argv.index('--intent')
+        if idx + 1 < len(argv) and not argv[idx + 1].startswith('--'):
+            intent_val = argv[idx + 1].lower()
+            from ..core.helpers import validate_intent
+            try:
+                validate_intent(intent_val)
+            except ValueError as e:
+                print(format_error(str(e)), file=sys.stderr)
+                return 1
+            envelope['intent'] = intent_val
+            argv = argv[:idx] + argv[idx + 2:]
+        else:
+            print(format_error("--intent requires a value (request|inform|ack|error)"), file=sys.stderr)
+            return 1
+
+    # --reply-to <id> or <id:DEVICE>
+    if '--reply-to' in argv:
+        idx = argv.index('--reply-to')
+        if idx + 1 < len(argv) and not argv[idx + 1].startswith('--'):
+            reply_to_val = argv[idx + 1]
+            envelope['reply_to'] = reply_to_val
+            argv = argv[:idx] + argv[idx + 2:]
+        else:
+            print(format_error("--reply-to requires an event ID (e.g., 42 or 42:BOXE)"), file=sys.stderr)
+            return 1
+
+    # --thread <name>
+    if '--thread' in argv:
+        idx = argv.index('--thread')
+        if idx + 1 < len(argv) and not argv[idx + 1].startswith('--'):
+            thread_val = argv[idx + 1]
+            # Validate thread name
+            if len(thread_val) > 64:
+                print(format_error("Thread name too long (max 64 chars)"), file=sys.stderr)
+                return 1
+            if not all(c.isalnum() or c in '-_' for c in thread_val):
+                print(format_error("Thread name must be alphanumeric with hyphens/underscores"), file=sys.stderr)
+                return 1
+            envelope['thread'] = thread_val
+            argv = argv[:idx] + argv[idx + 2:]
+        else:
+            print(format_error("--thread requires a thread name"), file=sys.stderr)
+            return 1
+
+    # Validation: ack requires reply_to
+    if envelope.get('intent') == 'ack' and 'reply_to' not in envelope:
+        print(format_error("Intent 'ack' requires --reply-to"), file=sys.stderr)
+        return 1
+
+    # Validate reply_to exists and inherit thread if not explicit
+    if 'reply_to' in envelope:
+        from ..core.messages import resolve_reply_to, get_thread_from_event
+        local_id, error = resolve_reply_to(envelope['reply_to'])
+        if error:
+            print(format_error(f"Invalid --reply-to: {error}"), file=sys.stderr)
+            return 1
+        # Thread inheritance: if reply_to without explicit thread, inherit from parent
+        if 'thread' not in envelope and local_id:
+            parent_thread = get_thread_from_event(local_id)
+            if parent_thread:
+                envelope['thread'] = parent_thread
 
     # First non-flag argument is the message
     message = unescape_bash(argv[0]) if argv else None
@@ -179,9 +246,10 @@ def cmd_send(argv: list[str], quiet: bool = False) -> int:
             pass  # Best-effort - local send still works
 
         # Send message and get delivered_to list
-        delivered_to = send_message(identity, message)
-        if delivered_to is None:
-            # Error already printed (validation failure or DB error)
+        try:
+            delivered_to = send_message(identity, message, envelope if envelope else None)
+        except HcomError as e:
+            print(f"Error: {e}", file=sys.stderr)
             return 1
 
         # Handle quiet mode
@@ -229,6 +297,10 @@ def cmd_send(argv: list[str], quiet: bool = False) -> int:
             print(recipient_feedback)
 
     # External sender polling (--wait flag)
+    # NOTE: The two-step pattern (send first, then --wait separately) is deliberate.
+    # LLMs in AI dev environments won't sit waiting on a long-running command - they'll
+    # timeout quickly or want further confirmation. Separating send from wait gives a
+    # higher success rate: first send delivers info, then user confirms the blocking wait.
     if wait_timeout is not None:
         # Require --from when using --wait
         if not custom_sender:
@@ -330,11 +402,14 @@ def cmd_send(argv: list[str], quiet: bool = False) -> int:
 
                 events = get_events_since(current_pos)
 
+                # Get current tag for @mention matching (external senders usually don't have tags)
+                sender_tag = current_instance.get('tag') if current_instance else None
+
                 for event in events:
                     current_pos = max(current_pos, event['id'])
                     if event['type'] == 'message':
                         data = event['data']
-                        if is_mentioned(data.get('text', ''), custom_sender):
+                        if is_mentioned(data.get('text', ''), custom_sender, sender_tag):
                             update_instance_position(custom_sender, {'last_event_id': current_pos})
                             set_status(custom_sender, 'active', f"deliver:{data['from']}")
                             print(f"\n[Message from {data['from']}]")

@@ -1,13 +1,10 @@
 """Message operations - filtering, routing, and delivery"""
 from __future__ import annotations
 
-from .instances import (
-    load_instance_position,
-    update_instance_position, is_parent_instance
-)
+from .instances import load_instance_position, update_instance_position
 from .config import get_config
-from ..shared import MENTION_PATTERN, SENDER, SenderIdentity, parse_iso_timestamp, format_age
-from .helpers import in_same_group_by_id, validate_scope, is_mentioned
+from ..shared import MENTION_PATTERN, SENDER, SenderIdentity, HcomError, parse_iso_timestamp, format_age
+from .helpers import validate_scope, is_mentioned
 import sys
 
 # ==================== Formatting Helpers ====================
@@ -33,136 +30,193 @@ def format_recipients(delivered_to: list[str], max_show: int = 10) -> str:
 
 # ==================== Scope Computation ====================
 
-def compute_scope(identity: SenderIdentity, message: str, enabled_instances: list[str]) -> tuple[str, dict] | None:
+def compute_scope(message: str, enabled_instances: list[dict]) -> tuple[tuple[str, dict], str | None]:
     """Compute message scope and routing data.
 
     Args:
-        identity: Sender identity (kind + name + instance_data)
         message: Message text
-        enabled_instances: List of enabled instance names (for @mention validation)
+        enabled_instances: List of enabled instance dicts (with 'name' and 'tag' fields)
 
     Returns:
-        (scope, extra_data) tuple, or None on validation failure
+        ((scope, extra_data), None) on success
+        (None, error_message) on validation failure
 
     Scope types:
-        - 'broadcast': External senders to everyone
-        - 'mentions': @-mention routing (cross all boundaries)
-        - 'parent_broadcast': Parent broadcasting to other parents
-        - 'subagent_group': Subagent broadcasting to same group
+        - 'broadcast': No @mentions → everyone
+        - 'mentions': Has @targets → explicit targets only
 
-    STRICT FAILURE: @mentions to non-existent or disabled instances return None with error
+    STRICT FAILURE: @mentions to non-existent or disabled instances return error
+
+    @mention matching uses full display name ({tag}-{name} or {name}):
+        - @api-alice matches instance with tag='api', name='alice'
+        - @api- matches all instances with tag='api' (prefix match)
+        - @alice matches instance with name='alice' (no tag or base name match)
     """
-    # Check for @mentions FIRST (crosses all boundaries)
+    from .instances import get_full_name
+
+    # Build full name lookup: {full_name: base_name}
+    # We store base_name in mentions list (that's the PK) but match against full_name
+    full_to_base = {}
+    full_names = []
+    for inst in enabled_instances:
+        if isinstance(inst, str):
+            # Backwards compat: plain string (base name or legacy full name)
+            full_to_base[inst] = inst
+            full_names.append(inst)
+        else:
+            full = get_full_name(inst)
+            base = inst.get('name', '')
+            full_to_base[full] = base
+            full_names.append(full)
+
+    # Check for @mentions
     if '@' in message:
         mentions = MENTION_PATTERN.findall(message)
         if mentions:
             # Validate all mentions match ENABLED instances only
-            matched_instances = []
+            matched_base_names = []
             unmatched = []
 
             for mention in mentions:
-                # Check if mention matches any ENABLED instance (prefix match, case insensitive)
+                # Check if mention matches any ENABLED instance (prefix match on full name)
                 # If mention has no :, only match local instances (exclude :-suffixed remotes)
                 # If mention has :, allow matching remote instances
                 if ':' in mention:
                     # Mention includes device suffix - match any instance with prefix
-                    matches = [name for name in enabled_instances
-                              if name.lower().startswith(mention.lower())]
+                    matches = [full_to_base[fn] for fn in full_names
+                              if fn.lower().startswith(mention.lower())]
                 else:
                     # Mention is bare name - only match local instances (no : in name)
                     # Don't match across underscore boundary (reserved for subagent hierarchy)
-                    matches = [name for name in enabled_instances
-                              if ':' not in name and name.lower().startswith(mention.lower())
-                              and (len(name) == len(mention) or name[len(mention)] != '_')]
+                    matches = [full_to_base[fn] for fn in full_names
+                              if ':' not in fn and fn.lower().startswith(mention.lower())
+                              and (len(fn) == len(mention) or fn[len(mention)] != '_')]
                 if matches:
-                    matched_instances.extend(matches)
+                    matched_base_names.extend(matches)
                 else:
                     unmatched.append(mention)
 
-            # STRICT: fail loud on unmatched mentions (non-existent OR disabled)
+            # STRICT: fail on unmatched mentions (non-existent OR disabled)
             if unmatched:
                 # Special case: literal "@mention" in message text
                 if 'mention' in unmatched:
-                    print("Error: The literal text '@mention' is not a valid target - use actual instance names", file=sys.stderr)
-                else:
-                    print(
-                        f"Error: @mentions to non-existent or stopped instances: {', '.join(f'@{m}' for m in unmatched)}",
-                        file=sys.stderr
-                    )
-                # Show available (enabled) instances
-                display = format_recipients(enabled_instances)
-                print(f"Available: {display}", file=sys.stderr)
-                return None
+                    return None, "The literal text '@mention' is not a valid target - use actual instance names"
 
-            # Deduplicate matched instances
-            unique_instances = list(dict.fromkeys(matched_instances))
-            return ('mentions', {'mentions': unique_instances})
+                display = format_recipients(full_names)
+                error = f"@mentions to non-existent or stopped instances: {', '.join(f'@{m}' for m in unmatched)}\nAvailable: {display}"
+                return None, error
 
-    # External senders broadcast (no mentions)
-    if identity.broadcasts:
-        return ('broadcast', {})
+            # Deduplicate matched instances (store base names for DB lookup)
+            unique_instances = list(dict.fromkeys(matched_base_names))
+            return ('mentions', {'mentions': unique_instances}), None
 
-    # No mentions - determine broadcast scope
-    if not identity.instance_data:
-        # Shouldn't happen for kind='instance', but handle gracefully
-        return ('broadcast', {})
-
-    # Check if sender is parent or subagent
-    if is_parent_instance(identity.instance_data):
-        return ('parent_broadcast', {})
-    else:
-        # Subagent - broadcast within group only
-        group_id = identity.group_id
-        if not group_id:
-            # Subagent without group? Shouldn't happen, fail loud
-            print(f"Error: Subagent '{identity.name}' has no group_id", file=sys.stderr)
-            return None
-        return ('subagent_group', {'group_id': group_id})
+    # No @mentions → broadcast to everyone
+    return ('broadcast', {}), None
 
 
 def _should_deliver(scope: str, extra: dict, receiver_name: str, sender_name: str) -> bool:
     """Check if message should be delivered to receiver based on scope.
 
-    Internal helper for computing recipient snapshots at send time.
-
     Args:
-        scope: Message scope ('broadcast', 'mentions', 'parent_broadcast', 'subagent_group')
-        extra: Extra scope data (mentions, group_id, etc)
+        scope: Message scope ('broadcast', 'mentions')
+        extra: Extra scope data (mentions list for 'mentions' scope)
         receiver_name: Instance to check delivery for
         sender_name: Sender name (excluded from delivery)
 
     Returns:
         True if receiver should get the message
     """
-    # Never deliver to self
     if receiver_name == sender_name:
         return False
 
-    # Validate scope
     validate_scope(scope)
 
-    # Match on scope
     if scope == 'broadcast':
         return True
-
     if scope == 'mentions':
         return receiver_name in extra.get('mentions', [])
 
-    if scope == 'parent_broadcast':
-        receiver_data = load_instance_position(receiver_name)
-        return is_parent_instance(receiver_data)
-
-    if scope == 'subagent_group':
-        group_id = extra.get('group_id')
-        if not group_id:
-            return False
-        receiver_data = load_instance_position(receiver_name)
-        return in_same_group_by_id(group_id, receiver_data)
-
-    # Should never reach here if validate_scope works
     return False
 
 # ==================== Core Message Operations ====================
+
+def resolve_reply_to(reply_to: str) -> tuple[int | None, str | None]:
+    """Resolve reply_to reference to local event ID.
+
+    Handles both local (42) and cross-device (42:BOXE) formats.
+
+    Args:
+        reply_to: Event reference string - "42" or "42:BOXE"
+
+    Returns:
+        (local_event_id, warning_message)
+        - local_event_id: Resolved local event ID, or None if can't resolve
+        - warning_message: Warning string if resolution failed, else None
+    """
+    from .db import get_db
+
+    conn = get_db()
+
+    if ':' in reply_to:
+        # Cross-device format: 42:BOXE
+        parts = reply_to.split(':', 1)
+        try:
+            remote_id = int(parts[0])
+            short_device = parts[1].upper()
+        except (ValueError, IndexError):
+            return None, f"Invalid reply_to format: {reply_to}"
+
+        # Look up by relay origin metadata
+        row = conn.execute(
+            """
+            SELECT id FROM events
+            WHERE json_extract(data, '$._relay.short') = ?
+              AND (
+                json_extract(data, '$._relay.id') = ?
+                OR json_extract(data, '$._relay.id') = ?
+              )
+            ORDER BY id DESC
+            LIMIT 1
+            """,
+            (short_device, remote_id, str(remote_id)),
+        ).fetchone()
+
+        if row:
+            return row['id'], None
+        return None, f"Remote event {reply_to} not found locally"
+    else:
+        # Local format: 42
+        try:
+            local_id = int(reply_to)
+        except ValueError:
+            return None, f"Invalid reply_to format: {reply_to}"
+
+        # Verify event exists
+        row = conn.execute("SELECT id FROM events WHERE id = ?", (local_id,)).fetchone()
+        if row:
+            return local_id, None
+        return None, f"Event #{reply_to} not found"
+
+
+def get_thread_from_event(event_id: int) -> str | None:
+    """Get thread field from an event by ID.
+
+    Args:
+        event_id: Local event ID
+
+    Returns:
+        Thread string if present, else None
+    """
+    from .db import get_db
+
+    conn = get_db()
+    row = conn.execute(
+        "SELECT json_extract(data, '$.thread') as thread FROM events WHERE id = ?",
+        (event_id,)
+    ).fetchone()
+
+    return row['thread'] if row and row['thread'] else None
+
 
 def unescape_bash(text: str) -> str:
     """Remove bash escape sequences from message content.
@@ -187,41 +241,50 @@ def unescape_bash(text: str) -> str:
         text = text.replace(escaped, unescaped)
     return text
 
-def send_message(identity: SenderIdentity, message: str) -> list[str] | None:
+def send_message(
+    identity: SenderIdentity,
+    message: str,
+    envelope: dict[str, str] | None = None
+) -> list[str]:
     """Send a message to the database and notify all instances.
 
     Args:
         identity: Sender identity (kind + name + instance_data)
         message: Message text
+        envelope: Optional envelope fields {intent, reply_to, thread}
 
     Returns:
-        delivered_to list on success (enabled instances that will receive), None on failure
+        delivered_to list (base names of enabled instances that will receive)
+
+    Raises:
+        HcomError: If validation fails or database write fails
     """
     from .db import log_event, get_db
+    from .instances import get_full_name
 
     conn = get_db()
 
-    # Get enabled instances only (for @mention validation AND delivery)
-    enabled_instances = [
-        row['name'] for row in
-        conn.execute("SELECT name FROM instances WHERE enabled = 1").fetchall()
-    ]
+    # Get enabled instances with name and tag (for @mention validation with full names)
+    enabled_rows = conn.execute(
+        "SELECT name, tag FROM instances WHERE enabled = 1"
+    ).fetchall()
+    enabled_instances = [{'name': row['name'], 'tag': row['tag']} for row in enabled_rows]
 
-    # For @mention validation: enabled instances + CLI identity (bigboss)
+    # For @mention validation: enabled instances + CLI identity (bigboss as plain string)
     mentionable = enabled_instances + [SENDER]
 
-    # Compute scope and routing data (validates @mentions against enabled only)
-    scope_result = compute_scope(identity, message, mentionable)
-    if scope_result is None:
-        # Failed validation (unmatched or stopped @mentions) - error already printed
-        return None
+    # Compute scope and routing data (validates @mentions against full names)
+    scope_result, error = compute_scope(message, mentionable)
+    if error:
+        raise HcomError(error)
 
     scope, extra = scope_result
 
-    # Compute delivered_to: enabled instances in scope
+    # Compute delivered_to: base names of enabled instances in scope
+    # Use base name for delivery check since that's what's stored in mentions
     delivered_to = [
-        inst_name for inst_name in enabled_instances
-        if _should_deliver(scope, extra, inst_name, identity.name)
+        inst['name'] for inst in enabled_instances
+        if _should_deliver(scope, extra, inst['name'], identity.name)
     ]
 
     # Build event data
@@ -236,6 +299,19 @@ def send_message(identity: SenderIdentity, message: str) -> list[str] | None:
     # Add scope extra data (mentions, group_id)
     if extra:
         data.update(extra)
+
+    # Add envelope fields if provided
+    if envelope:
+        if intent := envelope.get('intent'):
+            data['intent'] = intent
+        if reply_to := envelope.get('reply_to'):
+            data['reply_to'] = reply_to
+            # Resolve to local event ID for easier queries
+            local_id, _ = resolve_reply_to(reply_to)
+            if local_id:
+                data['reply_to_local'] = local_id
+        if thread := envelope.get('thread'):
+            data['thread'] = thread
 
     # Log to SQLite with namespace separation
     # External senders use 'ext_{name}' prefix for clear namespace isolation
@@ -256,9 +332,7 @@ def send_message(identity: SenderIdentity, message: str) -> list[str] | None:
             data=data
         )
     except Exception as e:
-        # DB write failed - print clear error for debugging
-        print(f"Error: Failed to write message to database: {e}", file=sys.stderr)
-        return None
+        raise HcomError(f"Failed to write message to database: {e}")
 
     # Push to relay server immediately (messages always push)
     try:
@@ -274,7 +348,7 @@ def send_message(identity: SenderIdentity, message: str) -> list[str] | None:
     return delivered_to
 
 
-def send_system_message(sender_name: str, message: str) -> list[str] | None:
+def send_system_message(sender_name: str, message: str) -> list[str]:
     """Send a system notification message.
 
     Args:
@@ -282,7 +356,10 @@ def send_system_message(sender_name: str, message: str) -> list[str] | None:
         message: Message text (can include @mentions for targeting)
 
     Returns:
-        delivered_to list on success, None on failure
+        delivered_to list
+
+    Raises:
+        HcomError: If validation fails or database write fails
     """
     identity = SenderIdentity(kind='system', name=sender_name, instance_data=None)
     return send_message(identity, message)
@@ -329,12 +406,21 @@ def get_unread_messages(instance_name: str, update_position: bool = False) -> tu
         # Apply scope-based filtering
         try:
             if should_deliver_message(event_data, instance_name, sender_name):
-                messages.append({
+                msg = {
                     'timestamp': event['timestamp'],
                     'from': sender_name,
                     'message': event_data['text'],
-                    'delivered_to': event_data.get('delivered_to', [])
-                })
+                    'delivered_to': event_data.get('delivered_to', []),
+                    'event_id': event['id'],
+                }
+                # Include envelope fields if present
+                if intent := event_data.get('intent'):
+                    msg['intent'] = intent
+                if thread := event_data.get('thread'):
+                    msg['thread'] = thread
+                if relay := event_data.get('_relay'):
+                    msg['_relay'] = relay
+                messages.append(msg)
         except ValueError as e:
             print(
                 f"Error: Corrupt message data in event {event['id']}: {e}. "
@@ -355,10 +441,10 @@ def get_unread_messages(instance_name: str, update_position: bool = False) -> tu
 # ==================== Message Filtering & Routing ====================
 
 def should_deliver_message(event_data: dict, receiver_name: str, sender_name: str) -> bool:
-    """Check if message should be delivered based on scope (15-line implementation).
+    """Check if message should be delivered based on scope.
 
     Args:
-        event_data: Message event data with 'scope' field and scope-specific data
+        event_data: Message event data with 'scope' field
         receiver_name: Instance to check delivery for
         sender_name: Sender name (excluded from delivery)
 
@@ -369,18 +455,15 @@ def should_deliver_message(event_data: dict, receiver_name: str, sender_name: st
         KeyError: If scope field missing (old message format)
         ValueError: If scope value invalid
     """
-    # Never deliver to self
     if receiver_name == sender_name:
         return False
 
-    # Extract and validate scope
     if 'scope' not in event_data:
         raise KeyError("Message missing 'scope' field (old format)")
 
     scope = event_data['scope']
-    validate_scope(scope)  # Raises ValueError if invalid
+    validate_scope(scope)
 
-    # Scope-based routing
     if scope == 'broadcast':
         return True
 
@@ -391,18 +474,6 @@ def should_deliver_message(event_data: dict, receiver_name: str, sender_name: st
         receiver_base = receiver_name.split(':')[0]
         return any(receiver_base == m.split(':')[0] for m in mentions)
 
-    if scope == 'parent_broadcast':
-        receiver_data = load_instance_position(receiver_name)
-        return is_parent_instance(receiver_data)
-
-    if scope == 'subagent_group':
-        group_id = event_data.get('group_id')
-        if not group_id:
-            return False
-        receiver_data = load_instance_position(receiver_name)
-        return in_same_group_by_id(group_id, receiver_data)
-
-    # Should never reach here if validate_scope works
     return False
 
 
@@ -504,11 +575,53 @@ def get_subagent_messages(parent_name: str, since_id: int = 0, limit: int = 0) -
 
 # ==================== Message Formatting ====================
 
+def _build_message_prefix(msg: dict) -> str:
+    """Build message prefix from envelope fields.
+
+    Format: [intent:thread #id] or [intent #id] or [thread:name #id] or [new message #id]
+    Remote messages: #id:DEVICE
+
+    Args:
+        msg: Message dict with optional 'intent', 'thread', 'event_id', '_relay'
+
+    Returns:
+        Formatted prefix string like "[request:pr-42 #42]"
+    """
+    intent = msg.get('intent')
+    thread = msg.get('thread')
+    event_id = msg.get('event_id')
+    relay = msg.get('_relay', {})
+
+    # Build ID reference (local or remote)
+    if relay and relay.get('short') and relay.get('id'):
+        id_ref = f"#{relay['id']}:{relay['short']}"
+    elif event_id:
+        id_ref = f"#{event_id}"
+    else:
+        id_ref = ""
+
+    # Build prefix based on envelope fields
+    if intent and thread:
+        prefix = f"{intent}:{thread}"
+    elif intent:
+        prefix = intent
+    elif thread:
+        prefix = f"thread:{thread}"
+    else:
+        prefix = "new message"
+
+    if id_ref:
+        return f"[{prefix} {id_ref}]"
+    return f"[{prefix}]"
+
+
 def format_hook_messages(messages: list[dict[str, str]], instance_name: str) -> str:
     """Format messages for hook feedback.
 
     Single message uses verbose format: "sender → you + N others"
     Multiple messages use compact format: "sender → you (+N)"
+
+    Format includes envelope info: [intent:thread #id] sender → recipient: text
     """
     def _others_count(msg: dict) -> int:
         """Count other recipients (excluding self)"""
@@ -523,7 +636,8 @@ def format_hook_messages(messages: list[dict[str, str]], instance_name: str) -> 
             recipient = f"{instance_name} (+{others} other{'s' if others > 1 else ''})"
         else:
             recipient = instance_name
-        reason = f"[new message] {msg['from']} → {recipient}: {msg['message']}"
+        prefix = _build_message_prefix(msg)
+        reason = f"{prefix} {msg['from']} → {recipient}: {msg['message']}"
     else:
         parts = []
         for msg in messages:
@@ -532,11 +646,18 @@ def format_hook_messages(messages: list[dict[str, str]], instance_name: str) -> 
                 recipient = f"{instance_name} (+{others})"
             else:
                 recipient = instance_name
-            parts.append(f"{msg['from']} → {recipient}: {msg['message']}")
+            prefix = _build_message_prefix(msg)
+            parts.append(f"{prefix} {msg['from']} → {recipient}: {msg['message']}")
         reason = f"[{len(messages)} new messages] | {' | '.join(parts)}"
 
-    # Only append hints to messages
-    hints = get_config().hints
+    # Append hints to messages: instance-specific first, then global config
+    from .instances import load_instance_position
+    instance_data = load_instance_position(instance_name)
+    hints = None
+    if instance_data:
+        hints = instance_data.get('hints')  # Per-instance override
+    if not hints:
+        hints = get_config().hints  # Global fallback
     if hints:
         reason = f"{reason} | [{hints}]"
 
@@ -579,7 +700,7 @@ def get_read_receipts(identity: SenderIdentity, max_text_length: int = 50, limit
 
     # Get all instances
     active_instances_query = """
-        SELECT name, last_event_id, session_id, mapid, parent_session_id, origin_device_id
+        SELECT name, tag, last_event_id, session_id, mapid, parent_session_id, origin_device_id
         FROM instances
         WHERE name != ?
     """
@@ -590,6 +711,7 @@ def get_read_receipts(identity: SenderIdentity, max_text_length: int = 50, limit
 
     instance_reads = {row['name']: row['last_event_id'] for row in active_instances}
     instance_data_cache = {row['name']: {
+        'tag': row['tag'],
         'session_id': row['session_id'],
         'mapid': row['mapid'],
         'parent_session_id': row['parent_session_id'],
@@ -648,7 +770,8 @@ def get_read_receipts(identity: SenderIdentity, max_text_length: int = 50, limit
                 if inst_data:
                     from ..core.instances import is_external_sender
                     if is_external_sender(inst_data):
-                        if not is_mentioned(msg_text, inst_name):
+                        inst_tag = inst_data.get('tag')
+                        if not is_mentioned(msg_text, inst_name, inst_tag):
                             continue
                 read_by.append(inst_name)
 

@@ -4,7 +4,16 @@ from __future__ import annotations
 from typing import Any
 
 # Valid scope values for message routing
-VALID_SCOPES = {'broadcast', 'mentions', 'parent_broadcast', 'subagent_group'}
+# - broadcast: No @mentions → everyone
+# - mentions: Has @targets → explicit targets only
+VALID_SCOPES = {'broadcast', 'mentions'}
+
+# Valid intent values for message envelope
+# - request: Response expected from recipient
+# - inform: FYI, no action needed
+# - ack: Explicit acknowledgment (requires reply_to)
+# - error: Terminal failure, stop retrying
+VALID_INTENTS = {'request', 'inform', 'ack', 'error'}
 
 def get_group_session_id(instance_data: dict[str, Any] | None) -> str | None:
     """Get the session_id that defines this instance's group.
@@ -49,58 +58,75 @@ def validate_scope(scope: str) -> None:
             f"Invalid scope '{scope}'. Must be one of: {', '.join(sorted(VALID_SCOPES))}"
         )
 
-def is_mentioned(text: str, name: str) -> bool:
-    """Check if instance name is @-mentioned in text using prefix matching.
+def validate_intent(intent: str) -> None:
+    """Validate that intent is a valid value.
 
-    Uses same prefix matching logic as compute_scope() for consistency:
-    - @alice matches "alice" and "alice-worker" (prefix match with hyphen)
-    - @alice does NOT match "alice_subagent_1" (underscore blocks prefix expansion)
-    - @alice_ matches "alice_subagent_1" (explicit underscore prefix)
-    - @alice does NOT match "alice:BOXE" (bare mention excludes remote instances)
-    - @alice:BOX matches "alice:BOXE" (remote mention includes device suffix)
+    Args:
+        intent: Intent value to validate
 
-    Underscore `_` is reserved as the subagent hierarchy separator, so prefix
-    matching stops at underscore boundaries. This prevents @parent from matching
-    all subagents named parent_type_N.
+    Raises:
+        ValueError: If intent is not in VALID_INTENTS
+    """
+    if intent not in VALID_INTENTS:
+        raise ValueError(
+            f"Invalid intent '{intent}'. Must be one of: {', '.join(sorted(VALID_INTENTS))}"
+        )
+
+def is_mentioned(text: str, name: str, tag: str | None = None) -> bool:
+    """Check if instance is @-mentioned in text using prefix matching on full name.
+
+    Uses same prefix matching logic as compute_scope() for consistency.
+    Full name is '{tag}-{name}' if tag exists, else just '{name}'.
+
+    Matching rules:
+    - @api-alice matches full name "api-alice" (exact or prefix)
+    - @api- matches all instances with tag "api" (full name starts with "api-")
+    - @alice matches base name "alice" (when no tag, or as base name match)
+    - Underscore blocks prefix expansion (reserved for subagent hierarchy)
+    - Bare mentions exclude remote instances (no : in name)
 
     Args:
         text: Text to search in
-        name: Instance name to check if mentioned (without @ prefix)
+        name: Instance base name to check (without @ prefix)
+        tag: Optional tag (if present, full name is '{tag}-{name}')
 
     Returns:
-        True if @mention prefix-matches name, False otherwise
+        True if @mention prefix-matches full name, False otherwise
 
     Examples:
-        >>> is_mentioned("Hey @john, can you help?", "john")
+        >>> is_mentioned("Hey @api-alice", "alice", "api")
         True
-        >>> is_mentioned("Hey @john, can you help?", "john-worker")  # hyphen ok
+        >>> is_mentioned("Hey @api-", "alice", "api")  # prefix match
         True
-        >>> is_mentioned("Hey @john, can you help?", "john_subagent_1")  # underscore blocks
+        >>> is_mentioned("Hey @alice", "alice", "api")  # base name match
+        True
+        >>> is_mentioned("Hey @alice", "alice")  # no tag
+        True
+        >>> is_mentioned("Hey @review-alice", "alice", "api")  # wrong tag
         False
-        >>> is_mentioned("Hey @john_, can you help?", "john_subagent_1")  # explicit underscore
-        True
-        >>> is_mentioned("email@john.com", "john")  # not a mention
-        False
-        >>> is_mentioned("@alice", "alice:BOXE")  # bare mention excludes remote
-        False
-        >>> is_mentioned("@alice:BOX", "alice:BOXE")  # remote prefix match
-        True
     """
     from ..shared import MENTION_PATTERN
+
+    # Build full name
+    full_name = f"{tag}-{name}" if tag else name
 
     # Extract all @mentions from text
     mentions = MENTION_PATTERN.findall(text)
 
-    # Check if any mention prefix-matches the instance name (case-insensitive)
+    # Check if any mention prefix-matches the full name (case-insensitive)
     # Respects local/remote distinction: bare mentions only match local instances
     for mention in mentions:
         if ':' in mention:
             # Remote mention - match any instance with prefix
-            if name.lower().startswith(mention.lower()):
+            if full_name.lower().startswith(mention.lower()):
                 return True
         else:
-            # Bare mention - only match local instances (no : in name)
+            # Bare mention - only match local instances (no : in full name)
             # Don't match across underscore boundary (reserved for subagent hierarchy)
+            if ':' not in full_name and full_name.lower().startswith(mention.lower()):
+                if len(full_name) == len(mention) or full_name[len(mention)] != '_':
+                    return True
+            # Also check base name match (e.g., @alice matches api-alice)
             if ':' not in name and name.lower().startswith(mention.lower()):
                 if len(name) == len(mention) or name[len(mention)] != '_':
                     return True
@@ -109,8 +135,10 @@ def is_mentioned(text: str, name: str) -> bool:
 
 __all__ = [
     'VALID_SCOPES',
+    'VALID_INTENTS',
     'get_group_session_id',
     'in_same_group_by_id',
     'validate_scope',
+    'validate_intent',
     'is_mentioned',
 ]

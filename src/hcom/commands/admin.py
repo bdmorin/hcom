@@ -1,5 +1,6 @@
 """Admin commands for HCOM"""
 import sys
+import os
 import json
 import time
 import shutil
@@ -7,7 +8,7 @@ from pathlib import Path
 from datetime import datetime
 from .utils import get_help_text, format_error
 from ..core.paths import hcom_path, LAUNCH_DIR, LOGS_DIR, ARCHIVE_DIR
-from ..core.instances import get_instance_status, is_external_sender
+from ..core.instances import get_instance_status, is_external_sender, get_full_name, load_instance_position
 from ..shared import STATUS_ICONS, format_age, shorten_path
 
 
@@ -542,6 +543,303 @@ def _events_unsub(argv: list[str], subagent_id: str | None = None) -> int:
     return 0
 
 
+def _list_archives(here_filter: bool = False) -> list[dict]:
+    """Get list of archive sessions with metadata.
+
+    Args:
+        here_filter: If True, only show archives with instances in current directory
+    """
+    from ..core.db import DB_FILE
+    import sqlite3
+
+    archive_dir = hcom_path(ARCHIVE_DIR)
+    if not archive_dir.exists():
+        return []
+
+    cwd = os.getcwd() if here_filter else None
+    archives = []
+
+    for session_dir in sorted(archive_dir.glob('session-*'), reverse=True):
+        if not session_dir.is_dir():
+            continue
+
+        db_path = session_dir / DB_FILE
+        if not db_path.exists():
+            continue
+
+        try:
+            stat = db_path.stat()
+            archive_info = {
+                'index': len(archives) + 1,
+                'name': session_dir.name,
+                'path': str(session_dir),
+                'timestamp': session_dir.name.replace('session-', ''),
+                'size_bytes': stat.st_size,
+                'created': stat.st_mtime,
+            }
+
+            # Get event/instance counts
+            try:
+                conn = sqlite3.connect(str(db_path))
+                conn.row_factory = sqlite3.Row
+                event_count = conn.execute("SELECT COUNT(*) FROM events").fetchone()[0]
+                instance_count = conn.execute("SELECT COUNT(*) FROM instances").fetchone()[0]
+
+                # Filter by directory if --here
+                if here_filter and cwd:
+                    dir_match = conn.execute(
+                        "SELECT 1 FROM instances WHERE directory = ? LIMIT 1",
+                        (cwd,)
+                    ).fetchone()
+                    if not dir_match:
+                        conn.close()
+                        continue
+
+                conn.close()
+                archive_info['events'] = event_count
+                archive_info['instances'] = instance_count
+            except Exception:
+                archive_info['events'] = None
+                archive_info['instances'] = None
+
+            archives.append(archive_info)
+        except Exception:
+            continue
+
+    # Renumber after filtering
+    for i, a in enumerate(archives):
+        a['index'] = i + 1
+
+    return archives
+
+
+def _resolve_archive(selector: str, archives: list[dict]) -> dict | None:
+    """Resolve archive by index or name prefix.
+
+    Accepts:
+        - Index: "1", "2", etc. (1 = most recent)
+        - Full name: "session-2025-12-12_183215"
+        - Prefix: "2025-12-12_183215"
+    """
+    # Try as index first
+    try:
+        idx = int(selector)
+        if 1 <= idx <= len(archives):
+            return archives[idx - 1]
+    except ValueError:
+        pass
+
+    # Try as name or prefix match
+    for archive in archives:
+        if archive['name'] == selector:
+            return archive
+        if selector in archive['name']:
+            return archive
+
+    return None
+
+
+def _query_archive_events(archive: dict, sql_filter: str | None, last: int) -> list[dict]:
+    """Query events from archive database."""
+    import sqlite3
+    from ..core.db import DB_FILE
+
+    db_path = Path(archive['path']) / DB_FILE
+    conn = sqlite3.connect(str(db_path))
+    conn.row_factory = sqlite3.Row
+
+    query = "SELECT id, timestamp, type, instance, data FROM events"
+    if sql_filter:
+        # Use events_v view if it exists for convenience columns
+        try:
+            conn.execute("SELECT 1 FROM events_v LIMIT 1")
+            query = f"SELECT id, timestamp, type, instance, data FROM events_v WHERE {sql_filter}"
+        except Exception:
+            query = f"SELECT id, timestamp, type, instance, data FROM events WHERE {sql_filter}"
+    query += " ORDER BY id DESC"
+    if last > 0:
+        query += f" LIMIT {last}"
+
+    try:
+        rows = conn.execute(query).fetchall()
+        events = []
+        for row in rows:
+            events.append({
+                'id': row['id'],
+                'timestamp': row['timestamp'],
+                'type': row['type'],
+                'instance': row['instance'],
+                'data': json.loads(row['data']) if row['data'] else {}
+            })
+        conn.close()
+        return list(reversed(events))  # Show oldest first
+    except Exception as e:
+        conn.close()
+        raise e
+
+
+def _query_archive_instances(archive: dict, sql_filter: str | None) -> list[dict]:
+    """Query instances from archive database."""
+    import sqlite3
+    from ..core.db import DB_FILE
+
+    db_path = Path(archive['path']) / DB_FILE
+    conn = sqlite3.connect(str(db_path))
+    conn.row_factory = sqlite3.Row
+
+    query = "SELECT name, status, directory, transcript_path, session_id FROM instances"
+    if sql_filter:
+        query += f" WHERE {sql_filter}"
+    query += " ORDER BY created_at DESC"
+
+    try:
+        rows = conn.execute(query).fetchall()
+        instances = [dict(row) for row in rows]
+        conn.close()
+        return instances
+    except Exception as e:
+        conn.close()
+        raise e
+
+
+def cmd_archive(argv: list[str]) -> int:
+    """List/query archives: hcom archive [<N>|<name>] [events|instances] [--sql] [--last] [--here] [--json]
+
+    Usage:
+        hcom archive                              List all archives (numbered)
+        hcom archive --here                       Filter to current directory
+        hcom archive 1                            Events from most recent
+        hcom archive 1 --sql "type='message'"     Filtered events
+        hcom archive 1 --last 20                  Last 20 events
+        hcom archive 1 instances                  Instances from archive
+        hcom archive session-2025-12-12_183215    By stable name (prefix match works)
+    """
+    from .utils import validate_flags, get_command_help
+
+    # Validate flags
+    if error := validate_flags('archive', argv):
+        print(format_error(error), file=sys.stderr)
+        return 1
+
+    # Parse arguments
+    json_output = '--json' in argv
+    here_filter = '--here' in argv
+    sql_filter = None
+    last_count = 20  # Default
+
+    # Extract flag values
+    clean_argv = []
+    i = 0
+    while i < len(argv):
+        if argv[i] == '--sql' and i + 1 < len(argv):
+            sql_filter = argv[i + 1]
+            i += 2
+        elif argv[i] == '--last' and i + 1 < len(argv):
+            try:
+                last_count = int(argv[i + 1])
+            except ValueError:
+                print(format_error("--last requires a number"), file=sys.stderr)
+                return 1
+            i += 2
+        elif argv[i].startswith('--'):
+            i += 1
+        else:
+            clean_argv.append(argv[i])
+            i += 1
+
+    # Get archives list
+    archives = _list_archives(here_filter)
+
+    # No selector = list mode
+    if not clean_argv:
+        if not archives:
+            if json_output:
+                print(json.dumps({"archives": [], "count": 0}))
+            else:
+                print("No archives found")
+            return 0
+
+        if json_output:
+            print(json.dumps({"archives": archives, "count": len(archives)}, indent=2))
+            return 0
+
+        # Human-readable list with index
+        print("Archives:")
+        for archive in archives:
+            events = archive.get('events', '?')
+            instances = archive.get('instances', '?')
+            print(f"  {archive['index']:>2}. {archive['name']}  {events} events  {instances} instances")
+        return 0
+
+    # Selector provided - resolve archive
+    selector = clean_argv[0]
+    archive = _resolve_archive(selector, archives)
+    if not archive:
+        print(format_error(f"Archive not found: {selector}"), file=sys.stderr)
+        print("Run 'hcom archive' to list available archives", file=sys.stderr)
+        return 1
+
+    # Subcommand: instances
+    if len(clean_argv) > 1 and clean_argv[1] == 'instances':
+        try:
+            instances = _query_archive_instances(archive, sql_filter)
+            if json_output:
+                print(json.dumps(instances, indent=2))
+            else:
+                if not instances:
+                    print("No instances in archive")
+                else:
+                    # Table format
+                    print(f"{'name':<8} {'status':<8} {'directory':<40} transcript")
+                    for inst in instances:
+                        name = inst.get('name', '?')[:8]
+                        status = inst.get('status', '?')[:8]
+                        directory = shorten_path(inst.get('directory', ''))[:40]
+                        transcript = shorten_path(inst.get('transcript_path', ''))
+                        print(f"{name:<8} {status:<8} {directory:<40} {transcript}")
+            return 0
+        except Exception as e:
+            print(format_error(f"Query failed: {e}"), file=sys.stderr)
+            return 1
+
+    # Default: query events
+    try:
+        events = _query_archive_events(archive, sql_filter, last_count)
+        if json_output:
+            print(json.dumps(events, indent=2))
+        else:
+            if not events:
+                print("No events in archive")
+            else:
+                for event in events:
+                    eid = event['id']
+                    ts = event['timestamp'].split('T')[1][:8] if 'T' in event['timestamp'] else event['timestamp']
+                    etype = event['type']
+                    inst = event['instance']
+                    data = event['data']
+
+                    # Format based on event type
+                    if etype == 'message':
+                        text = data.get('text', '')[:60]
+                        if len(data.get('text', '')) > 60:
+                            text += '...'
+                        print(f"#{eid} {ts} {etype:<8} {inst:<8} \"{text}\"")
+                    elif etype == 'status':
+                        status = data.get('status', '?')
+                        ctx = data.get('context', '')
+                        print(f"#{eid} {ts} {etype:<8} {inst:<8} {status} {ctx}")
+                    elif etype == 'life':
+                        action = data.get('action', '?')
+                        by = data.get('by', '')
+                        print(f"#{eid} {ts} {etype:<8} {inst:<8} {action} by:{by}" if by else f"#{eid} {ts} {etype:<8} {inst:<8} {action}")
+                    else:
+                        print(f"#{eid} {ts} {etype:<8} {inst:<8}")
+        return 0
+    except Exception as e:
+        print(format_error(f"Query failed: {e}"), file=sys.stderr)
+        return 1
+
+
 def _print_sh_exports(data: dict, shlex) -> None:
     """Print shell exports for instance data."""
     name = data.get("name", "")
@@ -688,6 +986,7 @@ def cmd_list(argv: list[str]) -> int:
     # Only show connection status for actual instances (not CLI/fallback)
     show_connection = current_name != SENDER
     current_enabled = False
+    current_data = None
     if show_connection:
         current_data = load_instance_position(current_name)
         current_enabled = current_data.get('enabled', False) if current_data else False
@@ -723,10 +1022,11 @@ def cmd_list(argv: list[str]) -> int:
         print(json.dumps(self_payload))
 
         for data in sorted_instances:
-            name = data['name']
+            # Use full display name ({tag}-{name} or {name})
+            full_name = get_full_name(data)
             enabled, status, age_str, description, age_seconds = get_instance_status(data)
             payload = {
-                name: {
+                full_name: {
                     "hcom_connected": enabled,
                     "status": status,
                     "status_context": data.get("status_context", ""),
@@ -743,12 +1043,16 @@ def cmd_list(argv: list[str]) -> int:
                     "transcript_path": data.get("transcript_path") or None,
                     "created_at": data.get("created_at"),
                     "tcp_mode": bool(data.get("tcp_mode", False)),
+                    "tag": data.get("tag") or None,
+                    "base_name": data['name'],  # Include base name for clarity
                 }
             }
             print(json.dumps(payload))
     else:
         # Human-readable - show header with name and read receipts
-        print(f"Your name: {current_name}")
+        # Use full display name (with tag prefix if set)
+        display_name = get_full_name(current_data) if current_data else current_name
+        print(f"Your name: {display_name}")
 
         # Show connection status only for actual instances (not bigboss)
         if show_connection:
@@ -774,7 +1078,8 @@ def cmd_list(argv: list[str]) -> int:
         print()
 
         for data in sorted_instances:
-            name = data['name']
+            # Use full display name ({tag}-{name} or {name})
+            name = get_full_name(data)
             enabled, status, age_str, description, age_seconds = get_instance_status(data)
             icon = STATUS_ICONS.get(status, '◦')
             state = "+" if enabled else "-"
@@ -890,31 +1195,31 @@ def cmd_list(argv: list[str]) -> int:
         if not verbose_output and stopped_count > 0:
             print(f"\n({stopped_count} stopped instance{'s' if stopped_count != 1 else ''} hidden, use -v to show all)")
 
+        # If no instances at all, hint about archives
+        total_instances = db.execute("SELECT COUNT(*) FROM instances").fetchone()[0]
+        if total_instances == 0:
+            archive_dir = hcom_path(ARCHIVE_DIR)
+            if archive_dir.exists():
+                archive_count = len(list(archive_dir.glob('session-*')))
+                if archive_count > 0:
+                    print(f"({archive_count} archived session{'s' if archive_count != 1 else ''} - run: hcom archive)")
+
     return 0
 
 
 def clear() -> int:
     """Clear and archive conversation"""
-    from ..core.db import DB_FILE, close_db, get_db
+    from ..core.db import DB_FILE, close_db, get_db, archive_db
 
     db_file = hcom_path(DB_FILE)
-    db_wal = hcom_path(f'{DB_FILE}-wal')
-    db_shm = hcom_path(f'{DB_FILE}-shm')
 
-    # cleanup: temp files, old scripts, old background logs
+    # Cleanup: temp files, old scripts, old background logs
     cutoff_time_24h = time.time() - (24 * 60 * 60)  # 24 hours ago
     cutoff_time_30d = time.time() - (30 * 24 * 60 * 60)  # 30 days ago
 
     launch_dir = hcom_path(LAUNCH_DIR)
     if launch_dir.exists():
         for f in launch_dir.glob('*'):
-            if f.is_file() and f.stat().st_mtime < cutoff_time_24h:
-                f.unlink(missing_ok=True)
-
-    # Clean old scripts dir (migration from SCRIPTS_DIR → LAUNCH_DIR rename)
-    old_scripts_dir = hcom_path('.tmp/scripts')
-    if old_scripts_dir.exists():
-        for f in old_scripts_dir.glob('*'):
             if f.is_file() and f.stat().st_mtime < cutoff_time_24h:
                 f.unlink(missing_ok=True)
 
@@ -936,53 +1241,30 @@ def clear() -> int:
         print("No HCOM conversation to clear")
         return 0
 
-    # Archive database if it has content
-    timestamp = get_archive_timestamp()
-    archived = False
-
     try:
-        # Check if DB has content
+        # Check if DB has content worth archiving
         db = get_db()
         event_count = db.execute("SELECT COUNT(*) FROM events").fetchone()[0]
         instance_count = db.execute("SELECT COUNT(*) FROM instances").fetchone()[0]
 
         if event_count > 0 or instance_count > 0:
-            # Create session archive folder with timestamp
-            session_archive = hcom_path(ARCHIVE_DIR, f'session-{timestamp}')
-            session_archive.mkdir(parents=True, exist_ok=True)
-
-            # Checkpoint WAL before archiving (attempts to consolidate WAL into main DB)
-            # Using PASSIVE mode - doesn't force if writers active
-            db.execute("PRAGMA wal_checkpoint(PASSIVE)")
-            db.commit()
-            close_db()
-
-            # Copy all DB files to archive (DB + WAL + SHM)
-            # This preserves WAL data in case checkpoint was incomplete
-            # SQLite can recover from WAL when opening archived DB
-            shutil.copy2(db_file, session_archive / DB_FILE)
-            if db_wal.exists():
-                shutil.copy2(db_wal, session_archive / f'{DB_FILE}-wal')
-            if db_shm.exists():
-                shutil.copy2(db_shm, session_archive / f'{DB_FILE}-shm')
-
-            # Delete main DB and WAL/SHM files
-            db_file.unlink()
-            db_wal.unlink(missing_ok=True)
-            db_shm.unlink(missing_ok=True)
-
-            archived = True
+            # Archive using centralized function
+            archive_path = archive_db("reset")
+            if archive_path:
+                print(f"Archived to {shorten_path(archive_path)}/")
+                print("Started fresh HCOM conversation")
+            else:
+                # archive_db returned None = DB locked (Windows), delete pending
+                print("Archived (original DB locked, will clear on next run)")
         else:
             # Empty DB, just delete
             close_db()
             db_file.unlink()
+            db_wal = hcom_path(f'{DB_FILE}-wal')
+            db_shm = hcom_path(f'{DB_FILE}-shm')
             db_wal.unlink(missing_ok=True)
             db_shm.unlink(missing_ok=True)
-
-        if archived:
-            print(f"Archived to archive/session-{timestamp}/")
-
-        print("Started fresh HCOM conversation")
+            print("Started fresh HCOM conversation")
         return 0
 
     except Exception as e:
@@ -1076,17 +1358,8 @@ def cmd_reset(argv: list[str]) -> int:
     exit_codes.append(clear())
 
     # Log reset event (used for local import filtering + relay to other devices)
-    from ..core.db import log_event, kv_set
-    from ..core.device import get_device_uuid
-    import time as time_module
-    reset_ts = time_module.time()
-    log_event(
-        event_type='life',
-        instance='_device',
-        data={'action': 'reset', 'device': get_device_uuid()}
-    )
-    # Persist reset timestamp in KV for reliable cross-process access
-    kv_set('relay_local_reset_ts', str(reset_ts))
+    from ..core.db import log_reset_event
+    log_reset_event()
 
     # Push reset event to relay server
     try:
@@ -1512,8 +1785,144 @@ def _relay_hf(argv: list[str]) -> int:
     return 0
 
 
-def cmd_config(argv: list[str]) -> int:
-    """Config management: hcom config [key] [value] [--json] [--edit] [--reset]
+def _config_instance(target: str, argv: list[str], json_output: bool, subagent_id: str | None) -> int:
+    """Handle instance-level config via -i <name>
+
+    Supported keys: tag, timeout, hints, subagent_timeout
+    """
+    from .utils import resolve_identity
+    from ..core.instances import load_instance_position, update_instance_position, get_full_name
+
+    # Valid instance-level config keys and their DB column names
+    INSTANCE_CONFIG_KEYS = {
+        'tag': 'tag',
+        'timeout': 'wait_timeout',
+        'hints': 'hints',
+        'subagent_timeout': 'subagent_timeout',
+    }
+
+    # Resolve instance name
+    if target.lower() == 'self':
+        # Resolve current instance identity
+        try:
+            identity = resolve_identity(subagent_id=subagent_id)
+        except Exception as e:
+            print(format_error(f"Cannot resolve identity: {e}"), file=sys.stderr)
+            print("-i self requires running inside a Claude instance", file=sys.stderr)
+            return 1
+        instance_name = identity.name
+    else:
+        instance_name = target
+    instance_data = load_instance_position(instance_name)
+    if not instance_data:
+        print(format_error(f"Instance '{instance_name}' not found"), file=sys.stderr)
+        return 1
+
+    # No key specified: show all instance config
+    if not argv:
+        full_name = get_full_name(instance_data)
+        config = {
+            'name': instance_name,
+            'full_name': full_name,
+            'tag': instance_data.get('tag') or None,
+            'timeout': instance_data.get('wait_timeout'),
+            'hints': instance_data.get('hints') or None,
+            'subagent_timeout': instance_data.get('subagent_timeout'),
+        }
+        if json_output:
+            print(json.dumps(config))
+        else:
+            print(f"Instance: {full_name}")
+            print(f"  tag: {config['tag'] or '(none)'}")
+            print(f"  timeout: {config['timeout']}s")
+            print(f"  hints: {config['hints'] or '(none)'}")
+            print(f"  subagent_timeout: {config['subagent_timeout'] or '(default)'}s")
+        return 0
+
+    key = argv[0].lower()
+    if key not in INSTANCE_CONFIG_KEYS:
+        print(format_error(f"Unknown instance config key: {key}"), file=sys.stderr)
+        print(f"Valid keys: {', '.join(sorted(INSTANCE_CONFIG_KEYS.keys()))}", file=sys.stderr)
+        return 1
+
+    db_column = INSTANCE_CONFIG_KEYS[key]
+
+    # Get value (no second arg)
+    if len(argv) == 1:
+        current_value = instance_data.get(db_column)
+        if json_output:
+            print(json.dumps({key: current_value}))
+        else:
+            if current_value is None:
+                print('(none)')
+            elif key == 'timeout':
+                print(f"{current_value}s")
+            elif key == 'subagent_timeout':
+                print(f"{current_value}s" if current_value else '(default)')
+            else:
+                print(current_value if current_value else '(none)')
+        return 0
+
+    # Set value
+    new_value = ' '.join(argv[1:])  # Allow spaces in hints
+
+    # Validate and convert based on key type
+    if key == 'tag':
+        if new_value and not all(c.isalnum() or c == '-' for c in new_value):
+            print(format_error("Tag must be alphanumeric (hyphens allowed)"), file=sys.stderr)
+            return 1
+        db_value = new_value if new_value else None
+
+    elif key in ('timeout', 'subagent_timeout'):
+        if new_value == '' or new_value.lower() == 'default':
+            db_value = None if key == 'subagent_timeout' else 1800  # timeout has a default
+        else:
+            try:
+                db_value = int(new_value)
+                if db_value < 0:
+                    raise ValueError("negative")
+            except ValueError:
+                print(format_error(f"{key} must be a positive integer (seconds)"), file=sys.stderr)
+                return 1
+
+    elif key == 'hints':
+        db_value = new_value if new_value else None
+
+    else:
+        db_value = new_value
+
+    # Update in DB
+    update_instance_position(instance_name, {db_column: db_value})
+
+    # Show result
+    new_data = load_instance_position(instance_name)
+    if json_output:
+        print(json.dumps({key: new_data.get(db_column)}))
+    else:
+        if key == 'tag':
+            new_full_name = get_full_name(new_data)
+            if db_value:
+                print(f"Tag set to '{db_value}' - display name is now '{new_full_name}'")
+            else:
+                print(f"Tag cleared - display name is now '{new_full_name}'")
+        elif key == 'timeout':
+            print(f"Timeout set to {db_value}s")
+        elif key == 'subagent_timeout':
+            if db_value:
+                print(f"Subagent timeout set to {db_value}s")
+            else:
+                print("Subagent timeout cleared (using default)")
+        elif key == 'hints':
+            if db_value:
+                print(f"Hints set to: {db_value}")
+            else:
+                print("Hints cleared")
+
+    return 0
+
+
+def cmd_config(argv: list[str], subagent_id: str | None = None) -> int:
+    """Config management: hcom config [key] [value] [--json] [--edit] [--reset] [-i <name>]
 
     Usage:
         hcom config              Show all config (pretty)
@@ -1522,6 +1931,14 @@ def cmd_config(argv: list[str]) -> int:
         hcom config <key> <val>  Set single value
         hcom config --edit       Open in $EDITOR
         hcom config --reset      Reset config to defaults
+
+    Instance-level settings (-i <name>):
+        hcom config -i <name>                 Show instance settings
+        hcom config -i <name> tag <value>     Set instance tag (changes display name)
+        hcom config -i <name> timeout <secs>  Set instance timeout
+        hcom config -i <name> hints <text>    Set instance hints (injected with messages)
+        hcom config -i <name> <key> ""        Clear setting
+        hcom config -i self ...               Current instance (requires Claude context)
     """
     import os
     import subprocess
@@ -1529,6 +1946,7 @@ def cmd_config(argv: list[str]) -> int:
         load_config_snapshot, save_config_snapshot,
         hcom_config_to_dict, dict_to_hcom_config,
         HcomConfigError, KNOWN_CONFIG_KEYS, DEFAULT_KNOWN_VALUES,
+        get_config_sources,
     )
     from ..core.paths import hcom_path, CONFIG_FILE
     from .utils import validate_flags
@@ -1543,6 +1961,20 @@ def cmd_config(argv: list[str]) -> int:
     edit_mode = '--edit' in argv
     reset_mode = '--reset' in argv
     argv = [a for a in argv if a not in ('--json', '--edit', '--reset')]
+
+    # Parse -i <name> for instance-level config
+    instance_target = None
+    if '-i' in argv:
+        idx = argv.index('-i')
+        if idx + 1 >= len(argv):
+            print(format_error("-i requires instance name (or 'self')"), file=sys.stderr)
+            return 1
+        instance_target = argv[idx + 1]
+        argv = argv[:idx] + argv[idx + 2:]
+
+    # Handle instance-level config
+    if instance_target is not None:
+        return _config_instance(instance_target, argv, json_output, subagent_id)
 
     config_path = hcom_path(CONFIG_FILE)
 
@@ -1571,34 +2003,75 @@ def cmd_config(argv: list[str]) -> int:
 
     # Load current config
     snapshot = load_config_snapshot()
-    core_dict = hcom_config_to_dict(snapshot.core)
+    # Get effective config (includes env overrides) for display
+    from ..core.config import HcomConfig
+    effective_config = HcomConfig.load()
+    effective_dict = hcom_config_to_dict(effective_config)
 
     # No args: show all
     if not argv:
         if json_output:
-            # JSON output: core + extras (mask sensitive values)
-            output = {**core_dict, **snapshot.extras}
+            # JSON output: effective values + extras (mask sensitive values)
+            output = {**effective_dict, **snapshot.extras}
             if output.get('HCOM_RELAY_TOKEN'):
                 v = output['HCOM_RELAY_TOKEN']
                 output['HCOM_RELAY_TOKEN'] = f"{v[:4]}***" if len(v) > 4 else "***"
             print(json.dumps(output, indent=2))
         else:
-            # Pretty output
+            # Pretty output with source indicators
+            sources = get_config_sources()
             print(f"Config: {config_path}\n")
 
-            # Core hcom settings
+            # Check for runtime overrides (instance-level settings from DB)
+            # Mapping: DB column -> config key
+            RUNTIME_KEYS = {
+                'tag': 'HCOM_TAG',
+                'wait_timeout': 'HCOM_TIMEOUT',
+                'hints': 'HCOM_HINTS',
+                'subagent_timeout': 'HCOM_SUBAGENT_TIMEOUT',
+            }
+            runtime_overrides = {}
+            instance_name = None
+            from .utils import resolve_identity
+            from ..core.instances import load_instance_position
+            try:
+                identity = resolve_identity(subagent_id=subagent_id)
+                instance_name = identity.name
+                instance_data = load_instance_position(instance_name)
+                if instance_data:
+                    for db_col, config_key in RUNTIME_KEYS.items():
+                        val = instance_data.get(db_col)
+                        global_val = effective_dict.get(config_key, '')
+                        # Only mark as runtime if different from global
+                        if val is not None and str(val) != str(global_val):
+                            runtime_overrides[config_key] = str(val)
+            except Exception:
+                pass  # Not in Claude context, no runtime overrides
+
+            # Source legend
+            SOURCE_LABELS = {'env': '[env]', 'file': '[file]', 'default': '', 'runtime': '[runtime]'}
+
+            # Core hcom settings (show effective values)
             print("hcom Settings:")
             for key in KNOWN_CONFIG_KEYS:
-                value = core_dict.get(key, '')
-                default = DEFAULT_KNOWN_VALUES.get(key, '')
-                is_default = (value == default) or (not value and not default)
-                marker = "" if is_default else " *"
+                # Check runtime override first
+                if key in runtime_overrides:
+                    value = runtime_overrides[key]
+                    source_label = '[runtime]'
+                else:
+                    value = effective_dict.get(key, '')
+                    source = sources.get(key, 'default')
+                    source_label = SOURCE_LABELS.get(source, '')
                 # Mask sensitive values, truncate long values
                 if key == 'HCOM_RELAY_TOKEN' and value:
                     display_val = f"{value[:4]}***" if len(value) > 4 else "***"
                 else:
                     display_val = value if len(value) <= 60 else value[:57] + "..."
-                print(f"  {key}={display_val}{marker}")
+                # Right-align source label
+                if source_label:
+                    print(f"  {key}={display_val}  {source_label}")
+                else:
+                    print(f"  {key}={display_val}")
 
             # Extra env vars
             if snapshot.extras:
@@ -1606,11 +2079,16 @@ def cmd_config(argv: list[str]) -> int:
                 for key in sorted(snapshot.extras.keys()):
                     value = snapshot.extras[key]
                     display_val = value if len(value) <= 60 else value[:57] + "..."
-                    print(f"  {key}={display_val}")
+                    # Check if from env or file
+                    src = '[env]' if key in os.environ else '[file]'
+                    print(f"  {key}={display_val}  {src}")
 
-            print("\n* = modified from default")
+            print("\n[env] = environment, [file] = config.env, [runtime] = instance override, (blank) = default")
             print("\nEdit: hcom config --edit")
         return 0
+
+    # Get file-based config dict for get/set operations
+    core_dict = hcom_config_to_dict(snapshot.core)
 
     # Single arg: get value
     if len(argv) == 1:
@@ -1676,17 +2154,30 @@ def cmd_config(argv: list[str]) -> int:
     return 0
 
 
-def cmd_thread(argv: list[str]) -> int:
-    """Get conversation thread: hcom thread [@instance] [--last N] [--json] [--full] [--detailed]"""
+def cmd_transcript(argv: list[str]) -> int:
+    """Get conversation transcript: hcom transcript [@instance] [N | N-M] [--json] [--full] [--detailed]"""
     from .utils import resolve_identity, validate_flags
     from ..core.instances import load_instance_position
-    from ..core.thread import get_thread, format_thread, format_thread_detailed
+    from ..core.transcript import get_thread, format_thread, format_thread_detailed
     from ..core.db import get_db
+    import re
 
     # Validate flags
-    if error := validate_flags('thread', argv):
+    if error := validate_flags('transcript', argv):
         print(format_error(error), file=sys.stderr)
         return 1
+
+    def parse_position_or_range(arg: str) -> tuple[int, int] | None:
+        """Parse 'N' or 'N-M' into (start, end) tuple, or None if not a position."""
+        # Single position: just a number
+        if re.match(r'^\d+$', arg):
+            pos = int(arg)
+            return (pos, pos)
+        # Range: N-M
+        match = re.match(r'^(\d+)-(\d+)$', arg)
+        if match:
+            return (int(match.group(1)), int(match.group(2)))
+        return None
 
     # Parse arguments
     target = None
@@ -1713,26 +2204,35 @@ def cmd_thread(argv: list[str]) -> int:
                 print("Error: --last requires a number", file=sys.stderr)
                 return 1
         elif arg == '--range' and i + 1 < len(argv):
-            try:
-                parts = argv[i + 1].split('-')
-                if len(parts) != 2:
-                    raise ValueError("need two parts")
-                start, end = int(parts[0]), int(parts[1])
-                if start < 1 or end < 1:
-                    print("Error: --range values must be >= 1 (e.g. --range 5-10)", file=sys.stderr)
-                    return 1
-                if start > end:
-                    print("Error: --range start must be <= end (e.g. --range 5-10)", file=sys.stderr)
-                    return 1
-                range_tuple = (start, end)
-                i += 1
-            except (ValueError, IndexError):
-                print("Error: --range requires N-M format (e.g. --range 5-10)", file=sys.stderr)
+            parsed = parse_position_or_range(argv[i + 1])
+            if not parsed:
+                print("Error: --range requires N or N-M format (e.g. --range 5 or --range 5-10)", file=sys.stderr)
                 return 1
+            start, end = parsed
+            if start < 1 or end < 1:
+                print("Error: positions must be >= 1", file=sys.stderr)
+                return 1
+            if start > end:
+                print("Error: range start must be <= end", file=sys.stderr)
+                return 1
+            range_tuple = (start, end)
+            i += 1
         elif arg.startswith('@'):
             target = arg[1:]  # Strip @
         elif not arg.startswith('-'):
-            target = arg
+            # Check if it's a position/range first
+            parsed = parse_position_or_range(arg)
+            if parsed:
+                start, end = parsed
+                if start < 1 or end < 1:
+                    print("Error: positions must be >= 1", file=sys.stderr)
+                    return 1
+                if start > end:
+                    print("Error: range start must be <= end", file=sys.stderr)
+                    return 1
+                range_tuple = (start, end)
+            else:
+                target = arg
         i += 1
 
     # Resolve target instance
@@ -1763,13 +2263,13 @@ def cmd_thread(argv: list[str]) -> int:
             instance_name = identity.name
         except ValueError as e:
             from .utils import get_command_help
-            print(get_command_help('thread'), file=sys.stderr)
+            print(get_command_help('transcript'), file=sys.stderr)
             return 1
 
         data = load_instance_position(instance_name)
         if not data:
             print("Error: hcom not started for this session", file=sys.stderr)
-            print("Run 'hcom start' first, or use 'hcom thread @target'", file=sys.stderr)
+            print("Run 'hcom start' first, or use 'hcom transcript @target'", file=sys.stderr)
             return 1
 
         transcript_path = data.get('transcript_path', '')

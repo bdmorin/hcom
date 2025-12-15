@@ -74,7 +74,7 @@ def update_instance_position(instance_name: str, update_fields: dict[str, Any]) 
         update_copy = update_fields.copy()
         for bool_field in ['enabled', 'tcp_mode', 'background',
                            'name_announced', 'launch_context_announced',
-                           'external_stop_pending', 'session_ended']:
+                           'stop_pending', 'stop_notified', 'session_ended']:
             if bool_field in update_copy and isinstance(update_copy[bool_field], bool):
                 update_copy[bool_field] = int(update_copy[bool_field])
 
@@ -375,16 +375,15 @@ def hash_to_name(input_str: str, collision_attempt: int = 0) -> str:
     return f"{word}{suffix}"
 
 
-def get_display_name(session_id: str | None, tag: str | None = None, collision_attempt: int = 0) -> str:
-    """Get display name for instance using session_id deterministically.
+def get_base_name(session_id: str | None, collision_attempt: int = 0) -> str:
+    """Get base name for instance using session_id deterministically.
 
     Args:
         session_id: Session ID to hash (required)
-        tag: Optional tag prefix
         collision_attempt: Collision counter for race resolution (default 0)
 
     Returns:
-        Generated name (may already exist in DB - caller must check)
+        Generated base name (may already exist in DB - caller must check)
     """
     if not session_id:
         raise ValueError("session_id required for instance naming")
@@ -397,23 +396,57 @@ def get_display_name(session_id: str | None, tag: str | None = None, collision_a
         collision_word = NAME_WORDS[collision_hash % len(NAME_WORDS)]
         base_name = f"{base_name}{collision_word}"
 
-    # Add tag prefix if provided (config validation ensures tag is safe)
-    if tag:
-        return f"{tag}-{base_name}"
-
     return base_name
+
+
+def get_full_name(instance_data: dict[str, Any] | None) -> str:
+    """Get full display name from instance data.
+
+    Returns:
+        '{tag}-{name}' if tag exists, else just '{name}'
+
+    Handles legacy migration: if name already starts with '{tag}-',
+    don't duplicate the prefix (old instances stored full name in name field).
+    """
+    if not instance_data:
+        return ''
+    name = instance_data.get('name', '')
+    tag = instance_data.get('tag')
+    if tag:
+        # Legacy check: if name already has tag prefix, return as-is
+        prefix = f"{tag}-"
+        if name.startswith(prefix):
+            return name  # Already full name (legacy format)
+        return f"{tag}-{name}"
+    return name
+
+
+def get_display_name(session_id: str | None, tag: str | None = None, collision_attempt: int = 0) -> str:
+    """DEPRECATED: Use get_base_name() + get_full_name() instead.
+
+    For backwards compatibility, still returns {tag}-{base} format.
+    New code should use get_base_name() for the PK and get_full_name() for display.
+    """
+    base = get_base_name(session_id, collision_attempt)
+    if tag:
+        return f"{tag}-{base}"
+    return base
 
 def resolve_instance_name(session_id: str, tag: str | None = None) -> tuple[str, dict | None]:
     """
-    Resolve instance name for a session_id with hash collision handling.
-    Searches existing instances first (reuses if found), generates new name if not found.
+    Resolve instance name (base name) for a session_id with hash collision handling.
+    Searches existing instances first (reuses if found), generates new base name if not found.
+
+    The returned name is the BASE name (e.g., 'alice'), not the full display name.
+    Tag is stored separately in the instance record and can be changed at runtime.
+    Use get_full_name(instance_data) to get '{tag}-{name}' for display.
 
     Hash collision handling:
     - Deterministic hash may generate same name for different session_ids (~1/1000 probability)
     - Retry with collision_attempt counter (preserves session_id → name mapping)
     - DB UNIQUE constraint provides paranoid safety net for TOCTOU (astronomically rare)
 
-    Returns: (instance_name, existing_data_or_none)
+    Returns: (base_name, existing_data_or_none)
     """
     from .db import find_instance_by_session, get_instance
 
@@ -424,11 +457,11 @@ def resolve_instance_name(session_id: str, tag: str | None = None) -> tuple[str,
             data = get_instance(existing_name)
             return existing_name, data
 
-    # Not found - generate new name with hash collision retry
+    # Not found - generate new BASE name (no tag prefix) with hash collision retry
     max_retries = 100
     for attempt in range(max_retries):
-        # Increment collision_attempt to generate different name variant (preserves session_id identity)
-        instance_name = get_display_name(session_id, tag, collision_attempt=attempt)
+        # Generate base name only - tag stored separately in DB
+        instance_name = get_base_name(session_id, collision_attempt=attempt)
 
         # Check if name already exists in DB
         existing = get_instance(instance_name)
@@ -523,6 +556,17 @@ def initialize_instance_in_position_file(instance_name: str, session_id: str | N
             "status_context": "new"
         }
 
+        # Initialize tag for Claude instances/subagents (external senders should remain untagged)
+        # Tag can be changed later via `hcom config -i self tag`.
+        if session_id or mapid or parent_session_id:
+            try:
+                from .config import get_config
+                tag = get_config().tag
+                if tag:
+                    data["tag"] = tag
+            except Exception:
+                pass
+
         # Add parent_session_id and parent_name for subagents
         if parent_session_id:
             data["parent_session_id"] = parent_session_id
@@ -573,7 +617,9 @@ def enable_instance(instance_name: str, initiated_by: str = 'unknown', reason: s
         reason: Context (e.g., 'manual', 'resume', 'launch')
     """
     update_instance_position(instance_name, {
-        'enabled': True
+        'enabled': True,
+        'stop_pending': False,
+        'stop_notified': False,
     })
     # Log all enable operations
     try:
@@ -594,11 +640,15 @@ __all__ = [
     'update_instance_position',
     'is_parent_instance',
     'is_subagent_instance',
+    'is_remote_instance',
+    'is_external_sender',
     'get_instance_status',
     'get_status_description',
     'set_status',
     # Identity management
-    'get_display_name',
+    'get_base_name',
+    'get_full_name',
+    'get_display_name',  # Deprecated - use get_base_name + get_full_name
     'resolve_instance_name',
     'initialize_instance_in_position_file',
     'enable_instance',

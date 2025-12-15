@@ -232,6 +232,22 @@ class HcomConfig:
         return cls(**data)  # Validation happens in __post_init__
 
 
+def get_config_sources() -> dict[str, str]:
+    """Get source of each config value: 'env', 'file', or 'default'."""
+    config_path = hcom_path(CONFIG_FILE, ensure_parent=True)
+    file_config = parse_env_file(config_path) if config_path.exists() else {}
+
+    sources = {}
+    for key in KNOWN_CONFIG_KEYS:
+        if key in os.environ:
+            sources[key] = 'env'
+        elif key in file_config:
+            sources[key] = 'file'
+        else:
+            sources[key] = 'default'
+    return sources
+
+
 # ==================== Config Snapshot ====================
 
 @dataclass

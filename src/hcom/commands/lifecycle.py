@@ -2,8 +2,6 @@
 import os
 import sys
 import time
-import random
-import uuid
 from pathlib import Path
 from .utils import CLIError, format_error, is_interactive, resolve_identity, validate_flags
 from ..shared import FG_YELLOW, RESET, IS_WINDOWS
@@ -19,19 +17,17 @@ from ..core.instances import (
 )
 from ..hooks.subagent import in_subagent_context
 from ..core.db import iter_instances
-from ..core.runtime import build_claude_env
 from ..hooks.utils import disable_instance
 
 
 def cmd_launch(argv: list[str]) -> int:
     """Launch Claude instances: hcom [N] [claude] [args]"""
-    # Import from terminal module
-    from ..terminal import build_claude_command, launch_terminal
+    from ..core.ops import op_launch
+    from ..shared import HcomError
 
     try:
         # Parse arguments: hcom [N] [claude] [args]
         count = 1
-        forwarded = []
 
         # Extract count if first arg is digit
         if argv and argv[0].isdigit():
@@ -56,8 +52,6 @@ def cmd_launch(argv: list[str]) -> int:
 
         # Get tag from config
         tag = get_config().tag
-        if tag and '|' in tag:
-            raise CLIError('Tag cannot contain "|" characters.')
 
         # Phase 1: Parse and merge Claude args (env + CLI with CLI precedence)
         env_spec = resolve_claude_args(None, get_config().claude_args)
@@ -83,138 +77,57 @@ def cmd_launch(argv: list[str]) -> int:
 
         # Extract values from spec
         background = spec.is_background
-        # Use full tokens (prompts included) - respects user's HCOM_CLAUDE_ARGS config
         claude_args = spec.rebuild_tokens(include_system=True)
 
-        terminal_mode = get_config().terminal
-
-        # Fail fast for here mode with multiple instances
-        if terminal_mode == 'here' and count > 1:
-            print(format_error(
-                f"'here' mode cannot launch {count} instances (it's one terminal window)",
-                "Use 'hcom 1' for one instance"
-            ), file=sys.stderr)
-            return 1
-
-        # Initialize database if needed
-        from ..core.db import init_db
-        init_db()
-
-        # Check if launcher instance is enabled (for ready notification)
+        # Resolve launcher identity
         launcher = resolve_identity().name
         launcher_data = load_instance_position(launcher)
         launcher_enabled = launcher_data.get('enabled', False) if launcher_data else False
 
-        # Build environment variables for Claude instances
-        base_env = build_claude_env()
+        # Call op_launch
+        result = op_launch(
+            count,
+            claude_args,
+            launcher=launcher,
+            tag=tag,
+            background=background,
+            cwd=os.getcwd(),
+        )
 
-        # Add tag-specific hints if provided
-        if tag:
-            base_env['HCOM_TAG'] = tag
+        launched = result["launched"]
+        failed = result["failed"]
+        batch_id = result["batch_id"]
 
-        launched = 0
-
-        # Generate batch ID for notification correlation (8 chars - first UUID segment)
-        batch_id = str(uuid.uuid4()).split('-')[0]
-
-        # Build claude command once (all args passed through to claude CLI)
-        claude_cmd = build_claude_command(claude_args)
-
-        # Launch count instances
-        for _ in range(count):
-            instance_env = base_env.copy()
-
-            # Generate unique launch token for Windows identity
-            launch_token = str(uuid.uuid4())
-            instance_env['HCOM_LAUNCH_TOKEN'] = launch_token
-
-            # Mark all hcom-launched instances with event ID
-            instance_env['HCOM_LAUNCHED'] = '1'
-
-            # Capture launch event ID for consistent message history start
-            from ..core.db import get_last_event_id
-            instance_env['HCOM_LAUNCH_EVENT_ID'] = str(get_last_event_id())
-
-            # Track who launched this instance (use the one we already resolved)
-            instance_env['HCOM_LAUNCHED_BY'] = launcher
-
-            # Track batch for notification correlation
-            instance_env['HCOM_LAUNCH_BATCH_ID'] = batch_id
-
-            # Mark background instances via environment with log filename
-            if background:
-                # Generate unique log filename
-                log_filename = f'background_{int(time.time())}_{random.randint(1000, 9999)}.log'
-                instance_env['HCOM_BACKGROUND'] = log_filename
-
-            try:
-                if background:
-                    log_file = launch_terminal(claude_cmd, instance_env, cwd=os.getcwd(), background=True)
-                    if log_file:
-                        print(f"Headless instance launched, log: {log_file}")
-                        launched += 1
-                else:
-                    if launch_terminal(claude_cmd, instance_env, cwd=os.getcwd()):
-                        launched += 1
-            except Exception as e:
-                print(format_error(f"Failed to launch terminal: {e}"), file=sys.stderr)
-
-        requested = count
-        failed = requested - launched
-
-        if launched == 0:
-            print(format_error(f"No instances launched (0/{requested})"), file=sys.stderr)
-            return 1
+        # Print background log files
+        for log_file in result.get("log_files", []):
+            print(f"Headless instance launched, log: {log_file}")
 
         # Show results
         if failed > 0:
-            print(f"Launched {launched}/{requested} Claude instance{'s' if requested != 1 else ''} ({failed} failed)")
+            print(f"Launched {launched}/{count} Claude instance{'s' if count != 1 else ''} ({failed} failed)")
         else:
             print(f"Launched {launched} Claude instance{'s' if launched != 1 else ''}")
 
         print(f"Batch id: {batch_id}")
         print(f"Check status of launch + block until instance{'s are' if launched != 1 else 'is'} ready: hcom events launch")
 
-        # Log launch event
-        if launched > 0:
-            try:
-                from ..core.db import log_event
-                launcher = resolve_identity().name
-                log_event('life', launcher, {
-                    'action': 'launched',
-                    'by': launcher,
-                    'batch_id': batch_id,
-                    'count_requested': count,
-                    'launched': launched,
-                    'failed': failed,
-                    'background': background,
-                    'tag': tag or ''
-                })
-            except Exception:
-                pass  # Don't break launch if logging fails
-
-        # Auto-launch watch dashboard if in new window mode (new or custom) and all instances launched successfully
+        # Auto-launch watch dashboard if in new window mode and all instances launched successfully
         terminal_mode = get_config().terminal
 
-        # Only auto-watch if ALL instances launched successfully and launches windows (not 'here' or 'print') and not disabled by TUI
         if terminal_mode not in ('here', 'print') and failed == 0 and is_interactive() and not no_auto_watch:
-            # Show tips first if needed
             if tag:
-                print(f"\n  • Send to {tag} team: hcom send '@{tag} message'")
+                print(f"\n  • Send to {tag} team: hcom send '@{tag}- message'")
 
-            # Clear transition message
             print("\nOpening hcom UI...")
-            time.sleep(2)  # Brief pause so user sees the message
+            time.sleep(2)
 
-            # Launch interactive TUI (same as running bare `hcom`)
-            from ..ui import run_tui  # Local import to avoid circular dependency
+            from ..ui import run_tui
             return run_tui(hcom_path())
         else:
             tips = []
             if tag:
-                tips.append(f"Send to {tag} team: hcom send '@{tag} message'")
+                tips.append(f"Send to {tag} team: hcom send '@{tag}- message'")
 
-            # Add ready detection tip
             if launched > 0:
                 is_claude_code = os.environ.get('CLAUDECODE') == '1'
                 if is_claude_code:
@@ -230,11 +143,11 @@ def cmd_launch(argv: list[str]) -> int:
 
             return 0
 
-    except ValueError as e:
-        print(str(e), file=sys.stderr)
+    except (CLIError, HcomError) as e:
+        print(format_error(str(e)), file=sys.stderr)
         return 1
     except Exception as e:
-        print(str(e), file=sys.stderr)
+        print(format_error(str(e)), file=sys.stderr)
         return 1
 
 
@@ -467,12 +380,13 @@ def cmd_start(argv: list[str]) -> int:
         import time
         from ..core.db import get_last_event_id
         initial_event_id = get_last_event_id() if SKIP_HISTORY else 0
+        parent_tag = parent_data.get('tag') or None
 
         try:
             conn.execute(
-                """INSERT INTO instances (name, session_id, parent_session_id, parent_name, agent_id, enabled, created_at, last_event_id, directory, last_stop)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                (subagent_name, None, parent_session_id, parent_name, agent_id, 1, time.time(), initial_event_id, str(Path.cwd()), 0)
+                """INSERT INTO instances (name, session_id, parent_session_id, parent_name, tag, agent_id, enabled, created_at, last_event_id, directory, last_stop)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (subagent_name, None, parent_session_id, parent_name, parent_tag, agent_id, 1, time.time(), initial_event_id, str(Path.cwd()), 0)
             )
             conn.commit()
         except sqlite3.IntegrityError as e:
@@ -480,9 +394,9 @@ def cmd_start(argv: list[str]) -> int:
             subagent_name = f"{parent_name}_{agent_type}_{max_n + 2}"
             try:
                 conn.execute(
-                    """INSERT INTO instances (name, session_id, parent_session_id, parent_name, agent_id, enabled, created_at, last_event_id, directory, last_stop)
-                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                    (subagent_name, None, parent_session_id, parent_name, agent_id, 1, time.time(), initial_event_id, str(Path.cwd()), 0)
+                    """INSERT INTO instances (name, session_id, parent_session_id, parent_name, tag, agent_id, enabled, created_at, last_event_id, directory, last_stop)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (subagent_name, None, parent_session_id, parent_name, parent_tag, agent_id, 1, time.time(), initial_event_id, str(Path.cwd()), 0)
                 )
                 conn.commit()
             except sqlite3.IntegrityError:

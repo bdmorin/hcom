@@ -22,7 +22,7 @@ from .input import KeyboardInput
 from ..shared import (
     # ANSI codes
     RESET, BOLD, DIM,
-    FG_GREEN, FG_CYAN, FG_WHITE, FG_BLACK, FG_GRAY, FG_YELLOW, FG_RED, FG_ORANGE,
+    FG_GREEN, FG_CYAN, FG_WHITE, FG_BLACK, FG_GRAY, FG_YELLOW, FG_RED, FG_ORANGE, FG_LIGHTGRAY, FG_BLUE,
     BG_ORANGE, BG_CHARCOAL, BG_YELLOW,
     CLEAR_SCREEN, CURSOR_HOME, HIDE_CURSOR, SHOW_CURSOR,
     # Config
@@ -314,23 +314,37 @@ class HcomTUI:
                 instances[data['name']] = data
 
         # Build instance info dict (replace old instances, don't just add)
+        from ..core.instances import get_full_name
+
         new_instances = {}
         for name, data in instances.items():
             enabled, status_type, age_text, description, age_seconds = get_instance_status(data)
 
-            new_instances[name] = {
+            # Compute full display name ({tag}-{name} or just {name})
+            full_name = get_full_name(data)
+
+            new_instances[full_name] = {
                 'enabled': enabled,
                 'status': status_type,
                 'age_text': age_text,
                 'description': description,
                 'age_seconds': age_seconds,
                 'data': data,
+                'base_name': name,  # Keep base name for DB lookups
             }
 
         self.state.instances = new_instances
         # Status counts only for enabled instances (header shows active participants)
         enabled_instances = {k: v for k, v in self.state.instances.items() if v.get('enabled', False)}
         self.state.status_counts = get_status_counts(enabled_instances)
+
+        # Load archive count (shown when no instances)
+        from ..core.paths import hcom_path, ARCHIVE_DIR
+        archive_dir = hcom_path(ARCHIVE_DIR)
+        if archive_dir.exists():
+            self.state.archive_count = len(list(archive_dir.glob('session-*')))
+        else:
+            self.state.archive_count = 0
 
         # Load launch status (for banner) - aggregates all pending batches
         try:
@@ -1038,11 +1052,46 @@ class HcomTUI:
         type_label = type_labels.get(event_type, event_type)
 
         if event_type == 'message':
-            # Format: time name [message]\ncontent
+            # Format: time name [envelope]\ncontent
+            # Envelope: [intent→thread ↩reply_to] or [message] if no envelope
             sender = data.get('from', '?')
             message = data.get('text', '')
             display_time = format_timestamp(timestamp)
-            print(f"{DIM}{FG_GRAY}{display_time}{RESET} {BOLD}{FG_ORANGE}{sender}{RESET} {FG_GRAY}[{type_label}]{RESET}")
+
+            # Build envelope label from intent/thread/reply_to
+            intent = data.get('intent')
+            thread = data.get('thread')
+            reply_to = data.get('reply_to')
+
+            if intent or thread or reply_to:
+                # Intent colors (the main semantic signal)
+                intent_colors = {
+                    'request': FG_ORANGE,
+                    'inform': FG_LIGHTGRAY,
+                    'ack': FG_GREEN,
+                    'error': FG_RED,
+                }
+                intent_color = intent_colors.get(intent, FG_GRAY)
+
+                # Build parts with visual hierarchy:
+                # - Intent: colored and prominent
+                # - Thread: blue (cyan used by status sender)
+                # - Reply_to: dim reference
+                parts = []
+                if intent:
+                    parts.append(f"{intent_color}{intent}{RESET}")
+                if thread:
+                    # Truncate long thread names
+                    t = thread[:12] + '..' if len(thread) > 14 else thread
+                    parts.append(f"{DIM}→ {RESET}{FG_BLUE}{t}{RESET}")
+                if reply_to:
+                    parts.append(f"{DIM}↩ {FG_LIGHTGRAY}{reply_to}{RESET}")
+
+                envelope = f"{DIM}[{RESET}{' '.join(parts)}{DIM}]{RESET}"
+            else:
+                envelope = f"{DIM}[{type_label}]{RESET}"
+
+            print(f"{DIM}{FG_GRAY}{display_time}{RESET} {BOLD}{FG_ORANGE}{sender}{RESET} {envelope}")
             print(message)
             print()  # Empty line between events
 

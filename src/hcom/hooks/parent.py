@@ -71,10 +71,11 @@ def get_real_session_id(hook_data: dict[str, Any], env_file: str | None) -> str:
 
 
 def handle_stop_pending(hook_type: str, hook_data: dict[str, Any], instance_name: str, instance_data: dict[str, Any]) -> None:
-    """Handle status-only updates for external stop pending instances.
+    """Handle status-only updates for stop pending instances.
 
-    Called by dispatcher for disabled instances with external_stop_pending=True.
-    Allows tracking instance activity between external stop and actual session end.
+    Called by dispatcher for disabled instances with stop_pending=True.
+    Allows tracking instance activity between stop and actual session end,
+    and ensures cleanup hooks can set final inactive status.
     """
     tool_name = hook_data.get('tool_name', '')
 
@@ -83,6 +84,9 @@ def handle_stop_pending(hook_type: str, hook_data: dict[str, Any], instance_name
             detail = _extract_tool_detail(tool_name, hook_data.get('tool_input', {}))
             set_status(instance_name, 'active', f'tool:{tool_name}', detail=detail)
         case 'post':
+            # External stop notification (when disabled, hooks still run via stop_pending path)
+            if output := check_external_stop_notification(instance_name, instance_data):
+                print(json.dumps(output, ensure_ascii=False))
             if instance_data.get('status') == 'blocked':
                 set_status(instance_name, 'active', f'approved:{tool_name}')
         case 'notify':
@@ -94,7 +98,7 @@ def handle_stop_pending(hook_type: str, hook_data: dict[str, Any], instance_name
             stop(instance_name, instance_data)
         case 'sessionend':
             set_status(instance_name, 'inactive', f'exit:{hook_data.get("reason", "unknown")}')
-            update_instance_position(instance_name, {'session_ended': True, 'external_stop_pending': False})
+            update_instance_position(instance_name, {'session_ended': True, 'stop_pending': False, 'stop_notified': False})
             notify_instance(instance_name)
 
 

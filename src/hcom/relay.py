@@ -408,7 +408,12 @@ def _apply_remote_devices(devices: dict[str, dict], own_device: str) -> None:
             if event.get('instance') == '_device':
                 continue
 
-            event_id = event.get('id', 0)
+            raw_event_id = event.get('id', 0)
+            try:
+                event_id = int(raw_event_id)
+            except (TypeError, ValueError):
+                _log('BAD_EVENT_ID', f'device={short_id}', raw=raw_event_id)
+                continue
             if event_id <= last_event_id:
                 continue  # Already have this event
 
@@ -439,7 +444,8 @@ def _apply_remote_devices(devices: dict[str, dict], own_device: str) -> None:
                     for name in data['delivered_to']
                 ]
 
-            data['_relay'] = {'device': device_id}
+            # Store relay origin for cross-device reply_to resolution
+            data['_relay'] = {'device': device_id, 'short': short_id, 'id': event_id}
 
             log_event(
                 event_type=event.get('type', 'unknown'),

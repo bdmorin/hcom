@@ -21,13 +21,35 @@ def check_external_stop_notification(instance_name: str, instance_data: dict[str
 
     Returns hook output dict or None.
     """
-    if not instance_data or not instance_data.get('external_stop_pending'):
+    if not instance_data or not instance_data.get('stop_pending'):
         return None
 
-    update_instance_position(instance_name, {'external_stop_pending': False})
+    # Only show for disabled instances; enabled instances shouldn't be in stop_pending mode.
+    if instance_data.get('enabled', False):
+        return None
 
-    # Show notification if instance was stopped externally
+    # One-shot guard: don't repeat notification on every hook.
+    if instance_data.get('stop_notified'):
+        return None
+
+    # Check if this was an external stop (someone else stopped this instance)
+    from ..core.db import get_db
+    conn = get_db()
+    stop_event = conn.execute("""
+        SELECT json_extract(data, '$.by') as stopped_by
+        FROM events
+        WHERE instance = ? AND type = 'life' AND json_extract(data, '$.action') = 'stopped'
+        ORDER BY id DESC LIMIT 1
+    """, (instance_name,)).fetchone()
+
+    is_external = stop_event and stop_event['stopped_by'] != instance_name
+
+    if not is_external:
+        return None  # Self-stop, no notification needed
+
+    # Show notification for external stop
     if not instance_data.get('enabled', False):
+        update_instance_position(instance_name, {'stop_notified': True})
         message = (
             "[HCOM NOTIFICATION]\n"
             "Your HCOM connection has been stopped by an external command.\n"

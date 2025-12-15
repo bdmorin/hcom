@@ -96,7 +96,16 @@ class ManageScreen:
             data = info.get('data', {})
             is_subagent = bool(data.get('parent_session_id'))
             if is_subagent:
-                timeout = get_config().subagent_timeout
+                # Use parent's subagent_timeout if set, else global config
+                parent_name = data.get('parent_name')
+                timeout = None
+                if parent_name:
+                    from ..core.instances import load_instance_position
+                    parent_data = load_instance_position(parent_name)
+                    if parent_data:
+                        timeout = parent_data.get('subagent_timeout')
+                if timeout is None:
+                    timeout = get_config().subagent_timeout
                 remaining = timeout - age_seconds
                 if 0 < remaining < 10:
                     timeout_marker = f" {FG_YELLOW}⏱ {int(remaining)}s{RESET}"
@@ -293,7 +302,10 @@ class ManageScreen:
         if len(enabled_instances) == 0 and stopped_count == 0 and remote_count == 0:
             lines.append('')
             lines.append(f"{FG_GRAY}No instances - Press Tab → LAUNCH{RESET}")
-            lines.append('')
+            if self.state.archive_count > 0:
+                lines.append(f"{FG_GRAY}History: hcom archive{RESET}")
+            else:
+                lines.append('')
             # Pad to instance_rows
             while len(lines) < instance_rows:
                 lines.append('')
@@ -864,23 +876,25 @@ class ManageScreen:
                 # Check if confirming previous toggle
                 if self.state.pending_toggle == name and (time.time() - self.state.pending_toggle_time) <= self.tui.CONFIRMATION_TIMEOUT:
                     # Execute toggle (confirmation received)
+                    # Use base_name for DB operations, display name for UI
+                    base_name = info.get('base_name', name)
                     try:
                         if is_enabled:
                             # DEBUG: Log TUI toggle action
                             from ..hooks.utils import log_hook_error
                             parent_name = info['data'].get('parent_name', 'none')
-                            log_hook_error('tui:toggle_stop', f'TUI calling cmd_stop for {name} (parent={parent_name}, enabled={is_enabled})')
+                            log_hook_error('tui:toggle_stop', f'TUI calling cmd_stop for {base_name} (parent={parent_name}, enabled={is_enabled})')
 
                             # Suppress CLI output to prevent TUI corruption
                             with _suppress_output():
-                                cmd_stop([name])
+                                cmd_stop([base_name])
                             self.tui.flash(f"Stopped hcom for {color}{name}{RESET}")
                             self.state.completed_toggle = name
                             self.state.completed_toggle_time = time.time()
                         else:
                             # Suppress CLI output to prevent TUI corruption
                             with _suppress_output():
-                                cmd_start([name])
+                                cmd_start([base_name])
                             self.tui.flash(f"Started hcom for {color}{name}{RESET}")
                             self.state.completed_toggle = name
                             self.state.completed_toggle_time = time.time()

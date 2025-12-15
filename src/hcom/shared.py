@@ -10,7 +10,7 @@ from pathlib import Path
 from dataclasses import dataclass
 from typing import Literal
 
-__version__ = "0.6.8"
+__version__ = "0.6.9"
 
 # ===== Platform Detection =====
 IS_WINDOWS = sys.platform == 'win32'
@@ -93,6 +93,12 @@ class SenderIdentity:
         from hcom.core.helpers import get_group_session_id
         return get_group_session_id(self.instance_data)
 
+
+class HcomError(Exception):
+    """HCOM operation failed."""
+    pass
+
+
 # ===== Hook Constants =====
 # Stop hook polling interval
 STOP_HOOK_POLL_INTERVAL = 0.1  # 100ms between stop hook polls
@@ -109,12 +115,12 @@ HCOM_INVOCATION_PATTERN = r'(?:uvx\s+)?hcom|python3?\s+-m\s+hcom|(?:python3?\s+)
 # - hcom events (with optional --last, --wait, --sql, --agentid)
 # - hcom relay (with optional pull, hf)
 # - hcom config (any args)
-# - hcom thread (get conversation context)
+# - hcom transcript (get conversation context)
 # Negative lookahead ensures stop/start not followed by name targets (except approved flags)
 # Allows shell operators (2>&1, >/dev/null, |, &&) but blocks identifier-like targets (myname, 123abc)
 HCOM_COMMAND_PATTERN = re.compile(
     rf'({HCOM_INVOCATION_PATTERN})\s+'
-    r'(?:send\b|stop(?!\s+(?:[a-zA-Z_]|[0-9]+[a-zA-Z_])[-\w]*(?:\s|$))|start(?:\s+--agentid\s+\S+)?(?!\s+(?:[a-zA-Z_]|[0-9]+[a-zA-Z_])[-\w]*(?:\s|$))|(?:help|--help|-h)\b|--new-terminal\b|list(?:\s+(?:self|--(?:agentid|json|verbose|v))\b)*|events\b|relay\b|config\b|thread\b)'
+    r'(?:send\b|stop(?!\s+(?:[a-zA-Z_]|[0-9]+[a-zA-Z_])[-\w]*(?:\s|$))|start(?:\s+--agentid\s+\S+)?(?!\s+(?:[a-zA-Z_]|[0-9]+[a-zA-Z_])[-\w]*(?:\s|$))|(?:help|--help|-h)\b|--new-terminal\b|list(?:\s+(?:self|--(?:agentid|json|verbose|v))\b)*|events\b|relay\b|config\b|transcript\b|archive\b)'
 )
 
 # ===== Core ANSI Codes =====
@@ -400,6 +406,8 @@ from .claude_args import (  # noqa: E402
 __all__ = [
     # Message identity
     'SenderIdentity',
+    # Exceptions
+    'HcomError',
     # Re-exported from claude_args (backward compatibility for ui.py)
     'ClaudeArgsSpec',
     'resolve_claude_args',
