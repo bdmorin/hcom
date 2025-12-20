@@ -485,6 +485,25 @@ def get_last_event_id() -> int:
     result = cursor.fetchone()[0]
     return result if result is not None else 0
 
+
+def get_last_stop_event(instance_name: str) -> dict[str, Any] | None:
+    """Get the last stop event for an instance.
+
+    Returns:
+        Dict with 'stopped_by' and 'reason', or None if no stop event found
+    """
+    conn = get_db()
+    row = conn.execute("""
+        SELECT json_extract(data, '$.by') as stopped_by,
+               json_extract(data, '$.reason') as reason
+        FROM events
+        WHERE instance = ? AND type = 'life'
+          AND json_extract(data, '$.action') = 'stopped'
+        ORDER BY id DESC LIMIT 1
+    """, (instance_name,)).fetchone()
+    return dict(row) if row else None
+
+
 # ==================== Instance Operations ====================
 
 def get_instance(name: str) -> dict[str, Any] | None:

@@ -730,14 +730,23 @@ class HcomTUI:
                     self.state.frame_dirty = True
                 if current_max_id != self.state.last_event_id:
                     events = get_events_since(self.state.last_event_id, event_type='message')
+                    from ..core.instances import get_full_name, load_instance_position
                     new_messages = []
                     for e in events:
                         event_data = e['data']  # Already a dict from db.py
-                        # Include delivered_to and event_id for read receipt tracking
-                        delivered_to = event_data.get('delivered_to', [])
+                        # Convert sender base name to full display name
+                        sender_base = event_data.get('from', '')
+                        sender_data = load_instance_position(sender_base) if sender_base else None
+                        sender_display = get_full_name(sender_data) or sender_base
+                        # Convert recipient base names to full display names
+                        delivered_to_base = event_data.get('delivered_to', [])
+                        delivered_to = []
+                        for r_base in delivered_to_base:
+                            r_data = load_instance_position(r_base)
+                            delivered_to.append(get_full_name(r_data) or r_base)
                         new_messages.append((
                             e['timestamp'],
-                            event_data.get('from', ''),
+                            sender_display,
                             event_data.get('text', ''),
                             delivered_to,
                             e['id']  # event_id for read receipt lookup

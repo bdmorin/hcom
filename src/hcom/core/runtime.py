@@ -116,7 +116,7 @@ The user will see 'running stop hook' in the status bar - tell them that's norma
         launcher = os.environ.get('HCOM_LAUNCHED_BY', 'unknown')
         launched_notice = f"""NOTE:
 - You were launched via hcom by '{launcher}'.
-- HCOM is auto-enabled - assume primary communication method is hcom
+- HCOM is auto-enabled - assume primary communication method is hcom and respond via hcom send
 """
 
     config_vals = build_claude_env()

@@ -389,11 +389,14 @@ def main(argv: list[str] | None = None) -> int | None:
         print(msg, file=sys.stderr)
 
     # Ensure hooks current (warns but never blocks)
-    ensure_hooks_current()
+    # Skip for reset command - it handles hooks itself
+    if not (argv and argv[0] == 'reset'):
+        ensure_hooks_current()
 
     # Subagent context: require --agentid for all commands
     # Both subagents (--agentid <uuid>) and parent (--agentid parent) must identify
-    if argv and '--agentid' not in argv and os.environ.get('CLAUDECODE') == '1':
+    # Skip for version/help flags - they don't need identity
+    if argv and '--agentid' not in argv and argv[0] not in ('-v', '--version', '-h', '--help', 'reset') and os.environ.get('CLAUDECODE') == '1':
         try:
             from .commands.utils import resolve_identity
             from .hooks.subagent import in_subagent_context, cleanup_dead_subagents

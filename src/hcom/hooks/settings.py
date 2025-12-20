@@ -59,13 +59,15 @@ def load_settings_json(settings_path: Path, default: Any = None) -> dict[str, An
         default=default
     )
 
-def _remove_hcom_hooks_from_settings(settings: dict[str, Any]) -> None:
-    """Remove hcom hooks from settings dict"""
+def _remove_hcom_hooks_from_settings(settings: dict[str, Any]) -> bool:
+    """Remove hcom hooks from settings dict. Returns True if any hooks were removed."""
+    removed_any = False
+
     if not isinstance(settings, dict) or 'hooks' not in settings:
-        return
+        return False
 
     if not isinstance(settings['hooks'], dict):
-        return
+        return False
 
     # Check all active hook types for cleanup
     for event in ACTIVE_HOOK_TYPES:
@@ -87,13 +89,18 @@ def _remove_hcom_hooks_from_settings(settings: dict[str, Any]) -> None:
             matcher_copy = copy.deepcopy(matcher)
 
             # Filter out HCOM hooks from this matcher
+            original_hooks = matcher_copy.get('hooks', [])
             non_hcom_hooks = [
-                hook for hook in matcher_copy.get('hooks', [])
+                hook for hook in original_hooks
                 if not any(
                     pattern.search(hook.get('command', ''))
                     for pattern in HCOM_HOOK_PATTERNS
                 )
             ]
+
+            # Track if any hooks were removed
+            if len(non_hcom_hooks) < len(original_hooks):
+                removed_any = True
 
             # Only keep the matcher if it has non-HCOM hooks remaining
             if non_hcom_hooks:
@@ -111,7 +118,11 @@ def _remove_hcom_hooks_from_settings(settings: dict[str, Any]) -> None:
 
     # Remove HCOM from env section
     if 'env' in settings and isinstance(settings['env'], dict):
+        if 'HCOM' in settings['env']:
+            removed_any = True
         settings['env'].pop('HCOM', None)
         # Clean up empty env dict
         if not settings['env']:
             del settings['env']
+
+    return removed_any

@@ -1272,26 +1272,30 @@ def clear() -> int:
         return 1
 
 
-def remove_global_hooks() -> bool:
-    """Remove HCOM hooks from ~/.claude/settings.json"""
+def remove_global_hooks() -> tuple[bool, bool]:
+    """Remove HCOM hooks from ~/.claude/settings.json.
+
+    Returns:
+        (success, had_hooks): success=True if operation succeeded, had_hooks=True if hooks were found
+    """
     from ..hooks.settings import get_claude_settings_path, load_settings_json, _remove_hcom_hooks_from_settings
     from ..core.paths import atomic_write
 
     settings_path = get_claude_settings_path()
 
     if not settings_path.exists():
-        return True
+        return (True, False)  # Success, but no hooks (no settings file)
 
     try:
         settings = load_settings_json(settings_path, default=None)
         if not settings:
-            return False
+            return (False, False)  # Failed to load
 
-        _remove_hcom_hooks_from_settings(settings)
+        had_hooks = _remove_hcom_hooks_from_settings(settings)
         atomic_write(settings_path, json.dumps(settings, indent=2))
-        return True
+        return (True, had_hooks)
     except Exception:
-        return False
+        return (False, False)
 
 
 def reset_config() -> int:
@@ -1343,8 +1347,12 @@ def cmd_reset(argv: list[str]) -> int:
 
     # hooks: just remove hooks and exit
     if target == 'hooks':
-        if remove_global_hooks():
-            print("Removed hooks")
+        success, had_hooks = remove_global_hooks()
+        if success:
+            if had_hooks:
+                print("Removed hooks")
+            else:
+                print("No hooks to remove")
             return 0
         else:
             print("Warning: Could not remove hooks", file=sys.stderr)
@@ -1399,8 +1407,12 @@ def cmd_reset(argv: list[str]) -> int:
             except OSError:
                 pass  # Not empty or other issue
 
-        if remove_global_hooks():
-            print("Removed hooks")
+        success, had_hooks = remove_global_hooks()
+        if success:
+            if had_hooks:
+                print("Removed hooks")
+            else:
+                print("No hooks to remove")
         else:
             print("Warning: Could not remove hooks", file=sys.stderr)
             exit_codes.append(1)

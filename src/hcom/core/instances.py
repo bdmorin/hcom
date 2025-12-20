@@ -402,23 +402,37 @@ def get_base_name(session_id: str | None, collision_attempt: int = 0) -> str:
 def get_full_name(instance_data: dict[str, Any] | None) -> str:
     """Get full display name from instance data.
 
+    Architecture: DB stores base name ('alice') + optional tag ('team').
+    Full name ('team-alice') is computed at display time, not stored.
+    Use this in display/output code. Use base name for DB lookups and routing.
+
     Returns:
         '{tag}-{name}' if tag exists, else just '{name}'
 
-    Handles legacy migration: if name already starts with '{tag}-',
-    don't duplicate the prefix (old instances stored full name in name field).
+    Caches result on dict as '_full_name' for subsequent calls.
     """
     if not instance_data:
         return ''
+
+    # Return cached value if available
+    if '_full_name' in instance_data:
+        return instance_data['_full_name']
+
     name = instance_data.get('name', '')
     tag = instance_data.get('tag')
     if tag:
         # Legacy check: if name already has tag prefix, return as-is
         prefix = f"{tag}-"
         if name.startswith(prefix):
-            return name  # Already full name (legacy format)
-        return f"{tag}-{name}"
-    return name
+            full_name = name  # Already full name (legacy format)
+        else:
+            full_name = f"{tag}-{name}"
+    else:
+        full_name = name
+
+    # Cache on dict (safe - update functions use explicit field dicts)
+    instance_data['_full_name'] = full_name
+    return full_name
 
 
 def get_display_name(session_id: str | None, tag: str | None = None, collision_attempt: int = 0) -> str:

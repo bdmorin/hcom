@@ -69,19 +69,49 @@ hcom send "@backend scale up"       # Message entire backend group
 ```
 
 ### Subagent Communication
-Task tool subagents get their own identities and can talk to each other:
+
+Task tool subagents get their own hcom identities and can message parent/each other:
+
 ```
 Parent: alice
-  ├── alice_reviewer_1  ──┐
-  ├── alice_explorer_1  ──┼── can message each other AND parent
+  ├── alice_explorer_1  ──┐
+  ├── alice_reviewer_1  ──┼── can message each other AND parent
   └── alice_planner_1   ──┘
 ```
-Subagents stay alive after they finish their task (configurable timeout).
-Parents can communicate with subagents when they're in the background.
 
-**Example:** 
+Subagents stay alive after finishing their task (configurable timeout).
+Normal parent Claude can send messages to subagents who are running in the background.
 
-`"Use background task subagents to compare 3 different codebases, have each use hcom to send updates and you send follow-ups via hcom to steer and cross‑question them, then synthesize a final comparison"`
+To enable: tell claude to tell subagents use hcom
+
+**Follow up questions**
+
+Subagent investigates, reads 20 files, reports summary, normally dies.
+
+You or parent claude have a follow-up question. Subagent already knows the answer from those 20 files - but it's dead.
+
+With hcom: subagent stays alive, answers follow-ups in seconds instead of main claude or a new subagent re-investigating.
+
+
+**Guided Multi-Explore Comparison**
+
+Problem: 3 subagents explore 3 repos, each returns independent overview. Different focus areas, no shared baseline - comparison is shallow.
+
+Solution: Parent guides all subagents in real-time with hcom. When one finds something, parent asks others to find the equivalent.
+
+<details>
+<summary>example prompt</summary>
+
+```
+Compare error handling across these 3 repos using background explore subagents.
+Have each hcom start and explore their repo's error handling.
+As they find patterns, have them immediately send each discovery via hcom to you.
+Use their findings to guide the others - when one reports a pattern,
+ask the others to look for the equivalent in their repo.
+Synthesize a comparison from the guided exploration.
+```
+
+</details>
 
 ### External Tools
 Any process can join the conversation:

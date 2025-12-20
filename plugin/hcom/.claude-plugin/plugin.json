@@ -1,0 +1,19 @@
+{
+  "name": "hcom",
+  "version": "1.0.0",
+  "description": "Multi-agent communication for Claude Code - real-time messaging between instances",
+  "author": {
+    "name": "aannoo",
+    "url": "https://github.com/aannoo/claude-hook-comms"
+  },
+  "homepage": "https://github.com/aannoo/claude-hook-comms",
+  "repository": "https://github.com/aannoo/claude-hook-comms",
+  "license": "MIT",
+  "keywords": [
+    "hcom",
+    "multi-agent",
+    "communication",
+    "messaging",
+    "collaboration"
+  ]
+}

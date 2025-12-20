@@ -288,12 +288,14 @@ def send_message(
     ]
 
     # Build event data
+    # Note: 'from' and 'delivered_to' store BASE names for DB consistency.
+    # Display code converts to full names via get_full_name() at render time.
     data = {
-        'from': identity.name,          # Display name for output
+        'from': identity.name,          # Base name (display code converts to full)
         'sender_kind': identity.kind,   # 'external' or 'instance' for filtering
         'scope': scope,                 # Routing scope
         'text': message,
-        'delivered_to': delivered_to,   # Who received (enabled at send time)
+        'delivered_to': delivered_to,   # Base names of recipients
     }
 
     # Add scope extra data (mentions, group_id)
@@ -623,11 +625,18 @@ def format_hook_messages(messages: list[dict[str, str]], instance_name: str) -> 
 
     Format includes envelope info: [intent:thread #id] sender → recipient: text
     """
+    from .instances import get_full_name
+
     def _others_count(msg: dict) -> int:
         """Count other recipients (excluding self)"""
         delivered_to = msg.get('delivered_to', [])
         # Others = total recipients minus self
         return max(0, len(delivered_to) - 1)
+
+    def _get_sender_display_name(sender_base_name: str) -> str:
+        """Get full display name for sender (base name -> tag-base or base)"""
+        sender_data = load_instance_position(sender_base_name)
+        return get_full_name(sender_data) or sender_base_name
 
     if len(messages) == 1:
         msg = messages[0]
@@ -637,7 +646,8 @@ def format_hook_messages(messages: list[dict[str, str]], instance_name: str) -> 
         else:
             recipient = instance_name
         prefix = _build_message_prefix(msg)
-        reason = f"{prefix} {msg['from']} → {recipient}: {msg['message']}"
+        sender_display = _get_sender_display_name(msg['from'])
+        reason = f"{prefix} {sender_display} → {recipient}: {msg['message']}"
     else:
         parts = []
         for msg in messages:
@@ -647,11 +657,11 @@ def format_hook_messages(messages: list[dict[str, str]], instance_name: str) -> 
             else:
                 recipient = instance_name
             prefix = _build_message_prefix(msg)
-            parts.append(f"{prefix} {msg['from']} → {recipient}: {msg['message']}")
+            sender_display = _get_sender_display_name(msg['from'])
+            parts.append(f"{prefix} {sender_display} → {recipient}: {msg['message']}")
         reason = f"[{len(messages)} new messages] | {' | '.join(parts)}"
 
     # Append hints to messages: instance-specific first, then global config
-    from .instances import load_instance_position
     instance_data = load_instance_position(instance_name)
     hints = None
     if instance_data:

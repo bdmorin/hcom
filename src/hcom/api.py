@@ -11,6 +11,7 @@ External scripts should use the high-level functions.
 from __future__ import annotations
 
 import json
+import shlex
 import time
 from datetime import datetime, timezone
 from typing import Any
@@ -91,6 +92,7 @@ def whoami(*, field: str | None = None) -> dict[str, Any] | str | bool | None:
         "alice"
     """
     from .commands.utils import resolve_identity
+    from .core.instances import get_full_name
 
     _ensure_init()
 
@@ -98,7 +100,7 @@ def whoami(*, field: str | None = None) -> dict[str, Any] | str | bool | None:
 
     data = identity.instance_data or {}
     result = {
-        "name": identity.name,
+        "name": get_full_name(data) or identity.name,
         "session_id": identity.session_id or "",
         "connected": data.get("enabled", False),
         "directory": data.get("directory", ""),
@@ -127,11 +129,12 @@ def instances(*, name: str | None = None, all: bool = False) -> list[dict] | dic
 
     Example:
         >>> api.instances()
-        [{"name": "bob", "status": "active", "enabled": True, ...}, ...]
+        [{"name": "debater-bob", "status": "active", "enabled": True, ...}, ...]
         >>> api.instances(name="bob")
         {"name": "bob", "status": "active", ...}
     """
     from .core.db import iter_instances
+    from .core.instances import get_full_name
 
     _ensure_init()
 
@@ -140,7 +143,7 @@ def instances(*, name: str | None = None, all: bool = False) -> list[dict] | dic
         if not data:
             raise HcomError(f"Instance not found: {name}")
         return {
-            "name": name,
+            "name": get_full_name(data) or name,
             "session_id": data.get("session_id", ""),
             "enabled": data.get("enabled", False),
             "status": data.get("status", "unknown"),
@@ -151,7 +154,7 @@ def instances(*, name: str | None = None, all: bool = False) -> list[dict] | dic
     result = []
     for data in iter_instances(enabled_only=not all):
         result.append({
-            "name": data["name"],
+            "name": get_full_name(data) or data["name"],
             "session_id": data.get("session_id", ""),
             "enabled": data.get("enabled", False),
             "status": data.get("status", "unknown"),
@@ -364,13 +367,14 @@ def wait(sql: str, *, timeout: int = 60) -> dict | None:
     return None
 
 
-def transcript(*, name: str | None = None, last: int = 10, full: bool = False) -> list[dict]:
+def transcript(*, name: str | None = None, last: int = 10, full: bool = False, range: str | None = None) -> list[dict]:
     """Get conversation transcript.
 
     Args:
         name: Instance to get transcript for (default: self)
-        last: Number of recent exchanges
+        last: Number of recent exchanges (ignored if range specified)
         full: Include tool I/O and edit details (detailed mode)
+        range: Absolute position range "N-M" (stable for sharing between agents)
 
     Returns:
         List of exchange dicts from transcript parsing (keys include: position, user, action, files, timestamp;
@@ -378,18 +382,34 @@ def transcript(*, name: str | None = None, last: int = 10, full: bool = False) -
         Empty list if no transcript available (normal for external senders).
 
     Raises:
-        HcomError: If specific instance name not found
+        HcomError: If specific instance name not found or invalid range format
 
     Example:
         >>> api.transcript()
         [{"position": 1, "user": "hello", "action": "Hi!", "files": [], "timestamp": "..."}]
         >>> api.transcript(name="bob", last=5)
         [...]
+        >>> api.transcript(name="bob", range="10-20")  # stable absolute positions
+        [...]
     """
     from .core.transcript import get_thread
     from .commands.utils import resolve_identity
+    import re
 
     _ensure_init()
+
+    # Parse range if provided
+    range_tuple = None
+    if range:
+        match = re.match(r'^(\d+)-(\d+)$', range)
+        if not match:
+            raise HcomError(f"Invalid range format: {range} (expected N-M, e.g. '10-20')")
+        start, end = int(match.group(1)), int(match.group(2))
+        if start < 1 or end < 1:
+            raise HcomError("Range positions must be >= 1")
+        if start > end:
+            raise HcomError("Range start must be <= end")
+        range_tuple = (start, end)
 
     # Resolve target
     if name:
@@ -408,7 +428,7 @@ def transcript(*, name: str | None = None, last: int = 10, full: bool = False) -
     if not transcript_path:
         return []
 
-    result = get_thread(transcript_path, last=last, detailed=full)
+    result = get_thread(transcript_path, last=last, detailed=full, range_tuple=range_tuple)
     if result.get("error"):
         return []  # File unreadable, return empty
 
@@ -425,6 +445,7 @@ def messages(*, unread: bool = True, last: int = 20) -> list[dict]:
     Returns:
         List of message dicts with ts, from, text, mentions, delivered_to,
         and optional envelope fields (intent, thread, reply_to, reply_to_local).
+        The 'from' field uses full display names (tag-base or base).
 
     Example:
         >>> api.messages()  # unread messages for me
@@ -433,6 +454,7 @@ def messages(*, unread: bool = True, last: int = 20) -> list[dict]:
         [...]
     """
     from .commands.utils import resolve_identity
+    from .core.instances import get_full_name
 
     _ensure_init()
 
@@ -446,9 +468,13 @@ def messages(*, unread: bool = True, last: int = 20) -> list[dict]:
     result = []
     for e in raw:
         data = e.get("data", {})
+        # Convert sender base name to full display name
+        sender_base = data.get("from", "")
+        sender_data = load_instance_position(sender_base) if sender_base else None
+        sender_display = get_full_name(sender_data) or sender_base
         result.append({
             "ts": e["ts"],
-            "from": data.get("from", ""),
+            "from": sender_display,
             "text": data.get("text", ""),
             "mentions": data.get("mentions", []),
             "delivered_to": data.get("delivered_to", []),
@@ -641,21 +667,21 @@ def launch(
     *,
     tag: str | None = None,
     prompt: str | None = None,
-    background: bool = False,
+    background: bool | None = None,
+    system_prompt: str | None = None,
+    append_system_prompt: str | None = None,
     claude_args: str | None = None,
-    resume: str | None = None,
-    fork: bool = False,
 ) -> dict:
     """Launch Claude instances.
 
     Args:
         count: Number of instances to launch
         tag: HCOM_TAG value (creates tag-* instance names)
-        prompt: Initial prompt to send
-        background: Headless mode (-p)
-        claude_args: Additional claude CLI args as string
-        resume: Session ID to resume
-        fork: Fork session (use with resume)
+        prompt: Initial prompt to send (None = inherit from claude_args)
+        background: Headless mode (None = inherit from claude_args)
+        system_prompt: System prompt (None = inherit from claude_args)
+        append_system_prompt: Appended system prompt (None = inherit from claude_args)
+        claude_args: Claude CLI args string (--resume, --model, --agent, etc.)
 
     Returns:
         {"batch_id": str, "launched": int, "failed": int, "background": bool, "log_files": list}
@@ -668,6 +694,8 @@ def launch(
         {"batch_id": "abc123", "launched": 1, "failed": 0, ...}
         >>> api.launch(3, tag="worker", prompt="Do task", background=True)
         {"batch_id": "def456", "launched": 3, "failed": 0, ...}
+        >>> api.launch(1, claude_args="--resume abc123 --model opus")
+        {"batch_id": "ghi789", "launched": 1, ...}
     """
     from .core.ops import op_launch
     from .commands.utils import resolve_identity
@@ -675,28 +703,35 @@ def launch(
 
     _ensure_init()
 
-    # Build args list
-    args = []
-    if background:
-        args.append("-p")
-    if resume:
-        args.extend(["--resume", resume])
-    if fork:
-        args.append("--fork-session")
-    if claude_args:
-        args.extend(claude_args.split())
-    if prompt:
-        args.append(prompt)
-
-    # Parse and merge with config defaults
+    # Parse claude_args string into spec
     config = get_config()
     env_spec = resolve_claude_args(None, config.claude_args)
-    cli_spec = resolve_claude_args(args if args else None, None)
+    cli_spec = resolve_claude_args(shlex.split(claude_args) if claude_args else None, None)
 
+    # Merge: env defaults + claude_args string
     if cli_spec.clean_tokens or cli_spec.positional_tokens or cli_spec.system_entries:
         spec = merge_claude_args(env_spec, cli_spec)
     else:
         spec = env_spec
+
+    # Apply typed kwargs via update() - these override claude_args
+    if prompt is not None or background is not None or system_prompt is not None or append_system_prompt is not None:
+        # Determine system prompt updates
+        sys_flag = None
+        sys_value = None
+        if system_prompt is not None:
+            sys_flag = "--system-prompt"
+            sys_value = system_prompt
+        elif append_system_prompt is not None:
+            sys_flag = "--append-system-prompt"
+            sys_value = append_system_prompt
+
+        spec = spec.update(
+            prompt=prompt,
+            background=background,
+            system_flag=sys_flag,
+            system_value=sys_value,
+        )
 
     if spec.has_errors():
         raise HcomError('\n'.join(spec.errors))

@@ -477,6 +477,20 @@ Response Routing:
     # Load or create instance
     existing_data = load_instance_position(instance_name)
 
+    # Block self-restart during external stop pending
+    if not target and existing_data and existing_data.get('stop_pending'):
+        from ..core.db import get_last_stop_event
+        stop_event = get_last_stop_event(instance_name)
+        is_external = stop_event and stop_event['stopped_by'] != instance_name
+
+        if is_external:
+            raise CLIError(
+                "BLOCKED: You have been stopped by an external command.\n"
+                "You cannot restart yourself after an external stop.\n"
+                "Stop your current work immediately and end your turn.\n"
+                f"Stopped by: {stop_event['stopped_by']}"
+            )
+
     # Remote instance - send control via relay
     if existing_data and existing_data.get('origin_device_id'):
         if ':' in instance_name:

@@ -1,0 +1,16 @@
+{
+  "description": "HCOM bootstrap",
+  "hooks": {
+    "SessionStart": [
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "command -v hcom >/dev/null 2>&1 || pip install -q hcom 2>/dev/null; if ! grep -q '\\${HCOM}' ~/.claude/settings.json 2>/dev/null; then VERSION=$(hcom -v 2>/dev/null); echo '{\"hookSpecificOutput\":{\"hookEventName\":\"SessionStart\",\"additionalContext\":\"HCOM plugin loaded ('\"$VERSION\"'). Run hcom -v to install hooks, then restart Claude Code.\"}}'; fi"
+          }
+        ]
+      }
+    ]
+  }
+}

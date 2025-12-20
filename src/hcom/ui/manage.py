@@ -485,25 +485,34 @@ class ManageScreen:
             all_wrapped_lines = []
 
             # Get instance read positions for read receipt calculation
+            # Keys are full display names to match delivered_to list
             instance_reads = {}
             remote_instances = set()
             remote_msg_ts = {}
             try:
                 from ..core.db import get_db
+                from ..core.instances import get_full_name
                 conn = get_db()
-                rows = conn.execute("SELECT name, last_event_id, origin_device_id FROM instances").fetchall()
-                instance_reads = {row['name']: row['last_event_id'] for row in rows}
-                remote_instances = {row['name'] for row in rows if row['origin_device_id']}
+                rows = conn.execute("SELECT name, last_event_id, origin_device_id, tag FROM instances").fetchall()
+                # Track full_name -> base_name mapping for DB queries
+                full_to_base = {}
+                for row in rows:
+                    full_name = get_full_name({'name': row['name'], 'tag': row['tag']}) or row['name']
+                    full_to_base[full_name] = row['name']
+                    instance_reads[full_name] = row['last_event_id']
+                    if row['origin_device_id']:
+                        remote_instances.add(full_name)
                 # Get max msg_ts for remote instances from their status events
-                for inst_name in remote_instances:
+                for full_name in remote_instances:
+                    base_name = full_to_base.get(full_name, full_name)
                     row = conn.execute("""
                         SELECT json_extract(data, '$.msg_ts') as msg_ts
                         FROM events WHERE type = 'status' AND instance = ?
                           AND json_extract(data, '$.msg_ts') IS NOT NULL
                         ORDER BY id DESC LIMIT 1
-                    """, (inst_name,)).fetchone()
+                    """, (base_name,)).fetchone()
                     if row and row['msg_ts']:
-                        remote_msg_ts[inst_name] = row['msg_ts']
+                        remote_msg_ts[full_name] = row['msg_ts']
             except Exception:
                 pass  # No read receipts if DB query fails
 

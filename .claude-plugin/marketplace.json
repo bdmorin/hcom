@@ -1,0 +1,16 @@
+{
+  "name": "hcom",
+  "owner": {
+    "name": "aannoo",
+    "url": "https://github.com/aannoo"
+  },
+  "description": "Multi-agent communication for Claude Code - launch multiple terminals with real-time messaging",
+  "homepage": "https://github.com/aannoo/claude-hook-comms",
+  "plugins": [
+    {
+      "name": "hcom",
+      "source": "./plugin/hcom",
+      "description": "CLI tool for launching multiple Claude Code terminals with interactive subagents, headless persistence, and real-time communication via hooks"
+    }
+  ]
+}

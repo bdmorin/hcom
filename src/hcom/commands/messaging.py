@@ -14,15 +14,17 @@ def get_recipient_feedback(delivered_to: list[str]) -> str:
     """Get formatted recipient feedback showing who received the message.
 
     Args:
-        delivered_to: Instances that received the message (from send_message)
+        delivered_to: Instances that received the message (base names from send_message)
 
     Returns:
-        Formatted string like "Sent to: ◉ alice, ◉ bob"
+        Formatted string like "Sent to: ◉ alice, ◉ bob" (with full display names)
     """
-    from ..shared import STATUS_ICONS
+    from ..shared import STATUS_ICONS, SENDER
+    from ..core.instances import get_full_name
 
     if not delivered_to:
-        return "Message sent (no active recipients)"
+        # No Claude instances will receive, but bigboss (human at TUI) can see all messages
+        return f"Sent to: {SENDER} (no other active instances)"
 
     # Format recipients with status icons
     if len(delivered_to) > 10:
@@ -34,9 +36,11 @@ def get_recipient_feedback(delivered_to: list[str]) -> str:
         if r_data:
             _, status, _, _, _ = get_instance_status(r_data)
             icon = STATUS_ICONS.get(status, '◦')
+            display_name = get_full_name(r_data) or r_name
         else:
             icon = '◦'
-        recipient_status.append(f"{icon} {r_name}")
+            display_name = r_name
+        recipient_status.append(f"{icon} {display_name}")
 
     return f"Sent to: {', '.join(recipient_status)}"
 
