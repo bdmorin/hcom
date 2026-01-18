@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """Shared constants and utilities for hcom"""
+
 from __future__ import annotations
 
 import sys
@@ -10,46 +11,87 @@ from pathlib import Path
 from dataclasses import dataclass
 from typing import Literal
 
-__version__ = "0.6.10"
+__version__ = "0.6.11"
 
 # ===== Platform Detection =====
-IS_WINDOWS = sys.platform == 'win32'
+IS_WINDOWS = sys.platform == "win32"
 CREATE_NO_WINDOW = 0x08000000  # Windows: prevent console window creation
 
 # ===== Terminal Identity =====
-# Windows terminal session identifier fallback
-# Used for command identity resolution when HCOM_SESSION_ID not available
-# (CLAUDE_ENV_FILE sourcing works on Unix but not Windows)
-MAPID = (
-    os.environ.get('HCOM_LAUNCH_TOKEN')     # hcom-set, always unique
-    or os.environ.get('WT_SESSION')         # Windows Terminal (native)
-    or os.environ.get('ConEmuHWND')         # ConEmu/Cmder (native)
-    or os.environ.get('WEZTERM_PANE')       # WezTerm (cross-platform)
-    or os.environ.get('ALACRITTY_WINDOW_ID') # Alacritty (cross-platform)
-    or os.environ.get('WAVETERM_BLOCKID')   # Wave Terminal
-    or os.environ.get('ZELLIJ_SESSION_NAME') # Zellij (cross-platform)
-    or os.environ.get('TMUX_PANE')          # tmux (Git Bash/WSL)
-)
+
 
 def is_wsl() -> bool:
     """Detect if running in WSL"""
-    if platform.system() != 'Linux':
+    if platform.system() != "Linux":
         return False
     try:
-        with open('/proc/version', 'r') as f:
-            return 'microsoft' in f.read().lower()
+        with open("/proc/version", "r") as f:
+            return "microsoft" in f.read().lower()
     except (FileNotFoundError, PermissionError, OSError):
         return False
+
 
 def is_termux() -> bool:
     """Detect if running in Termux on Android"""
     return (
-        'TERMUX_VERSION' in os.environ or              # Primary: Works all versions
-        'TERMUX__ROOTFS' in os.environ or              # Modern: v0.119.0+
-        Path('/data/data/com.termux').exists() or     # Fallback: Path check
-        'com.termux' in os.environ.get('PREFIX', '')   # Fallback: PREFIX check
+        "TERMUX_VERSION" in os.environ  # Primary: Works all versions
+        or "TERMUX__ROOTFS" in os.environ  # Modern: v0.119.0+
+        or Path("/data/data/com.termux").exists()  # Fallback: Path check
+        or "com.termux" in os.environ.get("PREFIX", "")  # Fallback: PREFIX check
     )
 
+
+def is_inside_ai_tool() -> bool:
+    """Detect if running inside any AI CLI tool (Claude Code, Gemini CLI, Codex).
+
+    Returns True if:
+    - CLAUDECODE=1 (running inside Claude Code - may or may not be hcom-launched)
+    - HCOM_LAUNCHED=1 (Gemini/Codex are always hcom-launched; catches vanilla Claude too)
+    - GEMINI_CLI=1 (running inside Gemini CLI)
+    - CODEX_SANDBOX* or CODEX_MANAGED_BY_* (running inside Codex)
+    """
+    return (
+        os.environ.get("CLAUDECODE") == "1"
+        or os.environ.get("HCOM_LAUNCHED") == "1"
+        or os.environ.get("GEMINI_CLI") == "1"
+        or "CODEX_SANDBOX"
+        in os.environ  # Catches CODEX_SANDBOX and CODEX_SANDBOX_NETWORK_DISABLED
+        or "CODEX_MANAGED_BY_NPM" in os.environ
+        or "CODEX_MANAGED_BY_BUN" in os.environ
+    )
+
+
+def detect_current_tool() -> str:
+    """Detect current AI tool environment (vanilla or hcom-launched).
+
+    Returns: 'claude', 'codex', 'gemini', or 'adhoc' if unknown.
+    """
+    if os.environ.get("CLAUDECODE") == "1":
+        return "claude"
+    codex_env_vars = ("CODEX_SANDBOX", "CODEX_MANAGED_BY_NPM", "CODEX_MANAGED_BY_BUN")
+    if any(v in os.environ for v in codex_env_vars):
+        return "codex"
+    if os.environ.get("GEMINI_CLI") == "1":
+        return "gemini"
+    return "adhoc"
+
+
+def detect_vanilla_tool() -> str | None:
+    """Detect if running inside a vanilla (non-hcom-launched) AI tool.
+
+    Returns tool type ('claude', 'codex', 'gemini') or None if not vanilla.
+    """
+    if os.environ.get("HCOM_LAUNCHED") == "1":
+        return None  # Launched via hcom - not vanilla
+    tool = detect_current_tool()
+    return tool if tool != "adhoc" else None
+
+
+# ===== Release Configuration =====
+# Tools available for launch (flip to enable)
+RELEASED_TOOLS = {"claude", "gemini", "codex"}  # codex: coming soon
+# Tools that support background/headless mode
+RELEASED_BACKGROUND = {"claude"}
 
 # ===== Message Constants =====
 # Message patterns
@@ -59,43 +101,69 @@ def is_termux() -> bool:
 # - identifiers: var_@name (preceded by underscore)
 # - kebab-case: some-id@mention (preceded by hyphen)
 # Capture group must start with alphanumeric (prevents @-test, @_test, @123)
-# Includes : for remote instance names (e.g., @alice:BOXE)
-MENTION_PATTERN = re.compile(r'(?<![a-zA-Z0-9._-])@([a-zA-Z0-9][\w:-]*)')
+# Includes : for remote instance names (e.g., @luna:BOXE)
+MENTION_PATTERN = re.compile(r"(?<![a-zA-Z0-9._-])@([a-zA-Z0-9][\w:-]*)")
+
+# Binding marker for vanilla sessions: [HCOM:BIND:<base_name>]
+BIND_MARKER_RE = re.compile(r"\[HCOM:BIND:([a-z0-9_]+)\]")
 
 # Sender constants
-SENDER = 'bigboss'  # CLI sender identity
-SYSTEM_SENDER = 'hcom'  # System notification identity (launcher, watchdog, etc)
-SENDER_EMOJI = '🐳' # Legacy whale, unused but kept here to remind me about cake intake
+SENDER = "bigboss"  # CLI sender identity
+SYSTEM_SENDER = "hcom"  # System notification identity (launcher, watchdog, etc)
+SENDER_EMOJI = "🐳"  # Legacy whale, unused but kept here to remind me about cake intake
 MAX_MESSAGES_PER_DELIVERY = 50
 MAX_MESSAGE_SIZE = 1048576  # 1MB
+
 
 # ===== Message Identity =====
 @dataclass
 class SenderIdentity:
     """Sender identity for message routing.
 
-    Single identity (name) with kind for filtering.
-    NO routing_id - namespace managed via sender_kind in event data.
+    Attributes:
+        kind: Identity type that determines routing behavior:
+            'instance' - A registered hcom participant (full routing rules apply).
+            'external' - External sender via --from flag (broadcasts to all).
+            'system' - System-generated message (broadcasts to all).
+        name: Display name stored in events.instance column.
+        instance_data: Full instance data dict from DB (for kind='instance' only).
+        session_id: Claude session ID for transcript binding (available even when
+            instance_data is None, used for group membership).
     """
-    kind: Literal['external', 'instance', 'system']
-    name: str  # Display name (stored in events.instance)
-    instance_data: dict | None = None  # For kind='instance' only
-    session_id: str | None = None  # Stable session identifier (available even when instance_data is None)
+
+    kind: Literal["external", "instance", "system"]
+    name: str
+    instance_data: dict | None = None
+    session_id: str | None = None
 
     @property
     def broadcasts(self) -> bool:
         """External and system senders broadcast to everyone."""
-        return self.kind in ('external', 'system')
+        return self.kind in ("external", "system")
 
     @property
     def group_id(self) -> str | None:
         """Group session ID for routing (session-based group membership)."""
         from hcom.core.helpers import get_group_session_id
+
         return get_group_session_id(self.instance_data)
+
+
+@dataclass(frozen=True)
+class CommandContext:
+    """Resolved identity context for a single CLI invocation.
+
+    - explicit_name: raw `--name` value (if provided)
+    - identity: resolved instance identity (best-effort; may be None)
+    """
+
+    explicit_name: str | None
+    identity: SenderIdentity | None
 
 
 class HcomError(Exception):
     """HCOM operation failed."""
+
     pass
 
 
@@ -103,27 +171,9 @@ class HcomError(Exception):
 # Stop hook polling interval
 STOP_HOOK_POLL_INTERVAL = 0.1  # 100ms between stop hook polls
 
-# HCOM invocation pattern - matches all ways to invoke hcom
-# Supports: hcom, uvx hcom, python -m hcom, python hcom.py, python hcom.pyz, /path/to/hcom.py[z]
-HCOM_INVOCATION_PATTERN = r'(?:uvx\s+)?hcom|python3?\s+-m\s+hcom|(?:python3?\s+)?\S*hcom\.pyz?'
 
-# PreToolUse hook pattern - matches hcom commands for session_id injection and auto-approval
-# - hcom send (any args, including --agentid)
-# - hcom stop (no args) | hcom start (no args, or with --agentid flag)
-# - hcom help | hcom --help | hcom -h
-# - hcom list (with optional --json, -v, --verbose, self)
-# - hcom events (with optional --last, --wait, --sql, --agentid)
-# - hcom relay (with optional pull, hf)
-# - hcom config (any args)
-# - hcom transcript (get conversation context)
-# Negative lookahead ensures stop/start not followed by name targets (except approved flags)
-# Allows shell operators (2>&1, >/dev/null, |, &&) but blocks identifier-like targets (myname, 123abc)
-HCOM_COMMAND_PATTERN = re.compile(
-    rf'({HCOM_INVOCATION_PATTERN})\s+'
-    r'(?:send\b|stop(?!\s+(?:[a-zA-Z_]|[0-9]+[a-zA-Z_])[-\w]*(?:\s|$))|start(?:\s+--agentid\s+\S+)?(?!\s+(?:[a-zA-Z_]|[0-9]+[a-zA-Z_])[-\w]*(?:\s|$))|(?:help|--help|-h)\b|--new-terminal\b|list(?:\s+(?:self|--(?:agentid|json|verbose|v))\b)*|events\b|relay\b|config\b|transcript\b|archive\b)'
-)
-
-# ===== Core ANSI Codes =====
+# ===== ANSI Colors (inlined to avoid ui package import overhead) =====
+# Core ANSI codes
 RESET = "\033[0m"
 DIM = "\033[2m"
 BOLD = "\033[1m"
@@ -134,43 +184,96 @@ FG_GREEN = "\033[32m"
 FG_CYAN = "\033[36m"
 FG_WHITE = "\033[37m"
 FG_BLACK = "\033[30m"
-FG_GRAY = '\033[38;5;245m'  # Mid-gray (was 90, inconsistent across terminals)
-FG_YELLOW = '\033[33m'
-FG_RED = '\033[31m'
-FG_BLUE = '\033[38;5;75m'  # Sky blue (256-color, consistent across terminals)
+FG_GRAY = "\033[38;5;245m"
+FG_YELLOW = "\033[33m"
+FG_RED = "\033[31m"
+FG_BLUE = "\033[38;5;75m"
 
 # TUI-specific foreground
-FG_ORANGE = '\033[38;5;208m'
-FG_GOLD = '\033[38;5;220m'
-FG_LIGHTGRAY = '\033[38;5;250m'
-FG_DELIVER = '\033[38;5;156m'  # Light green for message delivery state
-
-# Stale instance color (brownish-grey, distinct from exited)
-FG_STALE = '\033[38;5;137m'  # Tan/brownish-grey
+FG_ORANGE = "\033[38;5;208m"
+FG_GOLD = "\033[38;5;220m"
+FG_LIGHTGRAY = "\033[38;5;250m"
+FG_DELIVER = "\033[38;5;156m"
+FG_STALE = "\033[38;5;137m"
 
 # Background colors
-BG_BLUE = '\033[48;5;69m'  # Light blue (256-color, consistent across terminals)
+BG_BLUE = "\033[48;5;69m"
 BG_GREEN = "\033[42m"
 BG_CYAN = "\033[46m"
 BG_YELLOW = "\033[43m"
 BG_RED = "\033[41m"
 BG_GRAY = "\033[100m"
-
-# Stale background (brownish-grey to match foreground)
-BG_STALE = '\033[48;5;137m'  # Tan/brownish-grey background
-
-# TUI-specific background
-BG_ORANGE = '\033[48;5;208m'
-BG_CHARCOAL = '\033[48;5;236m'
+BG_STALE = "\033[48;5;137m"
+BG_ORANGE = "\033[48;5;208m"
+BG_CHARCOAL = "\033[48;5;236m"
+BG_GOLD = "\033[48;5;220m"
 
 # Terminal control
-CLEAR_SCREEN = '\033[2J'
-CURSOR_HOME = '\033[H'
-HIDE_CURSOR = '\033[?25l'
-SHOW_CURSOR = '\033[?25h'
+CLEAR_SCREEN = "\033[2J"
+CURSOR_HOME = "\033[H"
+HIDE_CURSOR = "\033[?25l"
+SHOW_CURSOR = "\033[?25h"
 
 # Box drawing
-BOX_H = '─'
+BOX_H = "─"
+
+# ===== Status Configuration =====
+# Status values stored directly in instance files (no event mapping)
+# Row exists = participating (no separate enabled field)
+
+# Valid status values
+# 'listening' is special: heartbeat-proven current (refreshed every ~30s)
+# Other statuses are event-based (show time since last update)
+STATUS_VALUES = ["active", "listening", "blocked", "launching", "error", "inactive"]
+
+# Status icons
+STATUS_ICONS = {
+    "active": "▶",
+    "listening": "◉",
+    "blocked": "■",
+    "launching": "◎",
+    "error": "✗",
+    "inactive": "○",
+}
+
+# Adhoc instance icon (neutral - not claiming alive or dead)
+ADHOC_ICON = "◦"
+
+# Status colors (foreground)
+STATUS_COLORS = {
+    "active": FG_GREEN,
+    "listening": FG_BLUE,
+    "blocked": FG_RED,
+    "launching": FG_YELLOW,
+    "error": FG_RED,
+    "inactive": FG_GRAY,
+}
+
+# STATUS_MAP for watch command (foreground color, icon)
+STATUS_MAP = {
+    status: (STATUS_COLORS[status], STATUS_ICONS[status]) for status in STATUS_VALUES
+}
+
+# Background colors for statusline display blocks
+STATUS_BG_COLORS = {
+    "active": BG_GREEN,
+    "listening": BG_BLUE,
+    "blocked": BG_RED,
+    "launching": BG_YELLOW,
+    "error": BG_RED,
+    "inactive": BG_GRAY,
+}
+
+# Background color map for TUI statusline (background color, icon)
+STATUS_BG_MAP = {
+    status: (STATUS_BG_COLORS[status], STATUS_ICONS[status]) for status in STATUS_VALUES
+}
+
+# Display order (priority-based sorting)
+STATUS_ORDER = ["active", "listening", "blocked", "error", "launching", "inactive"]
+
+# TUI-specific (alias for STATUS_COLORS)
+STATUS_FG = STATUS_COLORS
 
 # ===== Default Config =====
 DEFAULT_CONFIG_HEADER = [
@@ -182,127 +285,191 @@ DEFAULT_CONFIG_HEADER = [
     "# Put each value on separate lines without comments.",
     "#",
     "# HCOM settings:",
-    "#   HCOM_TIMEOUT - seconds before disconnecting idle instance (default: 1800)",
     "#   HCOM_SUBAGENT_TIMEOUT - seconds before disconnecting idle subagents (default: 30)",
-    "#   HCOM_TERMINAL - Terminal mode: \"new\", \"here\", or custom command with {script}",
+    '#   HCOM_TERMINAL - Terminal mode: "default", preset name, or custom command with {script}',
     "#   HCOM_HINTS - Text appended to all messages received by instances",
     "#   HCOM_TAG - Group tag for instances (creates tag-* instances)",
+    "#   HCOM_DEFAULT_SUBSCRIPTIONS - Comma-separated event presets: collision, created, stopped, blocked",
     "#   HCOM_CLAUDE_ARGS - Default Claude args (e.g., '-p --model sonnet --agent reviewer')",
+    "#   HCOM_GEMINI_ARGS - Default Gemini args (e.g., '--model gemini-2.5-flash --yolo')",
+    "#   HCOM_CODEX_ARGS - Default Codex args (e.g., '--sandbox danger-full-access')",
     "#   HCOM_RELAY - Cross-device relay server URL (optional)",
     "#   HCOM_RELAY_TOKEN - Auth token for relay server (optional)",
     "#   HCOM_RELAY_ENABLED - Enable/disable relay sync (default: 1 if URL set)",
+    "#   HCOM_AUTO_APPROVE - Auto-approve safe hcom commands (default: 1)",
+    "#   HCOM_NAME_EXPORT - Export instance name to this env var in launched instances",
     "#",
     "ANTHROPIC_MODEL=",
     "CLAUDE_CODE_SUBAGENT_MODEL=",
+    "GEMINI_MODEL=",
 ]
 
 DEFAULT_CONFIG_DEFAULTS = [
-    'HCOM_TAG=',
-    'HCOM_HINTS=',
-    'HCOM_TIMEOUT=1800',
-    'HCOM_SUBAGENT_TIMEOUT=30',
-    'HCOM_TERMINAL=new',
+    "HCOM_TAG=",
+    "HCOM_HINTS=",
+    "HCOM_SUBAGENT_TIMEOUT=30",
+    "HCOM_TERMINAL=default",
+    "HCOM_DEFAULT_SUBSCRIPTIONS=collision",
     r'''HCOM_CLAUDE_ARGS="'say hi in hcom chat'"''',
-    'HCOM_RELAY=',
-    'HCOM_RELAY_TOKEN=',
-    'HCOM_RELAY_ENABLED=1',
-    'HCOM_NAME_EXPORT=',
+    "HCOM_GEMINI_ARGS=",
+    "HCOM_CODEX_ARGS=",
+    "HCOM_CODEX_SANDBOX_MODE=workspace",
+    "HCOM_GEMINI_SYSTEM_PROMPT=",
+    "HCOM_CODEX_SYSTEM_PROMPT=",
+    "HCOM_RELAY=",
+    "HCOM_RELAY_TOKEN=",
+    "HCOM_RELAY_ENABLED=1",
+    "HCOM_AUTO_APPROVE=1",
+    "HCOM_NAME_EXPORT=",
 ]
 
-# ===== Status Configuration =====
-# Status values stored directly in instance files (no event mapping)
-# 'enabled' field is separate from status (participation vs activity)
-
-# Valid status values
-STATUS_VALUES = ['active', 'idle', 'blocked', 'inactive']
-
-# Status icons
-STATUS_ICONS = {
-    'active': '▶',
-    'idle': '◉',
-    'blocked': '■',
-    'inactive': '○',
+# ===== Terminal Presets =====
+# (binary_to_check, command_template, platforms)
+# binary_to_check: None means check app bundle existence instead
+# platforms: list of platform.system() values
+TERMINAL_PRESETS: dict[str, tuple[str | None, str, list[str]]] = {
+    # macOS
+    "Terminal.app": (None, "open -a Terminal {script}", ["Darwin"]),
+    "iTerm": (None, "open -a iTerm {script}", ["Darwin"]),
+    "Ghostty": (None, "open -na Ghostty.app --args -e bash {script}", ["Darwin"]),
+    # Cross-platform terminals (on macOS, falls back to .app bundle if CLI not in PATH)
+    "kitty": ("kitty", "kitty {script}", ["Darwin", "Linux"]),
+    "WezTerm": (
+        "wezterm",
+        "wezterm start -- bash {script}",
+        ["Darwin", "Linux", "Windows"],
+    ),
+    "Alacritty": (
+        "alacritty",
+        "alacritty -e bash {script}",
+        ["Darwin", "Linux", "Windows"],
+    ),
+    # Tab utilities
+    "ttab": ("ttab", "ttab {script}", ["Darwin"]),
+    "wttab": ("wttab", "wttab {script}", ["Windows"]),
+    # Linux terminals
+    "gnome-terminal": (
+        "gnome-terminal",
+        "gnome-terminal --window -- bash {script}",
+        ["Linux"],
+    ),
+    "konsole": ("konsole", "konsole -e bash {script}", ["Linux"]),
+    "xterm": ("xterm", "xterm -e bash {script}", ["Linux"]),
+    "tilix": ("tilix", "tilix -e bash {script}", ["Linux"]),
+    "terminator": ("terminator", "terminator -x bash {script}", ["Linux"]),
+    # Windows
+    "Windows Terminal": ("wt", "wt bash {script}", ["Windows"]),
+    "mintty": ("mintty", "mintty bash {script}", ["Windows"]),
+    # Within-terminal splits/tabs
+    "tmux-split": ("tmux", "tmux split-window -h {script}", ["Darwin", "Linux"]),
+    "wezterm-tab": (
+        "wezterm",
+        "wezterm cli spawn -- bash {script}",
+        ["Darwin", "Linux", "Windows"],
+    ),
+    "kitty-tab": (
+        "kitten",
+        "kitten @ launch --type=tab -- bash {script}",
+        ["Darwin", "Linux"],
+    ),
 }
 
-# Status colors (foreground)
-STATUS_COLORS = {
-    'active': FG_GREEN,
-    'idle': FG_BLUE,
-    'blocked': FG_RED,
-    'inactive': FG_GRAY,
-}
-
-# STATUS_MAP for watch command (foreground color, icon)
-STATUS_MAP = {
-    status: (STATUS_COLORS[status], STATUS_ICONS[status])
-    for status in STATUS_VALUES
-}
-
-# Background colors for statusline display blocks
-STATUS_BG_COLORS = {
-    'active': BG_GREEN,
-    'idle': BG_BLUE,
-    'blocked': BG_RED,
-    'inactive': BG_GRAY,
-}
-
-# Background color map for TUI statusline (background color, icon)
-STATUS_BG_MAP = {
-    status: (STATUS_BG_COLORS[status], STATUS_ICONS[status])
-    for status in STATUS_VALUES
-}
-
-# Display order (priority-based sorting)
-STATUS_ORDER = ["active", "idle", "blocked", "inactive"]
-
-# TUI-specific (alias for STATUS_COLORS)
-STATUS_FG = STATUS_COLORS
 
 # ===== Pure Utility Functions =====
 def shorten_path(path: str) -> str:
     """Shorten path by replacing home directory with ~"""
     import os
+
     if not path:
         return path
     return path.replace(os.path.expanduser("~"), "~")
+
+
+def get_project_tag(directory: str, max_len: int = 12) -> str:
+    """Extract project name from directory path, truncated to max_len.
+
+    Returns last path component (folder name), truncated with ellipsis if needed.
+    Returns empty string if directory is empty/None.
+    """
+    if not directory:
+        return ""
+    from pathlib import Path
+
+    project = Path(directory).name
+    if len(project) > max_len:
+        project = project[: max_len - 1] + "…"
+    return project
+
 
 def parse_iso_timestamp(iso_str: str):
     """Parse ISO timestamp string to datetime, handling Z timezone.
     Returns datetime object or None on parse failure."""
     from datetime import datetime
+
     try:
-        return datetime.fromisoformat(iso_str.replace('Z', '+00:00'))
+        return datetime.fromisoformat(iso_str.replace("Z", "+00:00"))
     except (ValueError, AttributeError):
         return None
 
-def format_timestamp(iso_str: str, fmt: str = '%H:%M') -> str:
-    """Format ISO timestamp for display - pure function"""
+
+def get_local_archive_timestamp() -> str:
+    """Get local timestamp for archive files (e.g. 2024-01-30_123045).
+
+    Used for user-visible filenames where local time is preferred.
+    """
+    from datetime import datetime
+
+    return datetime.now().strftime("%Y-%m-%d_%H%M%S")
+
+
+def format_timestamp(iso_str: str, fmt: str = "%H:%M") -> str:
+    """Format ISO timestamp for display in local time."""
     try:
-        if 'T' in iso_str:
+        if "T" in iso_str:
             dt = parse_iso_timestamp(iso_str)
             if dt:
-                return dt.strftime(fmt)
+                # Convert UTC to local time for display
+                local_dt = dt.astimezone()
+                return local_dt.strftime(fmt)
         return iso_str
     except Exception:
         return iso_str[:5] if len(iso_str) >= 5 else iso_str
 
+
 def format_age(seconds: float) -> str:
     """Format time ago in human readable form - pure function.
-    Returns compact format: 5s, 3m, 2h, 1d (callers append ' ago' if needed)."""
+    Returns compact format: 5s, 3m, 2h, 1d (callers append ' ago' if needed).
+    Returns "now" for 0 or negative (used for 'listening' status - heartbeat-proven current)."""
+    if seconds <= 0:
+        return "now"
     if seconds < 60:
         return f"{int(seconds)}s"
     elif seconds < 3600:
-        return f"{int(seconds/60)}m"
+        return f"{int(seconds / 60)}m"
     elif seconds < 86400:
-        return f"{int(seconds/3600)}h"
+        return f"{int(seconds / 3600)}h"
     else:
-        return f"{int(seconds/86400)}d"
+        return f"{int(seconds / 86400)}d"
+
+
+def format_listening_since(status_time: int | float) -> str:
+    """Format 'since X' suffix for listening agents idle >= 1 minute.
+    Returns ' since 5m' style suffix, empty string if idle < 1 minute."""
+    import time
+
+    if not status_time:
+        return ""
+    idle_secs = int(time.time()) - int(status_time)
+    if idle_secs >= 60:
+        return f" since {format_age(idle_secs)}"
+    return ""
+
 
 def get_status_counts(instances: dict[str, dict]) -> dict[str, int]:
     """Count instances by status type - pure data transformation"""
     counts = {s: 0 for s in STATUS_ORDER}
     for info in instances.values():
-        status = info.get('status', 'unknown')
+        status = info.get("status", "unknown")
         counts[status] = counts.get(status, 0) + 1
     return counts
 
@@ -317,12 +484,12 @@ def parse_env_value(value: str) -> str:
 
     if value.startswith('"') and value.endswith('"') and len(value) >= 2:
         inner = value[1:-1]
-        inner = inner.replace('\\\\', '\x00')
-        inner = inner.replace('\\n', '\n')
-        inner = inner.replace('\\t', '\t')
-        inner = inner.replace('\\r', '\r')
+        inner = inner.replace("\\\\", "\x00")
+        inner = inner.replace("\\n", "\n")
+        inner = inner.replace("\\t", "\t")
+        inner = inner.replace("\\r", "\r")
         inner = inner.replace('\\"', '"')
-        inner = inner.replace('\x00', '\\')
+        inner = inner.replace("\x00", "\\")
         return inner
 
     if value.startswith("'") and value.endswith("'") and len(value) >= 2:
@@ -337,15 +504,15 @@ def format_env_value(value: str) -> str:
         return value
 
     # Check if quoting needed for special characters
-    needs_quoting = any(c in value for c in ['\n', '\t', '"', "'", ' ', '\r'])
+    needs_quoting = any(c in value for c in ["\n", "\t", '"', "'", " ", "\r"])
 
     if needs_quoting:
         # Use double quotes with proper escaping
-        escaped = value.replace('\\', '\\\\')  # Escape backslashes first
-        escaped = escaped.replace('\n', '\\n')  # Escape newlines
-        escaped = escaped.replace('\t', '\\t')  # Escape tabs
-        escaped = escaped.replace('\r', '\\r')  # Escape carriage returns
-        escaped = escaped.replace('"', '\\"')   # Escape double quotes
+        escaped = value.replace("\\", "\\\\")  # Escape backslashes first
+        escaped = escaped.replace("\n", "\\n")  # Escape newlines
+        escaped = escaped.replace("\t", "\\t")  # Escape tabs
+        escaped = escaped.replace("\r", "\\r")  # Escape carriage returns
+        escaped = escaped.replace('"', '\\"')  # Escape double quotes
         return f'"{escaped}"'
 
     return value
@@ -355,33 +522,40 @@ def parse_env_file(config_path: Path) -> dict[str, str]:
     """Parse ENV file (KEY=VALUE format) with security validation"""
     config: dict[str, str] = {}
 
-    dangerous_chars = ['`', '$', ';', '|', '&', '\n', '\r']
+    dangerous_chars = ["`", "$", ";", "|", "&", "\n", "\r"]
 
     try:
-        content = config_path.read_text(encoding='utf-8')
+        content = config_path.read_text(encoding="utf-8")
         for line in content.splitlines():
             line = line.strip()
-            if not line or line.startswith('#'):
+            if not line or line.startswith("#"):
                 continue
-            if '=' in line:
-                key, _, value = line.partition('=')
+            if "=" in line:
+                key, _, value = line.partition("=")
                 key = key.strip()
                 value = value.strip()
 
-                if key == 'HCOM_TERMINAL':
+                if key == "HCOM_TERMINAL":
+                    # Check dangerous chars first (for all values)
                     if any(c in value for c in dangerous_chars):
                         print(
                             f"Warning: Unsafe characters in HCOM_TERMINAL "
                             f"({', '.join(repr(c) for c in dangerous_chars if c in value)}), "
                             f"ignoring custom terminal command",
-                            file=sys.stderr
+                            file=sys.stderr,
                         )
                         continue
-                    if value not in ('new', 'here', 'print') and '{script}' not in value:
+                    # Valid values: 'default', preset name, or custom command with {script}
+                    # Internal/debug only: 'print' (show script), 'here' (force current terminal)
+                    if (
+                        value not in ("default", "print", "here")
+                        and value not in TERMINAL_PRESETS
+                        and "{script}" not in value
+                    ):
                         print(
-                            "Warning: HCOM_TERMINAL custom command must include {script} placeholder, "
+                            "Warning: HCOM_TERMINAL must be 'default', a preset name, or custom command with {script}, "
                             "ignoring",
-                            file=sys.stderr
+                            file=sys.stderr,
                         )
                         continue
 
@@ -393,26 +567,172 @@ def parse_env_file(config_path: Path) -> dict[str, str]:
     return config
 
 
-# ===== Claude Args Re-exports =====
-# Re-export Claude args for backward compatibility (ui.py depends on these)
-from .claude_args import (  # noqa: E402
-    ClaudeArgsSpec,
-    resolve_claude_args,
-    merge_claude_args,
-    validate_conflicts,
-    add_background_defaults,
-)
+# ===== Lazy imports for tool args (avoids ~25ms import overhead) =====
+# These are re-exported for backward compatibility (ui.py depends on them)
+# Using module __getattr__ for lazy loading
+
+_claude_args_cache: dict = {}
+_gemini_args_cache: dict = {}
+
+HCOM_SKIP_TOOL_ARGS_VALIDATION_ENV = "HCOM_SKIP_TOOL_ARGS_VALIDATION"
+
+
+def skip_tool_args_validation() -> bool:
+    """Return True if hcom should skip tool CLI arg validation.
+
+    This bypasses hcom-side "unknown option"/parse error gating so the underlying
+    tool (Claude/Gemini/Codex) can be the source of truth for flags.
+    """
+    import os
+
+    value = os.environ.get(HCOM_SKIP_TOOL_ARGS_VALIDATION_ENV, "")
+    return value not in ("", "0", "false", "False", "no", "NO")
+
+
+def __getattr__(name: str):
+    """Lazy load tool args modules on first access."""
+    # Claude args
+    if name in (
+        "ClaudeArgsSpec",
+        "resolve_claude_args",
+        "merge_claude_args",
+        "validate_conflicts",
+        "add_background_defaults",
+    ):
+        if not _claude_args_cache:
+            from .tools.claude.args import (
+                ClaudeArgsSpec,
+                resolve_claude_args,
+                merge_claude_args,
+                validate_conflicts,
+                add_background_defaults,
+            )
+
+            _claude_args_cache.update(
+                {
+                    "ClaudeArgsSpec": ClaudeArgsSpec,
+                    "resolve_claude_args": resolve_claude_args,
+                    "merge_claude_args": merge_claude_args,
+                    "validate_conflicts": validate_conflicts,
+                    "add_background_defaults": add_background_defaults,
+                }
+            )
+        return _claude_args_cache[name]
+
+    # Gemini args
+    if name in (
+        "GeminiArgsSpec",
+        "resolve_gemini_args",
+        "merge_gemini_args",
+        "validate_gemini_conflicts",
+    ):
+        if not _gemini_args_cache:
+            from .tools.gemini.args import (
+                GeminiArgsSpec,
+                resolve_gemini_args,
+                merge_gemini_args,
+                validate_conflicts as validate_gemini_conflicts,
+            )
+
+            _gemini_args_cache.update(
+                {
+                    "GeminiArgsSpec": GeminiArgsSpec,
+                    "resolve_gemini_args": resolve_gemini_args,
+                    "merge_gemini_args": merge_gemini_args,
+                    "validate_gemini_conflicts": validate_gemini_conflicts,
+                }
+            )
+        return _gemini_args_cache[name]
+
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
 
 __all__ = [
+    # Version
+    "__version__",
+    # Platform detection
+    "IS_WINDOWS",
+    "CREATE_NO_WINDOW",
+    "is_wsl",
+    "is_termux",
+    "is_inside_ai_tool",
+    "detect_vanilla_tool",
+    # Tool arg validation override
+    "HCOM_SKIP_TOOL_ARGS_VALIDATION_ENV",
+    "skip_tool_args_validation",
+    # Release configuration
+    "RELEASED_TOOLS",
+    "RELEASED_BACKGROUND",
+    # Message constants
+    "MENTION_PATTERN",
+    "BIND_MARKER_RE",
+    "SENDER",
+    "SYSTEM_SENDER",
+    "SENDER_EMOJI",
+    "MAX_MESSAGES_PER_DELIVERY",
+    "MAX_MESSAGE_SIZE",
     # Message identity
-    'SenderIdentity',
+    "SenderIdentity",
     # Exceptions
-    'HcomError',
-    # Re-exported from claude_args (backward compatibility for ui.py)
-    'ClaudeArgsSpec',
-    'resolve_claude_args',
-    'merge_claude_args',
-    'validate_conflicts',
-    'add_background_defaults',
+    "HcomError",
+    # Hook constants
+    "STOP_HOOK_POLL_INTERVAL",
+    # ANSI colors (re-exported from ui/colors.py)
+    "RESET",
+    "DIM",
+    "BOLD",
+    "REVERSE",
+    "FG_GREEN",
+    "FG_CYAN",
+    "FG_WHITE",
+    "FG_BLACK",
+    "FG_GRAY",
+    "FG_YELLOW",
+    "FG_RED",
+    "FG_BLUE",
+    "FG_ORANGE",
+    "FG_GOLD",
+    "FG_LIGHTGRAY",
+    "FG_DELIVER",
+    "FG_STALE",
+    "BG_BLUE",
+    "BG_GREEN",
+    "BG_CYAN",
+    "BG_YELLOW",
+    "BG_RED",
+    "BG_GRAY",
+    "BG_STALE",
+    "BG_ORANGE",
+    "BG_CHARCOAL",
+    "BG_GOLD",
+    "CLEAR_SCREEN",
+    "CURSOR_HOME",
+    "HIDE_CURSOR",
+    "SHOW_CURSOR",
+    "BOX_H",
+    # Status configuration
+    "STATUS_VALUES",
+    "STATUS_ICONS",
+    "ADHOC_ICON",
+    "STATUS_COLORS",
+    "STATUS_MAP",
+    "STATUS_BG_COLORS",
+    "STATUS_BG_MAP",
+    "STATUS_ORDER",
+    "STATUS_FG",
+    # Config defaults
+    "DEFAULT_CONFIG_HEADER",
+    "DEFAULT_CONFIG_DEFAULTS",
+    # Terminal presets
+    "TERMINAL_PRESETS",
+    # Utility functions
+    "shorten_path",
+    "parse_iso_timestamp",
+    "format_timestamp",
+    "format_age",
+    "get_status_counts",
+    # Config parsing utilities
+    "parse_env_value",
+    "format_env_value",
+    "parse_env_file",
 ]
-

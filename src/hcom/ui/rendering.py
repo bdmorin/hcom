@@ -1,16 +1,16 @@
 """ANSI rendering and text formatting utilities"""
+
 import re
 import shutil
 import textwrap
-import unicodedata
 from typing import Tuple
 
-# Import ANSI codes from shared
-from ..shared import (
-    RESET, FG_GRAY, FG_WHITE, BG_CHARCOAL
-)
+import wcwidth
 
-ANSI_RE = re.compile(r'\x1B\[[0-?]*[ -/]*[@-~]')
+# Import ANSI codes directly to avoid circular import with shared
+from .colors import RESET, FG_GRAY, FG_WHITE, BG_CHARCOAL
+
+ANSI_RE = re.compile(r"\x1B\[[0-?]*[ -/]*[@-~]")
 
 # TUI Layout Constants
 MAX_INPUT_ROWS = 8  # Cap input area at N rows
@@ -23,29 +23,23 @@ def separator_line(width: int) -> str:
 
 def ansi_len(text: str) -> int:
     """Get visible length of text (excluding ANSI codes), accounting for wide chars"""
-    visible = ANSI_RE.sub('', text)
-    width = 0
-    for char in visible:
-        ea_width = unicodedata.east_asian_width(char)
-        if ea_width in ('F', 'W'):  # Fullwidth or Wide
-            width += 2
-        elif ea_width in ('Na', 'H', 'N', 'A'):  # Narrow, Half-width, Neutral, Ambiguous
-            width += 1
-        # else: zero-width characters (combining marks, etc.)
-    return width
+    visible = ANSI_RE.sub("", text)
+    # wcwidth.wcswidth returns -1 if string contains non-printable chars
+    width = wcwidth.wcswidth(visible)
+    return width if width >= 0 else len(visible)
 
 
 def ansi_ljust(text: str, width: int) -> str:
     """Left-justify text to width, accounting for ANSI codes"""
     visible = ansi_len(text)
-    return text + (' ' * (width - visible)) if visible < width else text
+    return text + (" " * (width - visible)) if visible < width else text
 
 
 def bg_ljust(text: str, width: int, bg_color: str) -> str:
     """Left-justify text with background color padding"""
     visible = ansi_len(text)
     if visible < width:
-        padding = ' ' * (width - visible)
+        padding = " " * (width - visible)
         return f"{text}{bg_color}{padding}{RESET}"
     return text
 
@@ -53,7 +47,7 @@ def bg_ljust(text: str, width: int, bg_color: str) -> str:
 def truncate_ansi(text: str, width: int) -> str:
     """Truncate text to width, preserving ANSI codes, accounting for wide chars"""
     if width <= 0:
-        return ''
+        return ""
     visible_len = ansi_len(text)
     if visible_len <= width:
         return text
@@ -64,18 +58,17 @@ def truncate_ansi(text: str, width: int) -> str:
     target = width - 1  # Reserve space for ellipsis
 
     while i < len(text) and visible < target:
-        if text[i] == '\033':
+        if text[i] == "\033":
             match = ANSI_RE.match(text, i)
             if match:
                 result.append(match.group())
                 i = match.end()
                 continue
 
-        # Check character width
-        char_width = 1
-        ea_width = unicodedata.east_asian_width(text[i])
-        if ea_width in ('F', 'W'):  # Fullwidth or Wide
-            char_width = 2
+        # Check character width (wcwidth returns -1 for non-printable, treat as 1)
+        char_width = wcwidth.wcwidth(text[i])
+        if char_width < 0:
+            char_width = 1
 
         # Only add if it fits
         if visible + char_width <= target:
@@ -85,9 +78,9 @@ def truncate_ansi(text: str, width: int) -> str:
             break  # No more space
         i += 1
 
-    result.append('…')
+    result.append("…")
     result.append(RESET)
-    return ''.join(result)
+    return "".join(result)
 
 
 def smart_truncate_name(name: str, width: int) -> str:
@@ -106,7 +99,11 @@ def smart_truncate_name(name: str, width: int) -> str:
     prefix_len = (available + 1) // 2  # Round up for prefix
     suffix_len = available - prefix_len
 
-    return name[:prefix_len] + '…' + name[-suffix_len:] if suffix_len > 0 else name[:prefix_len] + '…'
+    return (
+        name[:prefix_len] + "…" + name[-suffix_len:]
+        if suffix_len > 0
+        else name[:prefix_len] + "…"
+    )
 
 
 def truncate_path(path: str, max_len: int) -> str:
@@ -117,21 +114,21 @@ def truncate_path(path: str, max_len: int) -> str:
     if len(path) <= max_len:
         return path
     if max_len < 8:
-        return '…' + path[-(max_len - 1):]
+        return "…" + path[-(max_len - 1) :]
 
     # Split into directory and filename
-    sep = '/' if '/' in path else '\\'
+    sep = "/" if "/" in path else "\\"
     parts = path.rsplit(sep, 1)
     if len(parts) == 2:
         dirname, filename = parts
         # If filename alone is too long, truncate it from start
         if len(filename) >= max_len - 2:
-            return '…' + sep + filename[-(max_len - 2):]
+            return "…" + sep + filename[-(max_len - 2) :]
         # Otherwise keep filename, truncate directory
         remaining = max_len - len(filename) - 2  # "…" + sep
-        return '…' + dirname[-remaining:] + sep + filename
+        return "…" + dirname[-remaining:] + sep + filename
     # No separator - just truncate from start
-    return '…' + path[-(max_len - 1):]
+    return "…" + path[-(max_len - 1) :]
 
 
 class AnsiTextWrapper(textwrap.TextWrapper):
@@ -163,7 +160,7 @@ class AnsiTextWrapper(textwrap.TextWrapper):
                     cur_line.append(chunks.pop())
 
             if cur_line:
-                lines.append(indent + ''.join(cur_line))
+                lines.append(indent + "".join(cur_line))
 
         return lines
 
@@ -229,7 +226,10 @@ def get_message_pulse_colors(seconds_since: float) -> tuple[str, str]:
     # Foreground: dark (18) → light gray (188)
     fg_val = int(18 + (188 - 18) * eased)
 
-    return f'\033[48;2;{bg_val};{bg_val};{bg_val}m', f'\033[38;2;{fg_val};{fg_val};{fg_val}m'
+    return (
+        f"\033[48;2;{bg_val};{bg_val};{bg_val}m",
+        f"\033[38;2;{fg_val};{fg_val};{fg_val}m",
+    )
 
 
 def get_device_sync_color(seconds_since: float) -> str:
@@ -238,7 +238,7 @@ def get_device_sync_color(seconds_since: float) -> str:
     Smooth RGB gradient from bright cyan to gray over 30 seconds.
     """
     if seconds_since >= 30:
-        return '\033[38;5;245m'  # Gray baseline
+        return "\033[38;5;245m"  # Gray baseline
 
     # Normalize to 0-1 range over 30 seconds
     t = min(seconds_since / 30.0, 1.0)
@@ -248,4 +248,4 @@ def get_device_sync_color(seconds_since: float) -> str:
     g = int(255 - 107 * t)  # 255 → 148
     b = int(255 - 107 * t)  # 255 → 148
 
-    return f'\033[38;2;{r};{g};{b}m'
+    return f"\033[38;2;{r};{g};{b}m"

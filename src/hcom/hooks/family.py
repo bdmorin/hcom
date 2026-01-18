@@ -3,6 +3,7 @@ Not just message relay related code but anything shared
 Functions in this module are called by hooks running in both parent and subagent contexts.
 Parent-only or subagent-only logic belongs in parent.py or subagent.py respectively.
 """
+
 from __future__ import annotations
 from typing import Any
 import sys
@@ -11,65 +12,19 @@ import os
 import socket
 
 from ..shared import MAX_MESSAGES_PER_DELIVERY
-from ..core.instances import load_instance_position, update_instance_position, set_status
-from ..core.messages import get_unread_messages, format_hook_messages
-from .utils import log_hook_error
-
-
-def check_external_stop_notification(instance_name: str, instance_data: dict[str, Any] | None) -> dict[str, Any] | None:
-    """Shared: show notification if instance was externally stopped
-
-    Returns hook output dict or None.
-    """
-    if not instance_data or not instance_data.get('stop_pending'):
-        return None
-
-    # Only show for disabled instances; enabled instances shouldn't be in stop_pending mode.
-    if instance_data.get('enabled', False):
-        return None
-
-    # One-shot guard: don't repeat notification on every hook.
-    if instance_data.get('stop_notified'):
-        return None
-
-    # Check if this was an external stop (someone else stopped this instance)
-    from ..core.db import get_db
-    conn = get_db()
-    stop_event = conn.execute("""
-        SELECT json_extract(data, '$.by') as stopped_by
-        FROM events
-        WHERE instance = ? AND type = 'life' AND json_extract(data, '$.action') = 'stopped'
-        ORDER BY id DESC LIMIT 1
-    """, (instance_name,)).fetchone()
-
-    is_external = stop_event and stop_event['stopped_by'] != instance_name
-
-    if not is_external:
-        return None  # Self-stop, no notification needed
-
-    # Show notification for external stop
-    if not instance_data.get('enabled', False):
-        update_instance_position(instance_name, {'stop_notified': True})
-        message = (
-            "[HCOM NOTIFICATION]\n"
-            "Your HCOM connection has been stopped by an external command.\n"
-            "You will no longer receive messages. Stop your current work immediately."
-        )
-        return {
-            "systemMessage": "[hcom stop notification]",
-            "hookSpecificOutput": {
-                "hookEventName": "PostToolUse",
-                "additionalContext": message
-            }
-        }
-
-    return None
+from ..core.instances import (
+    load_instance_position,
+    update_instance_position,
+    set_status,
+)
+from ..core.messages import get_unread_messages, format_messages_json
+from ..core.log import log_error, log_info
 
 
 def _check_claude_alive() -> bool:
     """Check if Claude process still alive (orphan detection)"""
     # Background instances are intentionally detached (HCOM_BACKGROUND is log filename, not '1')
-    if os.environ.get('HCOM_BACKGROUND'):
+    if os.environ.get("HCOM_BACKGROUND"):
         return True
     # stdin closed = Claude Code died
     return not sys.stdin.closed
@@ -83,27 +38,40 @@ def _setup_tcp_notification(instance_name: str) -> tuple[socket.socket | None, b
     try:
         notify_server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         notify_server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        notify_server.bind(('127.0.0.1', 0))
+        notify_server.bind(("127.0.0.1", 0))
         notify_server.listen(128)  # Larger backlog for notification bursts
         notify_server.setblocking(False)
 
         return (notify_server, True)
     except Exception as e:
-        log_hook_error(f'tcp_notification:{instance_name}', e)
+        log_error(
+            "hooks", "hook.error", e, hook="tcp_notification", instance=instance_name
+        )
         return (None, False)
 
 
 def poll_messages(
     instance_id: str,
     timeout: int,
-    disable_on_timeout: bool = False
 ) -> tuple[int, dict[str, Any] | None, bool]:
-    """Shared message polling for parent Stop and SubagentStop
+    """Stop hook polling loop - NOT used by main path (hcom claude).
+
+    WHEN THIS RUNS:
+    - Headless Claude (hcom claude -p): HCOM_BACKGROUND set, uses this loop
+    - Vanilla Claude (claude + hcom start): no PTY mode, uses this loop
+    - Subagents: SubagentStop uses this for background Task agents
+
+    MAIN PATH BYPASSES THIS:
+    - hcom claude (interactive): HCOM_PTY_MODE=1, Stop hook exits immediately
+      The PTY wrapper's poll thread handles message injection instead.
+      See parent.py:stop() for the early exit, pty/claude.py for PTY injection.
+
+    The loop uses select() on a TCP socket for efficient wake-on-message.
+    Senders call notify_instance() which connects to wake the select().
 
     Args:
         instance_id: Instance name to poll for
         timeout: Timeout in seconds (wait_timeout for parent, subagent_timeout for subagent)
-        disable_on_timeout: Whether to disable instance on timeout (True for subagents)
 
     Returns:
         (exit_code, hook_output, timed_out)
@@ -113,11 +81,8 @@ def poll_messages(
     """
     try:
         instance_data = load_instance_position(instance_id)
-        if not instance_data or not instance_data.get('enabled', False):
-            if instance_data and not instance_data.get('enabled'):
-                # DEBUG: Log disabled instance detected
-                log_hook_error('poll_messages:disabled', f'Instance {instance_id} is disabled, exiting poll')
-                set_status(instance_id, 'inactive', 'exit:disabled')
+        if not instance_data:
+            # Row doesn't exist = not participating
             return (0, None, False)
 
         # Setup TCP notification (both parent and subagent use it)
@@ -137,56 +102,97 @@ def poll_messages(
                 notify_server = None
                 tcp_mode = False
 
-        update_instance_position(instance_id, {
-            'notify_port': notify_port,
-            'tcp_mode': tcp_mode
-        })
+        update_instance_position(instance_id, {"tcp_mode": tcp_mode})
+        # Register TCP endpoint for notifications (so notify_all_instances can wake us).
+        if notify_port:
+            try:
+                from ..core.db import upsert_notify_endpoint
+
+                upsert_notify_endpoint(instance_id, "hook", int(notify_port))
+            except Exception as e:
+                log_error(
+                    "hooks",
+                    "hook.error",
+                    e,
+                    hook="notify_endpoints",
+                    instance=instance_id,
+                )
 
         # Set status BEFORE loop (visible immediately)
-        update_instance_position(instance_id, {'last_stop': time.time()})
-        set_status(instance_id, 'idle')
+        # Note: set_status() atomically updates last_stop when status='listening'
+        is_headless = bool(os.environ.get("HCOM_BACKGROUND"))
+        current_status = instance_data.get("status", "unknown")
+        log_info(
+            "hooks",
+            "poll.set_listening",
+            instance=instance_id,
+            is_headless=is_headless,
+            current_status=current_status,
+            tcp_mode=tcp_mode,
+            has_notify_port=bool(notify_port),
+        )
+        set_status(instance_id, "listening")
+        # Verify status was set
+        verify_data = load_instance_position(instance_id)
+        log_info(
+            "hooks",
+            "poll.listening_set",
+            instance=instance_id,
+            is_headless=is_headless,
+            new_status=verify_data.get("status") if verify_data else "no_data",
+            last_stop=verify_data.get("last_stop") if verify_data else 0,
+        )
 
         start = time.time()
 
         try:
             while time.time() - start < timeout:
-                # Check for disabled/session_ended
+                # Check for stopped (row deleted)
                 instance_data = load_instance_position(instance_id)
-                if not instance_data or not instance_data.get('enabled', False):
-                    set_status(instance_id, 'inactive', 'exit:disabled')
-                    return (0, None, False)
-                if instance_data.get('session_ended'):
+                if not instance_data:
+                    # Instance was stopped (deleted from DB)
                     return (0, None, False)
 
                 # Sync: pull remote state + push local events
                 try:
                     from ..relay import relay_wait
+
                     remaining = timeout - (time.time() - start)
                     relay_wait(min(remaining, 25))  # relay.py logs errors internally
                 except Exception as e:
                     # Best effort - log import/unexpected errors (relay.py handles its own)
-                    log_hook_error('poll_messages:relay_wait', e)
+                    log_error("relay", "relay.error", e, hook="poll_messages")
 
                 # Poll BEFORE select() to catch messages from PostToolUse→Stop transition gap
-                messages, max_event_id = get_unread_messages(instance_id, update_position=False)
+                messages, max_event_id = get_unread_messages(
+                    instance_id, update_position=False
+                )
 
                 if messages:
                     # Orphan detection - don't mark as read if Claude died
                     if not _check_claude_alive():
                         return (0, None, False)
 
-                    # Mark as read and deliver
-                    update_instance_position(instance_id, {'last_event_id': max_event_id})
+                    # Limit messages (both parent and subagent) without losing any unread messages.
+                    deliver_messages = messages[:MAX_MESSAGES_PER_DELIVERY]
 
-                    # Limit messages (both parent and subagent)
-                    messages = messages[:MAX_MESSAGES_PER_DELIVERY]
-                    formatted = format_hook_messages(messages, instance_id)
-                    set_status(instance_id, 'active', f"deliver:{messages[0]['from']}", msg_ts=messages[-1]['timestamp'])
+                    # Mark as read only through the last delivered event ID.
+                    delivered_last_event_id = deliver_messages[-1].get(
+                        "event_id", max_event_id
+                    )
+                    update_instance_position(
+                        instance_id, {"last_event_id": delivered_last_event_id}
+                    )
 
-                    output = {
-                        "decision": "block",
-                        "reason": formatted
-                    }
+                    formatted = format_messages_json(deliver_messages, instance_id)
+                    set_status(
+                        instance_id,
+                        "active",
+                        f"deliver:{deliver_messages[0]['from']}",
+                        msg_ts=deliver_messages[-1]["timestamp"],
+                    )
+
+                    output = {"decision": "block", "reason": formatted}
                     return (2, output, False)
 
                 # Calculate remaining time to prevent timeout overshoot
@@ -199,6 +205,7 @@ def poll_messages(
                 # - Local-only with TCP: select wakes on notification (30s)
                 # - Local-only no TCP: must poll frequently (100ms)
                 from ..relay import is_relay_enabled
+
                 if is_relay_enabled():
                     wait_time = min(remaining, 1.0)
                 elif notify_server:
@@ -208,6 +215,7 @@ def poll_messages(
 
                 if notify_server:
                     import select
+
                     readable, _, _ = select.select([notify_server], [], [], wait_time)
                     if readable:
                         # Drain all pending notifications
@@ -220,18 +228,13 @@ def poll_messages(
                     time.sleep(wait_time)
 
                 # Update heartbeat
-                update_instance_position(instance_id, {'last_stop': time.time()})
+                update_instance_position(instance_id, {"last_stop": time.time()})
 
             # Timeout reached
-            if disable_on_timeout:
-                update_instance_position(instance_id, {'enabled': False})
-                set_status(instance_id, 'inactive', 'exit:timeout')
             return (0, None, True)
 
         finally:
-            # Close socket but keep notify_port in DB (stale reference acceptable)
-            # Notifications to stale port fail silently (best-effort). Better than None which skips notification.
-            # Next Stop cycle updates to new port. Only clear on true exit (disabled/session ended).
+            # Close socket; notify_endpoints pruning is best-effort (stale endpoint acceptable).
             if notify_server:
                 try:
                     notify_server.close()
@@ -240,5 +243,5 @@ def poll_messages(
 
     except Exception as e:
         # Participant context (after gates) - log errors for debugging
-        log_hook_error('poll_messages', e)
+        log_error("hooks", "hook.error", e, hook="poll_messages")
         return (0, None, False)

@@ -1,4 +1,5 @@
 """Configuration management - central config system used by all modules."""
+
 from __future__ import annotations
 
 import os
@@ -11,8 +12,11 @@ from typing import Any
 
 from .paths import hcom_path, atomic_write, CONFIG_FILE
 from ..shared import (
-    parse_env_file, parse_env_value, format_env_value,
-    DEFAULT_CONFIG_HEADER, DEFAULT_CONFIG_DEFAULTS,
+    parse_env_file,
+    parse_env_value,
+    format_env_value,
+    DEFAULT_CONFIG_HEADER,
+    DEFAULT_CONFIG_DEFAULTS,
 )
 
 # ==================== Config Constants ====================
@@ -23,22 +27,22 @@ _HEADER_DEFAULT_EXTRAS: dict[str, str] = {}
 _header_data_started = False
 for _line in DEFAULT_CONFIG_HEADER:
     stripped = _line.strip()
-    if not _header_data_started and (not stripped or stripped.startswith('#')):
+    if not _header_data_started and (not stripped or stripped.startswith("#")):
         _HEADER_COMMENT_LINES.append(_line)
         continue
     if not _header_data_started:
         _header_data_started = True
-    if _header_data_started and '=' in _line:
-        key, _, value = _line.partition('=')
+    if _header_data_started and "=" in _line:
+        key, _, value = _line.partition("=")
         _HEADER_DEFAULT_EXTRAS[key.strip()] = parse_env_value(value)
 
 # Parse known HCOM_* config keys and defaults
 KNOWN_CONFIG_KEYS: list[str] = []
 DEFAULT_KNOWN_VALUES: dict[str, str] = {}
 for _entry in DEFAULT_CONFIG_DEFAULTS:
-    if '=' not in _entry:
+    if "=" not in _entry:
         continue
-    key, _, value = _entry.partition('=')
+    key, _, value = _entry.partition("=")
     key = key.strip()
     KNOWN_CONFIG_KEYS.append(key)
     DEFAULT_KNOWN_VALUES[key] = parse_env_value(value)
@@ -46,13 +50,16 @@ for _entry in DEFAULT_CONFIG_DEFAULTS:
 
 # ==================== Config Error ====================
 
+
 class HcomConfigError(ValueError):
     """Raised when HcomConfig contains invalid values."""
 
     def __init__(self, errors: dict[str, str]):
         self.errors = errors
         if errors:
-            message = "Invalid config:\n" + "\n".join(f"  - {msg}" for msg in errors.values())
+            message = "Invalid config:\n" + "\n".join(
+                f"  - {msg}" for msg in errors.values()
+            )
         else:
             message = "Invalid config"
         super().__init__(message)
@@ -60,19 +67,28 @@ class HcomConfigError(ValueError):
 
 # ==================== Config Dataclass ====================
 
+
 @dataclass
 class HcomConfig:
     """HCOM configuration with validation. Load priority: env → file → defaults"""
-    timeout: int = 1800
+
+    timeout: int = 86400  # Idle timeout - 24hr since last activity (CC hook max)
     subagent_timeout: int = 30
-    terminal: str = 'new'
-    hints: str = ''
-    tag: str = ''
-    claude_args: str = ''
-    relay: str = ''
-    relay_token: str = ''
+    terminal: str = "default"
+    hints: str = ""
+    tag: str = ""
+    claude_args: str = ""
+    gemini_args: str = ""
+    codex_args: str = ""
+    codex_sandbox_mode: str = "workspace"
+    gemini_system_prompt: str = ""
+    codex_system_prompt: str = ""
+    relay: str = ""
+    relay_token: str = ""
     relay_enabled: bool = True
-    name_export: str = ''
+    auto_approve: bool = True
+    default_subscriptions: str = "collision"
+    name_export: str = ""
 
     def __post_init__(self):
         """Validate configuration on construction"""
@@ -96,82 +112,178 @@ class HcomConfig:
 
         # Validate timeout
         if isinstance(self.timeout, bool):
-            set_error('timeout', f"timeout must be an integer, not boolean (got {self.timeout})")
+            set_error(
+                "timeout",
+                f"timeout must be an integer, not boolean (got {self.timeout})",
+            )
         elif not isinstance(self.timeout, int):
-            set_error('timeout', f"timeout must be an integer, got {type(self.timeout).__name__}")
+            set_error(
+                "timeout",
+                f"timeout must be an integer, got {type(self.timeout).__name__}",
+            )
         elif not 1 <= self.timeout <= 86400:
-            set_error('timeout', f"timeout must be 1-86400 seconds (24 hours), got {self.timeout}")
+            set_error(
+                "timeout",
+                f"timeout must be 1-86400 seconds (24 hours), got {self.timeout}",
+            )
 
         # Validate subagent_timeout
         if isinstance(self.subagent_timeout, bool):
-            set_error('subagent_timeout', f"subagent_timeout must be an integer, not boolean (got {self.subagent_timeout})")
+            set_error(
+                "subagent_timeout",
+                f"subagent_timeout must be an integer, not boolean (got {self.subagent_timeout})",
+            )
         elif not isinstance(self.subagent_timeout, int):
-            set_error('subagent_timeout', f"subagent_timeout must be an integer, got {type(self.subagent_timeout).__name__}")
+            set_error(
+                "subagent_timeout",
+                f"subagent_timeout must be an integer, got {type(self.subagent_timeout).__name__}",
+            )
         elif not 1 <= self.subagent_timeout <= 86400:
-            set_error('subagent_timeout', f"subagent_timeout must be 1-86400 seconds, got {self.subagent_timeout}")
+            set_error(
+                "subagent_timeout",
+                f"subagent_timeout must be 1-86400 seconds, got {self.subagent_timeout}",
+            )
 
         # Validate terminal
+        from ..shared import TERMINAL_PRESETS
+
         if not isinstance(self.terminal, str):
-            set_error('terminal', f"terminal must be a string, got {type(self.terminal).__name__}")
+            set_error(
+                "terminal",
+                f"terminal must be a string, got {type(self.terminal).__name__}",
+            )
         elif not self.terminal:  # Empty string
-            set_error('terminal', "terminal cannot be empty")
+            set_error("terminal", "terminal cannot be empty")
         else:
-            valid_modes = ('new', 'here', 'print')
-            if self.terminal not in valid_modes:
-                if '{script}' not in self.terminal:
+            # 'print' mode shows script content without executing (for debugging)
+            # 'here' mode forces running in current terminal (internal/debug)
+            if (
+                self.terminal not in ("default", "print", "here")
+                and self.terminal not in TERMINAL_PRESETS
+            ):
+                if "{script}" not in self.terminal:
                     set_error(
-                        'terminal',
-                        f"terminal must be one of {valid_modes} or custom command with {{script}}, "
-                        f"got '{self.terminal}'"
+                        "terminal",
+                        f"terminal must be 'default', preset name, or custom command with {{script}}, "
+                        f"got '{self.terminal}'",
                     )
 
         # Validate tag (only alphanumeric and hyphens - security: prevent log delimiter injection)
         if not isinstance(self.tag, str):
-            set_error('tag', f"tag must be a string, got {type(self.tag).__name__}")
-        elif self.tag and not re.match(r'^[a-zA-Z0-9-]+$', self.tag):
-            set_error('tag', "tag can only contain letters, numbers, and hyphens")
+            set_error("tag", f"tag must be a string, got {type(self.tag).__name__}")
+        elif self.tag and not re.match(r"^[a-zA-Z0-9-]+$", self.tag):
+            set_error("tag", "tag can only contain letters, numbers, and hyphens")
 
         # Validate claude_args (must be valid shell-quoted string)
         if not isinstance(self.claude_args, str):
-            set_error('claude_args', f"claude_args must be a string, got {type(self.claude_args).__name__}")
+            set_error(
+                "claude_args",
+                f"claude_args must be a string, got {type(self.claude_args).__name__}",
+            )
         elif self.claude_args:
             try:
                 # Test if it can be parsed as shell args
                 shlex.split(self.claude_args)
             except ValueError as e:
-                set_error('claude_args', f"claude_args contains invalid shell quoting: {e}")
+                set_error(
+                    "claude_args", f"claude_args contains invalid shell quoting: {e}"
+                )
+
+        # Validate gemini_args (must be valid shell-quoted string)
+        if not isinstance(self.gemini_args, str):
+            set_error(
+                "gemini_args",
+                f"gemini_args must be a string, got {type(self.gemini_args).__name__}",
+            )
+        elif self.gemini_args:
+            try:
+                # Test if it can be parsed as shell args
+                shlex.split(self.gemini_args)
+            except ValueError as e:
+                set_error(
+                    "gemini_args", f"gemini_args contains invalid shell quoting: {e}"
+                )
+
+        # Validate codex_args (must be valid shell-quoted string)
+        if not isinstance(self.codex_args, str):
+            set_error(
+                "codex_args",
+                f"codex_args must be a string, got {type(self.codex_args).__name__}",
+            )
+        elif self.codex_args:
+            try:
+                # Test if it can be parsed as shell args
+                shlex.split(self.codex_args)
+            except ValueError as e:
+                set_error(
+                    "codex_args", f"codex_args contains invalid shell quoting: {e}"
+                )
+
+        # Validate codex_sandbox_mode (must be one of valid modes)
+        valid_sandbox_modes = ("workspace", "untrusted", "danger-full-access", "none")
+        if not isinstance(self.codex_sandbox_mode, str):
+            set_error(
+                "codex_sandbox_mode",
+                f"codex_sandbox_mode must be a string, got {type(self.codex_sandbox_mode).__name__}",
+            )
+        elif self.codex_sandbox_mode not in valid_sandbox_modes:
+            set_error(
+                "codex_sandbox_mode",
+                f"codex_sandbox_mode must be one of {valid_sandbox_modes}, got '{self.codex_sandbox_mode}'",
+            )
 
         # Validate relay (optional string - URL)
         if not isinstance(self.relay, str):
-            set_error('relay', f"relay must be a string, got {type(self.relay).__name__}")
+            set_error(
+                "relay", f"relay must be a string, got {type(self.relay).__name__}"
+            )
 
         # Validate relay_token (optional string)
         if not isinstance(self.relay_token, str):
-            set_error('relay_token', f"relay_token must be a string, got {type(self.relay_token).__name__}")
+            set_error(
+                "relay_token",
+                f"relay_token must be a string, got {type(self.relay_token).__name__}",
+            )
 
         # Validate relay_enabled (boolean)
         if not isinstance(self.relay_enabled, bool):
-            set_error('relay_enabled', f"relay_enabled must be a boolean, got {type(self.relay_enabled).__name__}")
+            set_error(
+                "relay_enabled",
+                f"relay_enabled must be a boolean, got {type(self.relay_enabled).__name__}",
+            )
+
+        # Validate auto_approve (boolean)
+        if not isinstance(self.auto_approve, bool):
+            set_error(
+                "auto_approve",
+                f"auto_approve must be a boolean, got {type(self.auto_approve).__name__}",
+            )
+
+        # Validate default_subscriptions (comma-separated preset names)
+        if not isinstance(self.default_subscriptions, str):
+            set_error(
+                "default_subscriptions",
+                f"default_subscriptions must be a string, got {type(self.default_subscriptions).__name__}",
+            )
+        elif self.default_subscriptions:
+            # Check each preset name is alphanumeric/underscore (no SQL injection)
+            for preset in self.default_subscriptions.split(","):
+                preset = preset.strip()
+                if preset and not re.match(r"^[a-zA-Z0-9_]+$", preset):
+                    set_error(
+                        "default_subscriptions",
+                        f"default_subscriptions preset '{preset}' contains invalid characters (alphanumeric/underscore only)",
+                    )
 
         return errors
 
     @classmethod
-    def load(cls) -> 'HcomConfig':
+    def load(cls) -> "HcomConfig":
         """Load config with precedence: env var → file → defaults"""
         # Ensure config file exists
         config_path = hcom_path(CONFIG_FILE, ensure_parent=True)
-        created_config = False
         if not config_path.exists():
             _write_default_config(config_path)
-            created_config = True
-
-        # Warn once if legacy config.json still exists when creating config.env
-        legacy_config = hcom_path('config.json')
-        if created_config and legacy_config.exists():
-            print(
-                "Error: Found legacy ~/.hcom/config.json; new config file is: ~/.hcom/config.env.",
-                file=sys.stderr,
-            )
 
         # Parse config file once
         file_config = parse_env_file(config_path) if config_path.exists() else {}
@@ -184,50 +296,104 @@ class HcomConfig:
                 return file_config[key]
             return None
 
-        data = {}
+        data: dict[str, Any] = {}
 
         # Load timeout (requires int conversion)
-        timeout_str = get_var('HCOM_TIMEOUT')
+        timeout_str = get_var("HCOM_TIMEOUT")
         if timeout_str is not None and timeout_str != "":
             try:
-                data['timeout'] = int(timeout_str)
+                data["timeout"] = int(timeout_str)
             except (ValueError, TypeError):
-                print(f"Warning: HCOM_TIMEOUT='{timeout_str}' is not a valid integer, using default", file=sys.stderr)
+                print(
+                    f"Warning: HCOM_TIMEOUT='{timeout_str}' is not a valid integer, using default",
+                    file=sys.stderr,
+                )
 
         # Load subagent_timeout (requires int conversion)
-        subagent_timeout_str = get_var('HCOM_SUBAGENT_TIMEOUT')
+        subagent_timeout_str = get_var("HCOM_SUBAGENT_TIMEOUT")
         if subagent_timeout_str is not None and subagent_timeout_str != "":
             try:
-                data['subagent_timeout'] = int(subagent_timeout_str)
+                data["subagent_timeout"] = int(subagent_timeout_str)
             except (ValueError, TypeError):
-                print(f"Warning: HCOM_SUBAGENT_TIMEOUT='{subagent_timeout_str}' is not a valid integer, using default", file=sys.stderr)
+                print(
+                    f"Warning: HCOM_SUBAGENT_TIMEOUT='{subagent_timeout_str}' is not a valid integer, using default",
+                    file=sys.stderr,
+                )
 
         # Load string values
-        terminal = get_var('HCOM_TERMINAL')
-        if terminal is not None:  # Empty string will fail validation
-            data['terminal'] = terminal
-        hints = get_var('HCOM_HINTS')
+        terminal = get_var("HCOM_TERMINAL")
+        if terminal is not None and terminal != "":  # Empty → uses default
+            data["terminal"] = terminal
+        hints = get_var("HCOM_HINTS")
         if hints is not None:  # Allow empty string for hints (valid value)
-            data['hints'] = hints
-        tag = get_var('HCOM_TAG')
+            data["hints"] = hints
+        tag = get_var("HCOM_TAG")
         if tag is not None:  # Allow empty string for tag (valid value)
-            data['tag'] = tag
-        claude_args = get_var('HCOM_CLAUDE_ARGS')
+            data["tag"] = tag
+        claude_args = get_var("HCOM_CLAUDE_ARGS")
         if claude_args is not None:  # Allow empty string for claude_args (valid value)
-            data['claude_args'] = claude_args
+            data["claude_args"] = claude_args
+        gemini_args = get_var("HCOM_GEMINI_ARGS")
+        if gemini_args is not None:  # Allow empty string for gemini_args (valid value)
+            data["gemini_args"] = gemini_args
+        codex_args = get_var("HCOM_CODEX_ARGS")
+        if codex_args is not None:  # Allow empty string for codex_args (valid value)
+            data["codex_args"] = codex_args
+        codex_sandbox_mode = get_var("HCOM_CODEX_SANDBOX_MODE")
+        if codex_sandbox_mode is not None and codex_sandbox_mode != "":
+            if codex_sandbox_mode == "full-auto":
+                codex_sandbox_mode = "danger-full-access"
+            data["codex_sandbox_mode"] = codex_sandbox_mode
+        gemini_system_prompt = get_var("HCOM_GEMINI_SYSTEM_PROMPT")
+        if gemini_system_prompt is not None:
+            data["gemini_system_prompt"] = gemini_system_prompt
+        codex_system_prompt = get_var("HCOM_CODEX_SYSTEM_PROMPT")
+        if codex_system_prompt is not None:
+            data["codex_system_prompt"] = codex_system_prompt
 
         # Load relay string values
-        relay = get_var('HCOM_RELAY')
-        if relay is not None:  # Allow empty string for relay (valid value - means disabled)
-            data['relay'] = relay
-        relay_token = get_var('HCOM_RELAY_TOKEN')
+        relay = get_var("HCOM_RELAY")
+        if (
+            relay is not None
+        ):  # Allow empty string for relay (valid value - means disabled)
+            data["relay"] = relay
+        relay_token = get_var("HCOM_RELAY_TOKEN")
         if relay_token is not None:  # Allow empty string for token (valid value)
-            data['relay_token'] = relay_token
+            data["relay_token"] = relay_token
 
         # Load relay_enabled (boolean - "0" or "1", default True)
-        relay_enabled_str = get_var('HCOM_RELAY_ENABLED')
+        relay_enabled_str = get_var("HCOM_RELAY_ENABLED")
         if relay_enabled_str is not None:
-            data['relay_enabled'] = relay_enabled_str not in ('0', 'false', 'False', 'no', 'off')
+            data["relay_enabled"] = relay_enabled_str not in (
+                "0",
+                "false",
+                "False",
+                "no",
+                "off",
+                "",
+            )
+
+        # Load auto_approve (boolean - "0" or "1", default True)
+        auto_approve_str = get_var("HCOM_AUTO_APPROVE")
+        if auto_approve_str is not None:
+            data["auto_approve"] = auto_approve_str not in (
+                "0",
+                "false",
+                "False",
+                "no",
+                "off",
+                "",
+            )
+
+        # Load default_subscriptions (comma-separated preset names)
+        default_subscriptions = get_var("HCOM_DEFAULT_SUBSCRIPTIONS")
+        if default_subscriptions is not None:  # Allow empty string (disables defaults)
+            data["default_subscriptions"] = default_subscriptions
+
+        # Load name_export (export instance name to custom env var)
+        name_export = get_var("HCOM_NAME_EXPORT")
+        if name_export is not None:  # Allow empty string (disables export)
+            data["name_export"] = name_export
 
         return cls(**data)  # Validation happens in __post_init__
 
@@ -240,15 +406,16 @@ def get_config_sources() -> dict[str, str]:
     sources = {}
     for key in KNOWN_CONFIG_KEYS:
         if key in os.environ:
-            sources[key] = 'env'
+            sources[key] = "env"
         elif key in file_config:
-            sources[key] = 'file'
+            sources[key] = "file"
         else:
-            sources[key] = 'default'
+            sources[key] = "default"
     return sources
 
 
 # ==================== Config Snapshot ====================
+
 
 @dataclass
 class ConfigSnapshot:
@@ -259,19 +426,27 @@ class ConfigSnapshot:
 
 # ==================== Config Conversion ====================
 
+
 def hcom_config_to_dict(config: HcomConfig) -> dict[str, str]:
     """Convert HcomConfig to string dict for persistence/display."""
     return {
-        'HCOM_TIMEOUT': str(config.timeout),
-        'HCOM_SUBAGENT_TIMEOUT': str(config.subagent_timeout),
-        'HCOM_TERMINAL': config.terminal,
-        'HCOM_HINTS': config.hints,
-        'HCOM_TAG': config.tag,
-        'HCOM_CLAUDE_ARGS': config.claude_args,
-        'HCOM_RELAY': config.relay,
-        'HCOM_RELAY_TOKEN': config.relay_token,
-        'HCOM_RELAY_ENABLED': '1' if config.relay_enabled else '0',
-        'HCOM_NAME_EXPORT': config.name_export,
+        "HCOM_TIMEOUT": str(config.timeout),
+        "HCOM_SUBAGENT_TIMEOUT": str(config.subagent_timeout),
+        "HCOM_TERMINAL": config.terminal,
+        "HCOM_HINTS": config.hints,
+        "HCOM_TAG": config.tag,
+        "HCOM_CLAUDE_ARGS": config.claude_args,
+        "HCOM_GEMINI_ARGS": config.gemini_args,
+        "HCOM_CODEX_ARGS": config.codex_args,
+        "HCOM_CODEX_SANDBOX_MODE": config.codex_sandbox_mode,
+        "HCOM_GEMINI_SYSTEM_PROMPT": config.gemini_system_prompt,
+        "HCOM_CODEX_SYSTEM_PROMPT": config.codex_system_prompt,
+        "HCOM_RELAY": config.relay,
+        "HCOM_RELAY_TOKEN": config.relay_token,
+        "HCOM_RELAY_ENABLED": "1" if config.relay_enabled else "0",
+        "HCOM_AUTO_APPROVE": "1" if config.auto_approve else "0",
+        "HCOM_DEFAULT_SUBSCRIPTIONS": config.default_subscriptions,
+        "HCOM_NAME_EXPORT": config.name_export,
     }
 
 
@@ -280,54 +455,91 @@ def dict_to_hcom_config(data: dict[str, str]) -> HcomConfig:
     errors: dict[str, str] = {}
     kwargs: dict[str, Any] = {}
 
-    timeout_raw = data.get('HCOM_TIMEOUT')
+    timeout_raw = data.get("HCOM_TIMEOUT")
     if timeout_raw is not None:
         stripped = timeout_raw.strip()
         if stripped:
             try:
-                kwargs['timeout'] = int(stripped)
+                kwargs["timeout"] = int(stripped)
             except ValueError:
-                errors['timeout'] = f"timeout must be an integer, got '{timeout_raw}'"
+                errors["timeout"] = f"timeout must be an integer, got '{timeout_raw}'"
         else:
             # Explicit empty string is an error (can't be blank)
-            errors['timeout'] = 'timeout cannot be empty (must be 1-86400 seconds)'
+            errors["timeout"] = "timeout cannot be empty (must be 1-86400 seconds)"
 
-    subagent_raw = data.get('HCOM_SUBAGENT_TIMEOUT')
+    subagent_raw = data.get("HCOM_SUBAGENT_TIMEOUT")
     if subagent_raw is not None:
         stripped = subagent_raw.strip()
         if stripped:
             try:
-                kwargs['subagent_timeout'] = int(stripped)
+                kwargs["subagent_timeout"] = int(stripped)
             except ValueError:
-                errors['subagent_timeout'] = f"subagent_timeout must be an integer, got '{subagent_raw}'"
+                errors["subagent_timeout"] = (
+                    f"subagent_timeout must be an integer, got '{subagent_raw}'"
+                )
         else:
             # Explicit empty string is an error (can't be blank)
-            errors['subagent_timeout'] = 'subagent_timeout cannot be empty (must be positive integer)'
+            errors["subagent_timeout"] = (
+                "subagent_timeout cannot be empty (must be positive integer)"
+            )
 
-    terminal_val = data.get('HCOM_TERMINAL')
+    terminal_val = data.get("HCOM_TERMINAL")
     if terminal_val is not None:
         stripped = terminal_val.strip()
         if stripped:
-            kwargs['terminal'] = stripped
+            kwargs["terminal"] = stripped
         else:
             # Explicit empty string is an error (can't be blank)
-            errors['terminal'] = 'terminal cannot be empty (must be: new, here, print, or custom command)'
+            errors["terminal"] = (
+                "terminal cannot be empty (must be: default, preset name, or custom command)"
+            )
 
     # Optional fields - allow empty strings
-    if 'HCOM_HINTS' in data:
-        kwargs['hints'] = data['HCOM_HINTS']
-    if 'HCOM_TAG' in data:
-        kwargs['tag'] = data['HCOM_TAG']
-    if 'HCOM_CLAUDE_ARGS' in data:
-        kwargs['claude_args'] = data['HCOM_CLAUDE_ARGS']
-    if 'HCOM_RELAY' in data:
-        kwargs['relay'] = data['HCOM_RELAY']
-    if 'HCOM_RELAY_TOKEN' in data:
-        kwargs['relay_token'] = data['HCOM_RELAY_TOKEN']
-    if 'HCOM_RELAY_ENABLED' in data:
-        kwargs['relay_enabled'] = data['HCOM_RELAY_ENABLED'] not in ('0', 'false', 'False', 'no', 'off')
-    if 'HCOM_NAME_EXPORT' in data:
-        kwargs['name_export'] = data['HCOM_NAME_EXPORT']
+    if "HCOM_HINTS" in data:
+        kwargs["hints"] = data["HCOM_HINTS"]
+    if "HCOM_TAG" in data:
+        kwargs["tag"] = data["HCOM_TAG"]
+    if "HCOM_CLAUDE_ARGS" in data:
+        kwargs["claude_args"] = data["HCOM_CLAUDE_ARGS"]
+    if "HCOM_GEMINI_ARGS" in data:
+        kwargs["gemini_args"] = data["HCOM_GEMINI_ARGS"]
+    if "HCOM_CODEX_ARGS" in data:
+        kwargs["codex_args"] = data["HCOM_CODEX_ARGS"]
+    if "HCOM_CODEX_SANDBOX_MODE" in data:
+        codex_sandbox_mode = data["HCOM_CODEX_SANDBOX_MODE"]
+        if codex_sandbox_mode == "full-auto":
+            codex_sandbox_mode = "danger-full-access"
+        kwargs["codex_sandbox_mode"] = codex_sandbox_mode
+    if "HCOM_GEMINI_SYSTEM_PROMPT" in data:
+        kwargs["gemini_system_prompt"] = data["HCOM_GEMINI_SYSTEM_PROMPT"]
+    if "HCOM_CODEX_SYSTEM_PROMPT" in data:
+        kwargs["codex_system_prompt"] = data["HCOM_CODEX_SYSTEM_PROMPT"]
+    if "HCOM_RELAY" in data:
+        kwargs["relay"] = data["HCOM_RELAY"]
+    if "HCOM_RELAY_TOKEN" in data:
+        kwargs["relay_token"] = data["HCOM_RELAY_TOKEN"]
+    if "HCOM_RELAY_ENABLED" in data:
+        kwargs["relay_enabled"] = data["HCOM_RELAY_ENABLED"] not in (
+            "0",
+            "false",
+            "False",
+            "no",
+            "off",
+            "",
+        )
+    if "HCOM_AUTO_APPROVE" in data:
+        kwargs["auto_approve"] = data["HCOM_AUTO_APPROVE"] not in (
+            "0",
+            "false",
+            "False",
+            "no",
+            "off",
+            "",
+        )
+    if "HCOM_DEFAULT_SUBSCRIPTIONS" in data:
+        kwargs["default_subscriptions"] = data["HCOM_DEFAULT_SUBSCRIPTIONS"]
+    if "HCOM_NAME_EXPORT" in data:
+        kwargs["name_export"] = data["HCOM_NAME_EXPORT"]
 
     if errors:
         raise HcomConfigError(errors)
@@ -336,6 +548,7 @@ def dict_to_hcom_config(data: dict[str, str]) -> HcomConfig:
 
 
 # ==================== Config Snapshot I/O ====================
+
 
 def load_config_snapshot() -> ConfigSnapshot:
     """Load config.env into structured snapshot (file contents only)."""
@@ -352,7 +565,7 @@ def load_config_snapshot() -> ConfigSnapshot:
         if key in file_values:
             raw_core[key] = file_values.pop(key)
         else:
-            raw_core[key] = DEFAULT_KNOWN_VALUES.get(key, '')
+            raw_core[key] = DEFAULT_KNOWN_VALUES.get(key, "")
 
     for key, value in file_values.items():
         extras[key] = value
@@ -368,7 +581,7 @@ def load_config_snapshot() -> ConfigSnapshot:
     core_values = hcom_config_to_dict(core)
     # Preserve raw strings for display when they differ from validated values.
     for key, raw_value in raw_core.items():
-        if raw_value != '' and raw_value != core_values.get(key, ''):
+        if raw_value != "" and raw_value != core_values.get(key, ""):
             core_values[key] = raw_value
 
     return ConfigSnapshot(core=core, extras=extras, values=core_values)
@@ -379,14 +592,14 @@ def save_config_snapshot(snapshot: ConfigSnapshot) -> None:
     config_path = hcom_path(CONFIG_FILE, ensure_parent=True)
 
     lines: list[str] = list(_HEADER_COMMENT_LINES)
-    if lines and lines[-1] != '':
-        lines.append('')
+    if lines and lines[-1] != "":
+        lines.append("")
 
     core_values = hcom_config_to_dict(snapshot.core)
     for entry in DEFAULT_CONFIG_DEFAULTS:
-        key, _, _ = entry.partition('=')
+        key, _, _ = entry.partition("=")
         key = key.strip()
-        value = core_values.get(key, '')
+        value = core_values.get(key, "")
         formatted = format_env_value(value)
         if formatted:
             lines.append(f"{key}={formatted}")
@@ -398,29 +611,37 @@ def save_config_snapshot(snapshot: ConfigSnapshot) -> None:
         extras.pop(key, None)
 
     if extras:
-        if lines and lines[-1] != '':
-            lines.append('')
+        if lines and lines[-1] != "":
+            lines.append("")
         for key in sorted(extras.keys()):
             value = extras[key]
             formatted = format_env_value(value)
             lines.append(f"{key}={formatted}" if formatted else f"{key}=")
 
-    content = '\n'.join(lines) + '\n'
+    content = "\n".join(lines) + "\n"
     atomic_write(config_path, content)
 
 
 def save_config(core: HcomConfig, extras: dict[str, str]) -> None:
     """Convenience helper for writing canonical config."""
-    snapshot = ConfigSnapshot(core=core, extras=extras, values=hcom_config_to_dict(core))
+    snapshot = ConfigSnapshot(
+        core=core, extras=extras, values=hcom_config_to_dict(core)
+    )
     save_config_snapshot(snapshot)
 
 
 # ==================== Config File Writing ====================
 
+
 def _write_default_config(config_path: Path) -> None:
     """Write default config file with documentation"""
     try:
-        content = '\n'.join(DEFAULT_CONFIG_HEADER) + '\n' + '\n'.join(DEFAULT_CONFIG_DEFAULTS) + '\n'
+        content = (
+            "\n".join(DEFAULT_CONFIG_HEADER)
+            + "\n"
+            + "\n".join(DEFAULT_CONFIG_DEFAULTS)
+            + "\n"
+        )
         atomic_write(config_path, content)
     except Exception:
         pass
@@ -436,9 +657,15 @@ def get_config() -> HcomConfig:
     global _config_cache
     if _config_cache is None:
         # Detect if running as hook handler (called via 'hcom pre', 'hcom post', etc.)
-        is_hook_context = (
-            len(sys.argv) >= 2 and
-            sys.argv[1] in ('pre', 'post', 'sessionstart', 'userpromptsubmit', 'sessionend', 'subagent-stop', 'poll', 'notify')
+        is_hook_context = len(sys.argv) >= 2 and sys.argv[1] in (
+            "pre",
+            "post",
+            "sessionstart",
+            "userpromptsubmit",
+            "sessionend",
+            "subagent-stop",
+            "poll",
+            "notify",
         )
 
         try:

@@ -1,13 +1,18 @@
 """Messaging commands for HCOM"""
+
 import sys
 from .utils import format_error, validate_message, resolve_identity, validate_flags
-from ..shared import MAX_MESSAGES_PER_DELIVERY, SENDER, HcomError
+from ..shared import MAX_MESSAGES_PER_DELIVERY, SENDER, HcomError, CommandContext
 from ..core.paths import ensure_hcom_directories
 from ..core.db import init_db
-from ..core.instances import load_instance_position, set_status, get_instance_status, initialize_instance_in_position_file
-from ..hooks.subagent import in_subagent_context
-from ..core.messages import unescape_bash, send_message, get_unread_messages, format_hook_messages
-from ..core.helpers import is_mentioned
+from ..core.instances import load_instance_position, set_status, get_instance_status
+from ..core.messages import (
+    unescape_bash,
+    send_message,
+    get_unread_messages,
+    format_hook_messages,
+    format_messages_json,
+)
 
 
 def get_recipient_feedback(delivered_to: list[str]) -> str:
@@ -17,36 +22,38 @@ def get_recipient_feedback(delivered_to: list[str]) -> str:
         delivered_to: Instances that received the message (base names from send_message)
 
     Returns:
-        Formatted string like "Sent to: ◉ alice, ◉ bob" (with full display names)
+        Formatted string like "Sent to: ◉ luna, ◉ nova" (with full display names)
     """
-    from ..shared import STATUS_ICONS, SENDER
+    from ..shared import STATUS_ICONS, ADHOC_ICON
     from ..core.instances import get_full_name
 
     if not delivered_to:
-        # No Claude instances will receive, but bigboss (human at TUI) can see all messages
-        return f"Sent to: {SENDER} (no other active instances)"
+        # No agents will receive, but bigboss (human at TUI) can see all messages
+        return f"Sent to: {SENDER} (no other active agents)"
 
     # Format recipients with status icons
     if len(delivered_to) > 10:
-        return f"Sent to: {len(delivered_to)} instances"
+        return f"Sent to {len(delivered_to)} agents"
 
     recipient_status = []
     for r_name in delivered_to:
         r_data = load_instance_position(r_name)
         if r_data:
-            _, status, _, _, _ = get_instance_status(r_data)
-            icon = STATUS_ICONS.get(status, '◦')
+            status, _, _, _ = get_instance_status(r_data)
+            icon = STATUS_ICONS.get(status, STATUS_ICONS["inactive"])
             display_name = get_full_name(r_data) or r_name
         else:
-            icon = '◦'
+            icon = ADHOC_ICON  # Unknown recipient - neutral (not claiming dead)
             display_name = r_name
         recipient_status.append(f"{icon} {display_name}")
 
     return f"Sent to: {', '.join(recipient_status)}"
 
 
-def cmd_send(argv: list[str], quiet: bool = False) -> int:
-    """Send message to hcom: hcom send "message" [--agentid ID] [--from NAME]"""
+def cmd_send(
+    argv: list[str], quiet: bool = False, *, ctx: CommandContext | None = None
+) -> int:
+    """Send message to hcom: hcom send "message" [--name NAME] [--from NAME]"""
     if not ensure_hcom_directories():
         print(format_error("Failed to create HCOM directories"), file=sys.stderr)
         return 1
@@ -54,165 +61,243 @@ def cmd_send(argv: list[str], quiet: bool = False) -> int:
     init_db()
 
     # Validate: reject unknown flags (common hallucination: -t, -m, -a, etc.)
-    if error := validate_flags('send', argv):
+    if error := validate_flags("send", argv):
         print(format_error(error), file=sys.stderr)
         return 1
 
-    # Parse flags
-    custom_sender = None
+    # Parse --from flag (external sender identity)
+    # -b is alias for --from bigboss (human override)
+    import re
+    from ..shared import SenderIdentity
 
-    # Extract --agentid if present (for subagents)
-    from .utils import parse_agentid_flag
-    subagent_id, argv, agent_id_value = parse_agentid_flag(argv)
+    from_name: str | None = None
+    argv = argv.copy()  # Don't mutate original
 
-    # Check if --agentid was provided but instance not found
-    if subagent_id is None and agent_id_value is not None:
-        print(format_error(f"No instance found with agent_id '{agent_id_value}'"), file=sys.stderr)
-        print(f"Run 'hcom start --agentid {agent_id_value}' first", file=sys.stderr)
-        return 1
+    if "-b" in argv:
+        argv = [a for a in argv if a != "-b"]
+        from_name = "bigboss"
 
-    # STRICT VALIDATION: subagent must exist and be enabled
-    if subagent_id:
-        data = load_instance_position(subagent_id)
-        if not data:
+    if "--from" in argv:
+        idx = argv.index("--from")
+        if idx + 1 < len(argv) and not argv[idx + 1].startswith("-"):
+            from_name = argv[idx + 1]
+            argv = argv[:idx] + argv[idx + 2 :]
+        else:
+            print(format_error("--from requires a value"), file=sys.stderr)
+            return 1
+
+    # Validate --from name if provided
+    if from_name:
+        if len(from_name) > 50:
             print(
-                format_error(f"Subagent '{subagent_id}' not found"),
-                file=sys.stderr
+                format_error(f"Sender name too long ({len(from_name)} chars, max 50)"),
+                file=sys.stderr,
             )
-            print("Run 'hcom start' first", file=sys.stderr)
+            return 1
+        # Check for dangerous/invalid characters (injection prevention + naming consistency)
+        bad_chars = re.findall(r"[|&;$`<>@]", from_name)
+        if bad_chars:
+            print(
+                format_error(
+                    f"Name contains invalid characters: {' '.join(set(bad_chars))}"
+                ),
+                file=sys.stderr,
+            )
             return 1
 
-        if not data.get('enabled', False):
-            print(format_error(f"hcom stopped for {subagent_id}"), file=sys.stderr)
-            return 1
-
-    # Extract --from if present (for custom external sender)
-    if '--from' in argv:
-        idx = argv.index('--from')
-        if idx + 1 < len(argv):
-            custom_sender = argv[idx + 1]
-
-            # Block Task tool subagents from using --from
+    # Guard: subagents must not spoof external sender identities.
+    if from_name:
+        actor = ctx.identity if (ctx and ctx.identity) else None
+        if actor is None:
             try:
-                exec_identity = resolve_identity()  # Current execution context
-                if exec_identity.kind == 'instance' and exec_identity.instance_data:
-                    # Check if executor itself is a subagent
-                    if in_subagent_context(exec_identity.name):
-                        print(format_error(
-                            "Task subagents cannot use --from (use --agentid instead)",
-                            "Run 'hcom start --agentid <agent_id>' first, then 'hcom send \"msg\" --agentid <agent_id>'"
-                        ), file=sys.stderr)
-                        return 1
-            except HcomError:
-                pass  # Can't resolve identity - allow (true external sender)
-
-            # Validate
-            if len(custom_sender) > 50:
-                print(format_error("Sender name too long (max 50 chars)"), file=sys.stderr)
-                return 1
-            if not custom_sender or not all(c.isalnum() or c == '-' for c in custom_sender):
-                print(format_error("Sender name must be alphanumeric with hyphens (no underscores)"), file=sys.stderr)
-                return 1
-            argv = argv[:idx] + argv[idx + 2:]
-        else:
-            print(format_error("--from requires a sender name"), file=sys.stderr)
+                actor = resolve_identity()
+            except Exception:
+                actor = None
+        if (
+            actor
+            and actor.kind == "instance"
+            and actor.instance_data
+            and actor.instance_data.get("parent_name")
+        ):
+            print(
+                format_error(
+                    "Subagents cannot use --from/-b (external sender spoofing)"
+                ),
+                file=sys.stderr,
+            )
             return 1
 
-    # Extract --wait if present (for blocking receive)
-    wait_timeout = None
-    if '--wait' in argv:
-        idx = argv.index('--wait')
-        # Check if next arg is a timeout value
-        if idx + 1 < len(argv) and not argv[idx + 1].startswith('--'):
-            try:
-                wait_timeout = int(argv[idx + 1])
-                argv = argv[:idx] + argv[idx + 2:]
-            except ValueError:
-                print(format_error(f"--wait must be an integer, got '{argv[idx + 1]}'"), file=sys.stderr)
-                return 1
-        else:
-            # No timeout specified, use default (30 minutes)
-            wait_timeout = 1800
-            argv = argv[:idx] + argv[idx + 1:]
+    # Identity (instance-only): CLI supplies ctx (preferred). Direct calls may still pass --name.
+    explicit_name = ctx.explicit_name if ctx else None
+    if ctx is None:
+        from .utils import parse_name_flag
+        from ..core.identity import (
+            _looks_like_uuid,
+            is_valid_base_name,
+            base_name_error,
+        )
+
+        explicit_name, argv = parse_name_flag(argv)
+
+        # If --name provided, validate (instance identity)
+        if explicit_name:
+            # Skip validation for UUIDs (agent_id format)
+            if not _looks_like_uuid(explicit_name):
+                if len(explicit_name) > 50:
+                    print(
+                        format_error(
+                            f"Sender name too long ({len(explicit_name)} chars, max 50)"
+                        ),
+                        file=sys.stderr,
+                    )
+                    return 1
+                # Check for dangerous characters (injection prevention)
+                bad_chars = re.findall(r"[|&;$`<>]", explicit_name)
+                if bad_chars:
+                    print(
+                        format_error(
+                            f"Name contains invalid characters: {' '.join(set(bad_chars))}"
+                        ),
+                        file=sys.stderr,
+                    )
+                    return 1
+                if not is_valid_base_name(explicit_name):
+                    print(format_error(base_name_error(explicit_name)), file=sys.stderr)
+                    return 1
 
     # Extract envelope flags (optional structured messaging)
     envelope = {}
 
     # --intent {request|inform|ack|error}
-    if '--intent' in argv:
-        idx = argv.index('--intent')
-        if idx + 1 < len(argv) and not argv[idx + 1].startswith('--'):
+    if "--intent" in argv:
+        idx = argv.index("--intent")
+        if idx + 1 < len(argv) and not argv[idx + 1].startswith("--"):
             intent_val = argv[idx + 1].lower()
             from ..core.helpers import validate_intent
+
             try:
                 validate_intent(intent_val)
             except ValueError as e:
                 print(format_error(str(e)), file=sys.stderr)
                 return 1
-            envelope['intent'] = intent_val
-            argv = argv[:idx] + argv[idx + 2:]
+            envelope["intent"] = intent_val
+            argv = argv[:idx] + argv[idx + 2 :]
         else:
-            print(format_error("--intent requires a value (request|inform|ack|error)"), file=sys.stderr)
+            print(
+                format_error("--intent requires a value (request|inform|ack|error)"),
+                file=sys.stderr,
+            )
             return 1
 
     # --reply-to <id> or <id:DEVICE>
-    if '--reply-to' in argv:
-        idx = argv.index('--reply-to')
-        if idx + 1 < len(argv) and not argv[idx + 1].startswith('--'):
+    if "--reply-to" in argv:
+        idx = argv.index("--reply-to")
+        if idx + 1 < len(argv) and not argv[idx + 1].startswith("--"):
             reply_to_val = argv[idx + 1]
-            envelope['reply_to'] = reply_to_val
-            argv = argv[:idx] + argv[idx + 2:]
+            envelope["reply_to"] = reply_to_val
+            argv = argv[:idx] + argv[idx + 2 :]
         else:
-            print(format_error("--reply-to requires an event ID (e.g., 42 or 42:BOXE)"), file=sys.stderr)
+            print(
+                format_error("--reply-to requires an event ID (e.g., 42 or 42:BOXE)"),
+                file=sys.stderr,
+            )
             return 1
 
     # --thread <name>
-    if '--thread' in argv:
-        idx = argv.index('--thread')
-        if idx + 1 < len(argv) and not argv[idx + 1].startswith('--'):
+    if "--thread" in argv:
+        idx = argv.index("--thread")
+        if idx + 1 < len(argv) and not argv[idx + 1].startswith("--"):
             thread_val = argv[idx + 1]
             # Validate thread name
             if len(thread_val) > 64:
-                print(format_error("Thread name too long (max 64 chars)"), file=sys.stderr)
+                print(
+                    format_error(
+                        f"Thread name too long ({len(thread_val)} chars, max 64)"
+                    ),
+                    file=sys.stderr,
+                )
                 return 1
-            if not all(c.isalnum() or c in '-_' for c in thread_val):
-                print(format_error("Thread name must be alphanumeric with hyphens/underscores"), file=sys.stderr)
+            if not all(c.isalnum() or c in "-_" for c in thread_val):
+                print(
+                    format_error(
+                        "Thread name must be alphanumeric with hyphens/underscores"
+                    ),
+                    file=sys.stderr,
+                )
                 return 1
-            envelope['thread'] = thread_val
-            argv = argv[:idx] + argv[idx + 2:]
+            envelope["thread"] = thread_val
+            argv = argv[:idx] + argv[idx + 2 :]
         else:
             print(format_error("--thread requires a thread name"), file=sys.stderr)
             return 1
 
     # Validation: ack requires reply_to
-    if envelope.get('intent') == 'ack' and 'reply_to' not in envelope:
+    if envelope.get("intent") == "ack" and "reply_to" not in envelope:
         print(format_error("Intent 'ack' requires --reply-to"), file=sys.stderr)
         return 1
 
     # Validate reply_to exists and inherit thread if not explicit
-    if 'reply_to' in envelope:
+    if "reply_to" in envelope:
         from ..core.messages import resolve_reply_to, get_thread_from_event
-        local_id, error = resolve_reply_to(envelope['reply_to'])
+
+        local_id, error = resolve_reply_to(envelope["reply_to"])
         if error:
             print(format_error(f"Invalid --reply-to: {error}"), file=sys.stderr)
             return 1
         # Thread inheritance: if reply_to without explicit thread, inherit from parent
-        if 'thread' not in envelope and local_id:
+        if "thread" not in envelope and local_id:
             parent_thread = get_thread_from_event(local_id)
             if parent_thread:
-                envelope['thread'] = parent_thread
+                envelope["thread"] = parent_thread
 
-    # First non-flag argument is the message
-    message = unescape_bash(argv[0]) if argv else None
+    # Resolve message from args or stdin
+    use_stdin = False
+    if "--stdin" in argv:
+        argv = [a for a in argv if a != "--stdin"]
+        use_stdin = True
 
-    # Check message provided (optional if --wait is set for polling-only mode)
-    if not message and wait_timeout is None:
+    def _read_stdin() -> str:
+        try:
+            return sys.stdin.read()
+        except OSError:
+            return ""
+
+    message: str | None = None
+    if use_stdin:
+        if argv:
+            print(
+                format_error("--stdin cannot be combined with message arguments"),
+                file=sys.stderr,
+            )
+            return 1
+        message = _read_stdin()
+        if not message:
+            print(format_error("No input received on stdin"), file=sys.stderr)
+            return 1
+    elif not argv and not sys.stdin.isatty():
+        message = _read_stdin()
+        if not message:
+            print(format_error("No input received on stdin"), file=sys.stderr)
+            return 1
+    elif len(argv) > 1:
+        print(
+            format_error("Message must be a single argument or piped via stdin"),
+            file=sys.stderr,
+        )
+        return 1
+    else:
+        message = unescape_bash(argv[0]) if argv else None
+
+    # Check message provided
+    if not message:
         from .utils import get_command_help
+
         print(format_error("No message provided") + "\n", file=sys.stderr)
-        print(get_command_help('send'), file=sys.stderr)
+        print(get_command_help("send"), file=sys.stderr)
         return 1
 
     # Only validate and send if message is provided
+    identity: SenderIdentity | None = None
     if message:
         # Validate message
         error = validate_message(message)
@@ -220,38 +305,50 @@ def cmd_send(argv: list[str], quiet: bool = False) -> int:
             print(error, file=sys.stderr)
             return 1
 
-        # Resolve sender identity (handles all context: CLI, instance, subagent, custom)
-        identity = resolve_identity(subagent_id, custom_sender)
+        # Resolve sender identity
+        # - --from: one-shot external sender
+        # - --name: strict instance lookup
+        # - Neither: auto-detect from environment
+        if from_name:
+            identity = SenderIdentity(kind="external", name=from_name)
+        elif ctx and ctx.identity:
+            identity = ctx.identity
+        elif explicit_name:
+            identity = resolve_identity(name=explicit_name)
+        else:
+            identity = resolve_identity()
 
         # Guard: Block sends from vanilla Claude before opt-in
         import os
-        if identity.kind == 'instance' and not identity.instance_data and os.environ.get('CLAUDECODE') == '1':
-            print(format_error("hcom not started for this instance. Run 'hcom start' first, then use hcom send"), file=sys.stderr)
+
+        if (
+            identity.kind == "instance"
+            and not identity.instance_data
+            and os.environ.get("CLAUDECODE") == "1"
+        ):
+            print(format_error("Cannot send without identity."), file=sys.stderr)
+            print("Run 'hcom start' first, then use 'hcom send'.", file=sys.stderr)
             return 1
 
-        # For instances (not external), check state
-        if identity.kind == 'instance' and identity.instance_data:
+        # For instances (not external), row existence = participating
+        # (No enabled check needed - row exists means active)
 
-            # Check enabled state
-            # Instance exists = participated, so "stopped" not "not started"
-            if not identity.instance_data.get('enabled', False):
-                print(format_error("hcom stopped. Cannot send messages."), file=sys.stderr)
-                return 1
-
-        # Set status to active for subagents
-        if subagent_id:
-            set_status(subagent_id, 'active', 'tool:send')
+        # Status set by _set_hookless_command_status in cli.py for subagent/codex/adhoc
 
         # Pull remote state to ensure delivered_to includes cross-device instances
         try:
-            from ..relay import pull
-            pull()  # relay.py logs errors internally to relay.log
+            from ..relay import is_relay_handled_by_tui, pull
+
+            if not is_relay_handled_by_tui():
+                pull()  # relay.py logs errors internally
         except Exception:
             pass  # Best-effort - local send still works
 
         # Send message and get delivered_to list
         try:
-            delivered_to = send_message(identity, message, envelope if envelope else None)
+            delivered_to = send_message(
+                identity, message, envelope if envelope else None
+            )
         except HcomError as e:
             print(f"Error: {e}", file=sys.stderr)
             return 1
@@ -264,19 +361,25 @@ def cmd_send(argv: list[str], quiet: bool = False) -> int:
         recipient_feedback = get_recipient_feedback(delivered_to)
 
         # Show unread messages if instance context
-        if identity.kind == 'instance':
+        if identity.kind == "instance":
             from ..core.db import get_db
+
             conn = get_db()
             messages, _ = get_unread_messages(identity.name, update_position=True)
             if messages:
-                subagent_names = {row['name'] for row in
-                                conn.execute("SELECT name FROM instances WHERE parent_name = ?", (identity.name,)).fetchall()}
+                subagent_names = {
+                    row["name"]
+                    for row in conn.execute(
+                        "SELECT name FROM instances WHERE parent_name = ?",
+                        (identity.name,),
+                    ).fetchall()
+                }
 
                 # Separate subagent messages from main messages
                 subagent_msgs = []
                 main_msgs = []
                 for msg in messages:
-                    sender = msg['from']
+                    sender = msg["from"]
                     if sender in subagent_names:
                         subagent_msgs.append(msg)
                     else:
@@ -286,11 +389,15 @@ def cmd_send(argv: list[str], quiet: bool = False) -> int:
                 max_msgs = MAX_MESSAGES_PER_DELIVERY
 
                 if main_msgs:
-                    formatted = format_hook_messages(main_msgs[:max_msgs], identity.name)
+                    formatted = format_hook_messages(
+                        main_msgs[:max_msgs], identity.name
+                    )
                     output_parts.append(f"\n{formatted}")
 
                 if subagent_msgs:
-                    formatted = format_hook_messages(subagent_msgs[:max_msgs], identity.name)
+                    formatted = format_hook_messages(
+                        subagent_msgs[:max_msgs], identity.name
+                    )
                     output_parts.append(f"\n[Subagent messages]\n{formatted}")
 
                 print("".join(output_parts))
@@ -300,173 +407,555 @@ def cmd_send(argv: list[str], quiet: bool = False) -> int:
             # External sender - just show feedback
             print(recipient_feedback)
 
-    # External sender polling (--wait flag)
-    # NOTE: The two-step pattern (send first, then --wait separately) is deliberate.
-    # LLMs in AI dev environments won't sit waiting on a long-running command - they'll
-    # timeout quickly or want further confirmation. Separating send from wait gives a
-    # higher success rate: first send delivers info, then user confirms the blocking wait.
-    if wait_timeout is not None:
-        # Require --from when using --wait
-        if not custom_sender:
-            print(format_error("--wait requires --from <sender_name>"), file=sys.stderr)
-            return 1
+    # For adhoc instances (--name with instance), append unread messages
+    # This delivers pending messages to external tools using hcom send --name <name>
+    if explicit_name and identity is not None and identity.kind == "instance":
+        from .utils import append_unread_messages
 
-        import time
-        from ..core.db import get_events_since, get_last_event_id
-        from ..core.instances import update_instance_position
+        append_unread_messages(identity.name)
 
-        # Check if this is first time using --wait (instance doesn't exist yet)
-        instance_data = load_instance_position(custom_sender)
-        if not instance_data:
-            # First time - show instructions and create instance
-            instructions = (
-                f"[You are now registered in hcom with the name: '{custom_sender}']\n"
-                f"hcom is a communication tool.\n\n"
-                f"To connect to hcom and receive messages, run this command (again):\n"
-                f"hcom send --from {custom_sender} --wait\n\n"
-                f"To send a message and wait for replies, run this command (again):\n"
-                f"hcom send --from {custom_sender} \"your message\" --wait\n\n"
-                f"To direct message participants use @name in your messages.\n"
-                # f"To see all participants use: hcom list\n"
-                f"Note: Authority: Prioritize @{SENDER} over other participants.\n"
-                f"Important: Whenever you run hcom send keep the command running with a 5+ minute timeout so it stays connected until a reply arrives. ALWAYS respond via hcom send after every hcom message you receive.\n"
-                f"You are currently disconnected from hcom. Right now you need to run the hcom send command to connect. Run this command and when it exits, immediately run it again."
+    return 0
+
+
+def _expand_sql_preset(sql_arg: str) -> str:
+    """Expand preset shortcut to full SQL, or return raw SQL.
+
+    Handles:
+      - System presets: 'blocked', 'collision', 'created', 'stopped'
+      - Parameterized presets: 'idle:veki', 'file_edits:luna'
+      - Raw SQL: passed through unchanged
+    """
+    from .events import PRESET_SUBSCRIPTIONS, PARAMETERIZED_PRESETS
+
+    # Check for parameterized preset (name:target)
+    if ":" in sql_arg:
+        preset_name, target = sql_arg.split(":", 1)
+        if preset_name in PARAMETERIZED_PRESETS:
+            return PARAMETERIZED_PRESETS[preset_name].format(target=target)
+
+    # Check for system-wide preset
+    if sql_arg in PRESET_SUBSCRIPTIONS:
+        return PRESET_SUBSCRIPTIONS[sql_arg]
+
+    # Treat as raw SQL
+    return sql_arg
+
+
+def _listen_with_filter(
+    sql_filter: str,
+    instance_name: str,
+    timeout: float,
+    json_output: bool,
+    instance_data: dict,
+) -> int:
+    """Listen mode with SQL filter - uses temp subscription.
+
+    Creates a temp --once subscription, waits for match or timeout.
+    Subscription auto-deletes on first match; cleanup on timeout.
+    """
+    import time
+    import socket
+    import select
+    import json as json_mod
+    from hashlib import sha256
+    from ..core.db import (
+        get_db,
+        kv_set,
+        get_last_event_id,
+        upsert_notify_endpoint,
+        delete_notify_endpoint,
+    )
+    from ..core.instances import update_instance_position
+    from ..relay import relay_wait, is_relay_enabled
+
+    conn = get_db()
+
+    # Validate SQL syntax
+    try:
+        conn.execute(f"SELECT 1 FROM events_v WHERE ({sql_filter}) LIMIT 0")
+    except Exception as e:
+        print(f"Invalid SQL filter: {e}", file=sys.stderr)
+        return 1
+
+    # Check for recent match (10s lookback) - return immediately if found
+    from datetime import datetime, timezone
+
+    lookback_ts = datetime.fromtimestamp(time.time() - 10, tz=timezone.utc).isoformat()
+    recent = conn.execute(
+        f"SELECT id, timestamp, type, instance, data FROM events_v WHERE timestamp > ? AND ({sql_filter}) ORDER BY id DESC LIMIT 1",
+        [lookback_ts],
+    ).fetchone()
+    if recent:
+        if json_output:
+            print(
+                json_mod.dumps(
+                    {
+                        "event_id": recent["id"],
+                        "type": recent["type"],
+                        "instance": recent["instance"],
+                        "data": json_mod.loads(recent["data"])
+                        if recent["data"]
+                        else {},
+                    }
+                )
             )
-            print(f"\n{instructions}", file=sys.stderr)
-
-            # Create instance record (enabled=True, last_event_id at tail)
-            try:
-                initialize_instance_in_position_file(custom_sender, enabled=True)
-            except Exception as e:
-                print(format_error(f"Failed to create instance: {e}"), file=sys.stderr)
-                return 1
-            return 0
-
-        # Instance exists - enter polling loop
-        # Mark external sender as idle for TUI/CLI status
-        set_status(custom_sender, 'idle')
-
-        last_pos = instance_data.get('last_event_id', get_last_event_id())
-        current_pos = last_pos
-
-        # Poll with configured timeout (default 30min)
-        poll_timeout = wait_timeout
-        start_time = time.time()
-
-        # Setup TCP notification socket for instant wake on local messages
-        import socket
-        import select
-        notify_server = None
-        notify_port = None
-        try:
-            notify_server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            notify_server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-            notify_server.bind(('127.0.0.1', 0))
-            notify_server.listen(128)
-            notify_server.setblocking(False)
-            notify_port = notify_server.getsockname()[1]
-        except Exception:
-            notify_server = None
-
-        # Initialize heartbeat fields and notify_port
-        try:
-            update_instance_position(custom_sender, {
-                'last_stop': start_time,
-                'wait_timeout': poll_timeout,
-                'notify_port': notify_port,
-            })
-        except Exception as e:
-            print(f"Warning: Failed to update instance position: {e}", file=sys.stderr)
-
-        # Check if already disconnected before starting polling
-        current_instance = load_instance_position(custom_sender)
-        if current_instance and not current_instance.get('enabled', True):
-            print("\n[You have been disconnected from HCOM]", file=sys.stderr)
-            if notify_server:
-                notify_server.close()
-            return 0
         else:
-            print(f"[Polling for messages to @{custom_sender}. ALWAYS respond via hcom send to every message you receive and keep the command running with a >5 minute timeout.]", file=sys.stderr)
+            print(
+                f"[Match found] #{recent['id']} {recent['type']}:{recent['instance']}"
+            )
+        return 0
 
-        try:
-            while (time.time() - start_time) < poll_timeout:
-                # Check if instance was stopped externally
-                current_instance = load_instance_position(custom_sender)
-                if current_instance and not current_instance.get('enabled', True):
-                    print(f"\n[You have been disconnected: HCOM stopped for @{custom_sender}]", file=sys.stderr)
-                    return 0
+    # Create temp --once subscription
+    now = time.time()
+    sub_id = (
+        f"listen-{sha256(f'{instance_name}{sql_filter}{now}'.encode()).hexdigest()[:6]}"
+    )
+    sub_key = f"events_sub:{sub_id}"
 
-                # Sync remote events (long-poll if backend available)
-                remaining = poll_timeout - (time.time() - start_time)
+    # Mark instance as listening BEFORE capturing last_id
+    # This ensures our own status event is excluded from the subscription
+    set_status(instance_name, "listening", f"filter:{sub_id}")
+
+    kv_set(
+        sub_key,
+        json_mod.dumps(
+            {
+                "id": sub_id,
+                "sql": sql_filter,
+                "caller": instance_name,
+                "once": True,
+                "last_id": get_last_event_id(),
+                "created": now,
+            }
+        ),
+    )
+
+    # Setup TCP notify socket
+    notify_server = None
+    notify_port = None
+    try:
+        notify_server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        notify_server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        notify_server.bind(("127.0.0.1", 0))
+        notify_server.listen(128)
+        notify_server.setblocking(False)
+        notify_port = notify_server.getsockname()[1]
+        upsert_notify_endpoint(instance_name, "listen_filter", notify_port)
+    except Exception:
+        notify_server = None
+
+    # Initialize heartbeat
+    start_time = time.time()
+    try:
+        update_instance_position(
+            instance_name,
+            {
+                "last_stop": start_time,
+                "wait_timeout": timeout,
+            },
+        )
+    except Exception:
+        pass
+
+    if not json_output:
+        print(
+            f"[Listening for events matching filter. Timeout: {timeout}s]",
+            file=sys.stderr,
+        )
+
+    try:
+        while (time.time() - start_time) < timeout:
+            # Check if instance was stopped externally
+            current = load_instance_position(instance_name)
+            if not current:
+                if not json_output:
+                    print(
+                        f"\n[Disconnected: HCOM stopped for {instance_name}]",
+                        file=sys.stderr,
+                    )
+                return 0
+
+            # Relay sync (long-poll)
+            remaining = timeout - (time.time() - start_time)
+            if is_relay_enabled():
                 try:
-                    from ..relay import relay_wait
-                    relay_wait(min(remaining, 25))  # relay.py logs errors internally
-                except Exception:
-                    pass  # Best effort sync
-
-                events = get_events_since(current_pos)
-
-                # Get current tag for @mention matching (external senders usually don't have tags)
-                sender_tag = current_instance.get('tag') if current_instance else None
-
-                for event in events:
-                    current_pos = max(current_pos, event['id'])
-                    if event['type'] == 'message':
-                        data = event['data']
-                        if is_mentioned(data.get('text', ''), custom_sender, sender_tag):
-                            update_instance_position(custom_sender, {'last_event_id': current_pos})
-                            set_status(custom_sender, 'active', f"deliver:{data['from']}")
-                            print(f"\n[Message from {data['from']}]")
-                            print(data['text'])
-                            return 0
-
-                # Update position and heartbeat
-                try:
-                    update_instance_position(custom_sender, {
-                        'last_event_id': current_pos,
-                        'last_stop': time.time(),
-                    })
-                except Exception as e:
-                    print(f"Warning: Failed to update instance position: {e}", file=sys.stderr)
-
-                # TCP select for local notifications
-                # - With relay: relay_wait() did long-poll, short TCP check (1s)
-                # - Local-only with TCP: select wakes on notification (30s)
-                # - Local-only no TCP: must poll frequently (100ms)
-                remaining = poll_timeout - (time.time() - start_time)
-                if remaining <= 0:
-                    break
-                from ..relay import is_relay_enabled
-                if is_relay_enabled():
-                    wait_time = min(remaining, 1.0)
-                elif notify_server:
-                    wait_time = min(remaining, 30.0)
-                else:
-                    wait_time = min(remaining, 0.1)
-
-                if notify_server:
-                    readable, _, _ = select.select([notify_server], [], [], wait_time)
-                    if readable:
-                        # Drain all pending notifications
-                        while True:
-                            try:
-                                notify_server.accept()[0].close()
-                            except BlockingIOError:
-                                break
-                else:
-                    time.sleep(wait_time)
-
-            # Timeout
-            update_instance_position(custom_sender, {'last_event_id': current_pos})
-            set_status(custom_sender, 'inactive', 'exit:timeout')
-            print(f"\n[Timeout: no messages after {poll_timeout}s]", file=sys.stderr)
-            return 1
-        finally:
-            if notify_server:
-                try:
-                    notify_server.close()
+                    relay_wait(min(remaining, 25))
                 except Exception:
                     pass
 
+            # Check for subscription message (delivered via send_system_message)
+            messages, _ = get_unread_messages(instance_name, update_position=True)
+            if messages:
+                # Look for subscription notification from [hcom-events]
+                for msg in messages:
+                    if msg.get(
+                        "from"
+                    ) == "[hcom-events]" and f"[sub:{sub_id}]" in msg.get(
+                        "message", ""
+                    ):
+                        # Match found - subscription auto-deleted by --once
+                        if json_output:
+                            # Parse event details from notification
+                            print(
+                                json_mod.dumps(
+                                    {
+                                        "matched": True,
+                                        "notification": msg.get("message", ""),
+                                    }
+                                )
+                            )
+                        else:
+                            print(f"\n{msg.get('message', '')}")
+                        set_status(instance_name, "active", "filter matched")
+                        return 0
 
-    return 0
+                # Other messages received - still waiting for filter match
+                # But show them if not json mode
+                if not json_output:
+                    formatted = format_hook_messages(messages, instance_name)
+                    print(f"\n{formatted}")
+                    print("[Still waiting for filter match...]", file=sys.stderr)
+
+            # Update heartbeat
+            try:
+                update_instance_position(instance_name, {"last_stop": time.time()})
+            except Exception:
+                pass
+
+            # TCP select for local notifications
+            remaining = timeout - (time.time() - start_time)
+            if remaining <= 0:
+                break
+            wait_time = min(remaining, 1.0 if is_relay_enabled() else 5.0)
+
+            if notify_server:
+                readable, _, _ = select.select([notify_server], [], [], wait_time)
+                if readable:
+                    while True:
+                        try:
+                            notify_server.accept()[0].close()
+                        except BlockingIOError:
+                            break
+            else:
+                time.sleep(wait_time)
+
+        # Timeout - cleanup subscription
+        if not json_output:
+            print(f"\n[Timeout: no match after {timeout}s]", file=sys.stderr)
+        if instance_data.get("tool") == "adhoc":
+            set_status(instance_name, "inactive", "exit:timeout")
+        return 0
+
+    except KeyboardInterrupt:
+        if not json_output:
+            print("\n[Interrupted]", file=sys.stderr)
+        return 130
+    finally:
+        # Cleanup subscription if it still exists (timeout case)
+        kv_set(sub_key, None)
+        # Cleanup notify endpoint
+        try:
+            delete_notify_endpoint(instance_name, kind="listen_filter")
+        except Exception:
+            pass
+        if notify_server:
+            try:
+                notify_server.close()
+            except Exception:
+                pass
+
+
+def cmd_listen(argv: list[str], *, ctx: CommandContext | None = None) -> int:
+    """Block and receive messages: hcom listen --name NAME [--timeout N] [--json] [--sql FILTER]"""
+    import time
+    import socket
+    import select
+    from ..core.instances import update_instance_position
+    from ..relay import is_relay_enabled
+
+    if not ensure_hcom_directories():
+        print(format_error("Failed to create HCOM directories"), file=sys.stderr)
+        return 1
+
+    init_db()
+
+    # Validate flags
+    if error := validate_flags("listen", argv):
+        print(format_error(error), file=sys.stderr)
+        return 1
+
+    # Identity: CLI supplies ctx (preferred). Direct calls may still pass --name.
+    name_value = ctx.explicit_name if ctx else None
+    if ctx is None:
+        from .utils import parse_name_flag
+
+        name_value, argv = parse_name_flag(argv)
+
+    if ctx and ctx.identity:
+        identity = ctx.identity
+        instance_name = identity.name
+    elif name_value:
+        # Explicit --name provided - strict instance lookup
+        try:
+            identity = resolve_identity(name=name_value)
+        except HcomError as e:
+            print(format_error(str(e)), file=sys.stderr)
+            return 1
+        instance_name = identity.name
+    else:
+        # No explicit --name - resolve from environment
+        try:
+            identity = resolve_identity()
+            instance_name = identity.name
+        except Exception:
+            print(
+                format_error("--name required (no identity context)"), file=sys.stderr
+            )
+            print("Usage: hcom listen --name <name> [--timeout N]", file=sys.stderr)
+            return 1
+
+    # Parse --timeout (optional, default 24 hours - matches HCOM_TIMEOUT)
+    timeout = 86400  # 24 hours default
+    if "--timeout" in argv:
+        idx = argv.index("--timeout")
+        if idx + 1 < len(argv) and not argv[idx + 1].startswith("--"):
+            try:
+                timeout = int(argv[idx + 1])
+                argv = argv[:idx] + argv[idx + 2 :]
+            except ValueError:
+                print(
+                    format_error(
+                        f"--timeout must be an integer, got '{argv[idx + 1]}'"
+                    ),
+                    file=sys.stderr,
+                )
+                return 1
+        else:
+            print(format_error("--timeout requires a value"), file=sys.stderr)
+            return 1
+
+    # Parse positional timeout (e.g. hcom listen 5)
+    # Be careful not to consume flags or other positional args if we add them later
+    # Only consume if it looks like an integer and we haven't set timeout via flag
+    if not any(
+        arg == "--timeout" for arg in argv
+    ):  # Should be gone if we parsed it, but check to be safe
+        # Find first positional arg that is an integer
+        for i, arg in enumerate(argv):
+            if not arg.startswith("-") and arg.isdigit():
+                timeout = int(arg)
+                # Remove it from argv so it doesn't confuse other things (though usually listen has no other pos args)
+                argv.pop(i)
+                break
+
+    # Quick check mode: timeout <= 1 means instant check (0.1s)
+    # This makes "hcom listen 1" a fast one-shot check for pending messages
+    if timeout <= 1:
+        timeout = 0.1
+
+    # Parse --json (optional)
+    json_output = "--json" in argv
+    if json_output:
+        argv.remove("--json")
+
+    # Parse --sql (optional) - SQL filter mode
+    sql_filter = None
+    if "--sql" in argv:
+        idx = argv.index("--sql")
+        if idx + 1 < len(argv) and not argv[idx + 1].startswith("--"):
+            sql_filter = argv[idx + 1]
+            argv = argv[:idx] + argv[idx + 2 :]
+        else:
+            print(format_error("--sql requires a value"), file=sys.stderr)
+            return 1
+
+    # Use instance_data from identity resolution (already validated by resolve_identity)
+    instance_data = identity.instance_data
+    if not instance_data:
+        # Shouldn't happen - resolve_identity raises if instance not found
+        print(format_error(f"hcom not started for '{instance_name}'."), file=sys.stderr)
+        return 1
+
+    # Branch: SQL filter mode vs message-wait mode
+    if sql_filter:
+        # Expand preset shortcuts (e.g., 'idle:veki' -> full SQL)
+        expanded_sql = _expand_sql_preset(sql_filter)
+        return _listen_with_filter(
+            expanded_sql, instance_name, timeout, json_output, instance_data
+        )
+
+    # Standard message-wait mode below
+    # Mark instance as listening when entering listen loop
+    set_status(instance_name, "listening", "ready")
+
+    start_time = time.time()
+
+    # Setup TCP notification socket for instant wake on local messages
+    notify_server = None
+    notify_port = None
+    try:
+        notify_server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        notify_server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        notify_server.bind(("127.0.0.1", 0))
+        notify_server.listen(128)
+        notify_server.setblocking(False)
+        notify_port = notify_server.getsockname()[1]
+    except Exception:
+        notify_server = None
+
+    # Initialize heartbeat fields (notify endpoint registered separately)
+    try:
+        update_instance_position(
+            instance_name,
+            {
+                "last_stop": start_time,
+                "wait_timeout": timeout,
+            },
+        )
+    except Exception as e:
+        print(f"Warning: Failed to update instance position: {e}", file=sys.stderr)
+
+    # Register notify endpoint without clobbering other listeners (PTY wrappers, hooks).
+    if notify_port:
+        try:
+            from ..core.db import upsert_notify_endpoint
+
+            upsert_notify_endpoint(instance_name, "listen", int(notify_port))
+        except Exception:
+            pass
+
+    # Check if already disconnected before starting polling (row deleted = stopped)
+    current_instance = load_instance_position(instance_name)
+    if not current_instance:
+        print("[You have been disconnected from HCOM]", file=sys.stderr)
+        if notify_server:
+            notify_server.close()
+        return 0
+
+    if not json_output:
+        print(
+            f"[Listening for messages to {instance_name}. Timeout: {timeout}s]",
+            file=sys.stderr,
+        )
+
+    try:
+        while (time.time() - start_time) < timeout:
+            # Check if instance was stopped externally (row deleted = stopped)
+            current_instance = load_instance_position(instance_name)
+            if not current_instance:
+                if not json_output:
+                    print(
+                        f"\n[Disconnected: HCOM stopped for {instance_name}. Unless told otherwise, stop work and end your turn now]",
+                        file=sys.stderr,
+                    )
+                return 0
+
+            # Sync remote events (long-poll if backend available)
+            remaining = timeout - (time.time() - start_time)
+            try:
+                from ..relay import relay_wait
+
+                relay_wait(min(remaining, 25))
+            except Exception:
+                pass  # Best effort sync
+
+            # Use get_unread_messages - same as real instances (handles broadcasts, @mentions, subscriptions)
+            messages, _ = get_unread_messages(instance_name, update_position=True)
+            if messages:
+                # Adhoc: set inactive with context (we don't know what happens after)
+                # Codex: set active:deliver (matches Gemini pattern - notify hook sets idle)
+                # Others: set active (they have hooks to track state)
+                if instance_data.get("tool") == "adhoc":
+                    set_status(instance_name, "inactive", "message received")
+                elif instance_data.get("tool") == "codex":
+                    msg_ts = messages[-1].get("timestamp", "")
+                    set_status(
+                        instance_name,
+                        "active",
+                        f"deliver:{messages[0]['from']}",
+                        msg_ts=msg_ts,
+                    )
+                else:
+                    set_status(instance_name, "active", "finished listening")
+
+                if json_output:
+                    import json
+
+                    for msg in messages:
+                        print(
+                            json.dumps(
+                                {
+                                    "from": msg["from"],
+                                    "text": msg[
+                                        "message"
+                                    ],  # get_unread_messages() uses 'message' key
+                                }
+                            )
+                        )
+                else:
+                    # Default: JSON format for model consumption
+                    formatted = format_messages_json(messages, instance_name)
+                    print(f"\n{formatted}")
+                return 0
+
+            # Update heartbeat
+            try:
+                update_instance_position(
+                    instance_name,
+                    {
+                        "last_stop": time.time(),
+                    },
+                )
+            except Exception as e:
+                print(
+                    f"Warning: Failed to update instance position: {e}", file=sys.stderr
+                )
+
+            # TCP select for local notifications
+            remaining = timeout - (time.time() - start_time)
+            if remaining <= 0:
+                break
+            if is_relay_enabled():
+                wait_time = min(remaining, 1.0)
+            elif notify_server:
+                wait_time = min(remaining, 30.0)
+            else:
+                wait_time = min(remaining, 0.1)
+
+            if notify_server:
+                readable, _, _ = select.select([notify_server], [], [], wait_time)
+                if readable:
+                    # Drain all pending notifications
+                    while True:
+                        try:
+                            notify_server.accept()[0].close()
+                        except BlockingIOError:
+                            break
+            else:
+                time.sleep(wait_time)
+
+        # Timeout
+        # Only set inactive for adhoc instances - others have their own lifecycle
+        if instance_data.get("tool") == "adhoc":
+            set_status(instance_name, "inactive", "exit:timeout")
+        if not json_output:
+            print(f"\n[Timeout: no messages after {timeout}s]", file=sys.stderr)
+        # Timeout is normal for listen (especially for external tools)
+        return 0
+    except KeyboardInterrupt:
+        if not json_output:
+            print("\n[Interrupted]", file=sys.stderr)
+        return 130
+    finally:
+        # Clean up notify endpoint so future sends don't hit stale port
+        try:
+            from ..core.db import delete_notify_endpoint
+
+            delete_notify_endpoint(instance_name, kind="listen")
+        except Exception:
+            pass
+        if notify_server:
+            try:
+                notify_server.close()
+            except Exception:
+                pass

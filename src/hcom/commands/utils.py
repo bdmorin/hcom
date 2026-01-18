@@ -1,138 +1,331 @@
 """Command utilities for HCOM"""
+
 import sys
-import re
-import os
-from ..shared import __version__, MAX_MESSAGE_SIZE, SenderIdentity, SENDER, HcomError
+from typing import Callable
+
+from ..shared import __version__, is_inside_ai_tool
+
+# Re-export resolve_identity from core.identity (centralized identity resolution)
+from ..core.identity import resolve_identity  # noqa: F401
 
 
 class CLIError(Exception):
     """Raised when arguments cannot be mapped to command semantics."""
 
 
+# Type for help entries: static tuple or callable returning tuple
+HelpEntry = tuple[str, str] | Callable[[], tuple[str, str]]
+
+
+def _dynamic_terminal_help(tool: str) -> Callable[[], tuple[str, str]]:
+    """Create dynamic help entry for tool launch terminal behavior."""
+
+    def _help() -> tuple[str, str]:
+        if is_inside_ai_tool():
+            return (f"  hcom {tool}", "Opens new terminal")
+        return (f"  hcom {tool}", "Runs in current terminal")
+
+    return _help
+
+
 # Command registry - single source of truth for CLI help
 # Format: list of (usage, description) tuples per command
-COMMAND_HELP: dict[str, list[tuple[str, str]]] = {
-    'events': [
-        ('', 'Query the event stream (messages, status changes, file edits, lifecycle)'),
-        ('', ''),
-        ('Query:', ''),
-        ('  events', 'Recent events as JSON'),
-        ('  --last N', 'Limit count (default: 20)'),
-        ('  --sql EXPR', 'SQL WHERE filter'),
-        ('  --wait [SEC]', 'Block until match (default: 60s)'),
-        ('', ''),
-        ('Subscribe:', ''),
-        ('  events sub', 'List subscriptions'),
-        ('  events sub "sql"', 'Push notification when event matches SQL'),
-        ('  events sub collision', 'Alert when instances edit same file'),
-        ('    --once', 'Auto-remove after first match'),
-        ('    --for <name>', 'Subscribe for another instance'),
-        ('  events unsub <id>', 'Remove subscription by ID'),
-        ('  events unsub collision', 'Disable collision alerts'),
-        ('', ''),
-        ('SQL columns (events_v view):', ''),
-        ('  Base', 'id, timestamp, type, instance'),
-        ('  msg_*', 'from, text, scope, sender_kind, delivered_to, mentions, intent, thread, reply_to'),
-        ('  status_*', 'val, context, detail'),
-        ('  life_*', 'action, by, batch_id, reason'),
-        ('', ''),
-        ('', 'Example: msg_from = \'alice\' AND type = \'message\''),
-        ('', 'Use <> instead of != for SQL negation'),
+# Entries can be static tuples or callables for dynamic content
+COMMAND_HELP: dict[str, list[HelpEntry]] = {
+    "events": [
+        (
+            "",
+            "Query the event stream (messages, status changes, file edits, lifecycle)",
+        ),
+        ("", ""),
+        ("Query:", ""),
+        ("  events", "Recent events as JSON"),
+        ("  --last N", "Limit count (default: 20)"),
+        ("  --sql EXPR", "SQL WHERE filter"),
+        ("  --wait [SEC]", "Block until match (default: 60s)"),
+        ("", ""),
+        ("Subscribe:", ""),
+        ("  events sub", "List subscriptions"),
+        ('  events sub "sql"', "Push notification when event matches SQL"),
+        ("Presets (system-wide):", ""),
+        ("  events sub collision", "Alert when agents edit same file"),
+        ("  events sub created", "Any instance created"),
+        ("  events sub stopped", "Any instance stopped"),
+        ("  events sub blocked", "Any instance blocked"),
+        ("Presets (per-instance):", ""),
+        ("  events sub idle:<name>", "Instance finished (listening)"),
+        ("  events sub file_edits:<name>", "Instance edited a file"),
+        ("  events sub user_input:<name>", "User prompt or @bigboss msg"),
+        ("  events sub created:<name>", "Instance created"),
+        ("  events sub stopped:<name>", "Instance stopped"),
+        ("  events sub blocked:<name>", "Instance blocked"),
+        ("Presets (command watch):", ""),
+        ('  events sub cmd:"pattern"', "Shell commands containing pattern"),
+        ('  events sub cmd:<name>:"pattern"', "Commands from specific instance"),
+        ('  events sub cmd-starts:"pattern"', "Commands starting with pattern"),
+        ('  events sub cmd-exact:"pattern"', "Commands matching exactly"),
+        ("    --once", "Auto-remove after first match"),
+        ("    --for <name>", "Subscribe for another agent"),
+        ("  events unsub <id|preset>", "Remove subscription"),
+        ("", ""),
+        ("SQL columns (events_v view):", ""),
+        ("  Base", "id, timestamp, type, instance"),
+        (
+            "  msg_*",
+            "from, text, scope, sender_kind, delivered_to[], mentions[], intent, thread, reply_to",
+        ),
+        ("  status_*", "val, context, detail"),
+        ("  life_*", "action, by, batch_id, reason"),
+        ("Field values:", ""),
+        ("  type", "message, status, life"),
+        ("  msg_scope", "broadcast, mentions"),
+        ("  msg_sender_kind", "instance, external, system"),
+        ("  status_context", "tool:X, deliver:X, approval, prompt, exit:X"),
+        ("  life_action", "created, ready, stopped, batch_launched"),
+        ("", ""),
+        ("", "Example: msg_from = 'luna' AND type = 'message'"),
+        ("", "Use <> instead of != for SQL negation"),
     ],
-    'list': [
-        ('list', 'All instances'),
-        (' -v', 'Verbose output of all instances'),
-        (' --json', 'Verbose JSON output of all instances'),
-        ('',''),
-        ('list [self|<name>]', 'Instance details'),
-        ('  [field]', 'Print specific field (status, directory, session_id, etc)'),
-        ('  --json', 'Output as JSON'),
-        ('  --sh', 'Shell exports: eval "$(hcom list self --sh)"'),
+    "list": [
+        ("list", "All agents"),
+        ("  -v", "Verbose"),
+        ("  --json", "Verbose JSON (one per line)"),
+        ("", ""),
+        ("list [self|<name>]", "Details"),
+        ("  [field]", "Print specific field (status, directory, session_id, etc)"),
+        ("  --json", "Output as JSON"),
+        ("  --sh", 'Shell exports: eval "$(hcom list self --sh)"'),
     ],
-    'send': [
-        ('send "msg"', 'Send message to all your best buddies'),
-        ('send "@name msg"', 'Send to specific instance/group'),
-        ('  --from <name>', 'Identity for non-Claude tools (Gemini, scripts)'),
-        ('  --wait', 'Poll for @mentions (use with --from)'),
-        ('Envelope (optional):', ''),
-        ('  --intent <type>', 'request|inform|ack|error'),
-        ('  --reply-to <id>', 'Link to event (42 or 42:BOXE for remote)'),
-        ('  --thread <name>', 'Group related messages'),
+    "send": [
+        ('send "msg"', "Broadcast message to all your best buddies"),
+        ('send "@name msg"', "Send to specific agent/group"),
+        ("send --stdin", "Read message from stdin"),
+        ("  --name <name>", "Identity (agent name or UUID)"),
+        ("  --from <name>", "External sender identity, alias: -b"),
+        ("Envelope (optional):", ""),
+        ("  --intent <type>", "request|inform|ack|error"),
+        ("  --reply-to <id>", "Link to event (42 or 42:BOXE for remote)"),
+        ("  --thread <name>", "Group related messages"),
     ],
-    'stop': [
-        ('stop', 'Disable hcom for current instance'),
-        ('stop <name>', 'Disable hcom for specific instance'),
-        ('stop all', 'Disable hcom for all instances'),
+    "stop": [
+        ("stop", "End hcom participation"),
+        ("stop <name>", "End hcom for <name>"),
+        ("stop <n1> <n2> ...", "End hcom for multiple"),
+        ("stop tag:<name>", "End hcom for all with tag"),
+        ("stop all", "End hcom for all"),
     ],
-    'start': [
-        ('start', 'Enable hcom for current instance'),
-        ('start <name>', 'Re-enable stopped instance'),
+    # NOTE: README references `hcom start -h` for remote/sandbox setup instructions.
+    # The sandbox tip below is intentional - agents see it when running help.
+    "start": [
+        ("", "hcom is a cli tool for multi agent communication"),
+        ("", "the hcom start command shows you more info about hcom"),
+        ("", ""),
+        ("start", "Connect to hcom with new identity"),
+        ("start --as <name>", "Reclaim identity after compaction/resume"),
+        ("", ""),
+        (
+            "",
+            "Inside a sandbox? Put this in front of every hcom command you run: HCOM_DIR=$PWD/.hcom",
+        ),
     ],
-    'reset': [
-        ('reset', 'Clear database (archive conversation)'),
-        ('reset hooks', 'Remove hooks only'),
-        ('reset all', 'Stop all + clear db + remove hooks + reset config'),
+    "kill": [
+        ("kill <name>", "Kill headless process (Unix only)"),
+        ("kill all", "Kill all with tracked PIDs"),
+        ("", "Sends SIGTERM to the process group"),
     ],
-    'config': [
-        ('config', 'Show all config values'),
-        ('config <key>', 'Get single config value'),
-        ('config <key> <val>', 'Set config value'),
-        ('  --json', 'JSON output'),
-        ('  --edit', 'Open config in $EDITOR'),
-        ('  --reset', 'Reset config to defaults'),
-        ('Instance config:', ''),
-        ('config -i <name>', 'Show instance config'),
-        ('config -i <name> <key>', 'Get instance config value'),
-        ('config -i <name> <key> <val>', 'Set instance config value'),
-        ('  -i self', 'Current instance (requires Claude context)'),
-        ('  keys: tag, timeout, hints, subagent_timeout', ''),
-        ('Global settings:', ''),
-        ('  HCOM_TAG', 'Group tag (creates tag-* instances)'),
-        ('  HCOM_TERMINAL', 'Terminal: new|here|"custom {script}"'),
-        ('  HCOM_HINTS', 'Text appended to messages received by instance'),
-        ('  HCOM_TIMEOUT', 'Idle timeout in seconds (default: 1800)'),
-        ('  HCOM_SUBAGENT_TIMEOUT', 'Subagent timeout in seconds (default: 30)'),
-        ('  HCOM_CLAUDE_ARGS', 'Default claude args (e.g. "-p --model opus")'),
-        ('  HCOM_RELAY', 'Relay server URL'),
-        ('  HCOM_RELAY_TOKEN', 'Relay auth token'),
-        ('  HCOM_RELAY_ENABLED', 'Enable relay sync (1|0)'),
-        ('  HCOM_NAME_EXPORT', 'Also export instance name to this var'),
-        ('', ''),
-        ('', 'Non-HCOM_* vars in config.env pass through to Claude Code'),
-        ('', 'e.g. ANTHROPIC_MODEL=opus'),
-        ('', ''),
-        ('Precedence:', 'HCOM defaults < config.env < shell env vars'),
-        ('', 'Each resolves independently'),
+    "listen": [
+        ("listen --name X [timeout]", "Block and receive messages"),
+        ("  [timeout]", "Timeout in seconds (alias for --timeout)"),
+        ("  --timeout N", "Timeout in seconds (default: 86400)"),
+        ("  --json", "Output messages as JSON"),
+        ('  --sql "filter"', "Wait for event matching SQL (uses temp subscription)"),
+        ("", ""),
+        ("SQL filter mode:", ""),
+        ("  --sql \"type='message'\"", "Custom SQL against events_v"),
+        ("  --sql idle:name", "Preset: wait for instance to go idle"),
+        ("  --sql stopped:name", "Preset: wait for instance to stop"),
+        ("  --sql blocked:name", "Preset: wait for instance to block"),
+        ("", ""),
+        ("Exit codes:", ""),
+        ("  0", "Message received / event matched"),
+        ("  1", "Timeout or error"),
     ],
-    'relay': [
-        ('relay', 'Show relay status'),
-        ('relay on', 'Enable cross-device chat'),
-        ('relay off', 'Disable cross-device chat'),
-        ('relay pull', 'Fetch from other devices now'),
-        ('relay hf [token]', 'Connect to relay server on HuggingFace'),
-        ('', '(finds or creates a free private space on your HuggingFace account'),
-        ('', 'provide HF_TOKEN or login with hf cli first)'),
+    "reset": [
+        ("reset", "Clear database (archive conversation)"),
+        ("reset all", "Stop all + clear db + remove hooks + reset config"),
+        ("", ""),
+        ("Sandbox/Local Mode:", ""),
+        ("  If you can't write to ~/.hcom, set:", ""),
+        ('    export HCOM_DIR="$PWD/.hcom"', ""),
+        (
+            "  This installs hooks under $PWD (.claude/.gemini/.codex) and stores state in $HCOM_DIR",
+            "",
+        ),
+        ("", ""),
+        ("  To remove local setup:", ""),
+        ('    hcom hooks remove && rm -rf "$HCOM_DIR"', ""),
+        ("", ""),
+        ("  To use explicit location:", ""),
+        ("    export HCOM_DIR=/your/path/.hcom", ""),
+        ("", ""),
+        ("  To regain global access:", ""),
+        ("    Fix ~/.hcom permissions, then: hcom hooks remove", ""),
     ],
-    'transcript': [
-        ('transcript', 'Show your conversation transcript (last 10)'),
-        ('transcript N', 'Show exchange N (absolute position)'),
-        ('transcript N-M', 'Show exchanges N through M'),
-        ('transcript @instance', 'See another instance\'s transcript'),
-        ('transcript @instance N', 'Exchange N of another instance'),
-        ('  --last N', 'Limit to last N exchanges'),
-        ('  --full', 'Show full assistant responses'),
-        ('  --detailed', 'Show tool I/O, edits, errors'),
-        ('  --json', 'JSON output'),
+    "config": [
+        ("config", "Show all config values"),
+        ("config <key>", "Get single config value"),
+        ("config <key> <val>", "Set config value"),
+        ("config <key> --info", "Detailed help for a setting (presets, examples)"),
+        ("  --json", "JSON output"),
+        ("  --edit", "Open config in $EDITOR"),
+        ("  --reset", "Reset config to defaults"),
+        ("Runtime agent config:", ""),
+        ("config -i <name>", "Show agent config"),
+        ("config -i <name> <key>", "Get agent config value"),
+        ("config -i <name> <key> <val>", "Set agent config value"),
+        ("  -i self", "Current agent (requires Claude/Gemini/Codex context)"),
+        ("  keys: tag, timeout, hints, subagent_timeout", ""),
+        ("Global settings:", ""),
+        ("  HCOM_TAG", "Group tag (creates tag-* names for agents)"),
+        ("  HCOM_TERMINAL", 'default | <preset> | "cmd {script}"'),
+        ("  HCOM_HINTS", "Text appended to all messages received by agent"),
+        ("  HCOM_SUBAGENT_TIMEOUT", "Claude subagent timeout in seconds (default: 30)"),
+        ("  HCOM_CLAUDE_ARGS", 'Default claude args (e.g. "--model opus")'),
+        ("  HCOM_GEMINI_ARGS", "Default gemini args"),
+        ("  HCOM_CODEX_ARGS", "Default codex args"),
+        ("  HCOM_RELAY", "Relay server URL (set by 'hcom relay hf')"),
+        ("  HCOM_RELAY_TOKEN", "HuggingFace token (set by 'hcom relay hf')"),
+        ("  HCOM_AUTO_APPROVE", "Auto-approve safe hcom commands (1|0)"),
+        ("  HCOM_DEFAULT_SUBSCRIPTIONS", 'Default subscriptions (e.g. "collision")'),
+        ("  HCOM_NAME_EXPORT", "Export instance name to custom env var"),
+        ("", ""),
+        ("", "Non-HCOM_* vars in config.env pass through to Claude/Gemini/Codex"),
+        ("", "e.g. ANTHROPIC_MODEL=opus"),
+        ("", ""),
+        ("Precedence:", "HCOM defaults < config.env < shell env vars"),
+        ("", "Each resolves independently"),
     ],
-    'archive': [
-        ('archive', 'List archived sessions (numbered)'),
-        ('archive <N>', 'Query events from archive (1 = most recent)'),
-        ('archive <N> instances', 'Query instances from archive'),
-        ('archive <name>', 'Query by stable name (prefix match works)'),
-        ('  --here', 'Filter to archives with current directory'),
-        ('  --sql "expr"', 'SQL WHERE filter'),
-        ('  --last N', 'Limit to last N events (default: 20)'),
-        ('  --json', 'JSON output'),
+    "relay": [
+        ("relay", "Show relay status"),
+        ("relay on", "Enable cross-device live sync"),
+        ("relay off", "Disable cross-device live sync"),
+        ("relay pull", "Force sync now"),
+        ("relay hf [token]", "Setup HuggingFace Space relay"),
+        ("  --update", "Update existing Space"),
+        (
+            "",
+            "Finds or duplicates a private, free HF Space to your account as the relay server.",
+        ),
+        ("", "Provide HF_TOKEN or run 'huggingface-cli login' first."),
+    ],
+    "transcript": [
+        ("transcript @name", "View another agent's conversation"),
+        ("transcript @name N", "Show exchange N"),
+        ("transcript @name N-M", "Show exchanges N through M"),
+        ("transcript timeline", "Follow user prompts across all transcripts by time"),
+        ("  --last N", "Limit to last N exchanges (default: 10)"),
+        ("  --full", "Show full assistant responses"),
+        ("  --detailed", "Show tool I/O, edits, errors"),
+        ("  --json", "JSON output"),
+    ],
+    "archive": [
+        ("archive", "List archived sessions (numbered)"),
+        ("archive <N>", "Query events from archive (1 = most recent)"),
+        ("archive <N> agents", "Query agents from archive"),
+        ("archive <name>", "Query by stable name (prefix match works)"),
+        ("  --here", "Filter to archives with current directory"),
+        ('  --sql "expr"', "SQL WHERE filter"),
+        ("  --last N", "Limit to last N events (default: 20)"),
+        ("  --json", "JSON output"),
+    ],
+    "run": [
+        ("run", "List available workflow/launch scripts"),
+        ("run <name> [args]", "Run script or profile"),
+        ("", ""),
+        ("", "Run `hcom run` to see available scripts and more info"),
+        ("", "Run `hcom run <script> --help` for script options"),
+        ("", "Run `hcom run docs` for Python API + full CLI ref + examples"),
+        ("", ""),
+        ("", "Docs sections:"),
+        ("  hcom run docs --cli", "CLI reference only"),
+        ("  hcom run docs --config", "Config settings only"),
+        ("  hcom run docs --api", "Python API + scripts guide"),
+    ],
+    "claude": [
+        ("[N] claude [args...]", "Launch N Claude agents (default N=1)"),
+        ("", ""),
+        _dynamic_terminal_help("claude"),
+        ("  hcom N claude (N>1)", "Opens new terminal windows"),
+        ('  hcom N claude "do task x"', "initial prompt"),
+        ('  hcom 3 claude -p "prompt"', "3 headless in background"),
+        ("  HCOM_TAG=api hcom 2 claude", "Group tag (creates api-*)"),
+        ("  hcom 1 claude --agent <name>", ".claude/agents/<name>.md"),
+        ('  hcom 1 claude --system-prompt "text"', "System prompt"),
+        ("", ""),
+        ("Environment:", ""),
+        ("  HCOM_TAG", "Group tag (agents become tag-*)"),
+        ("  HCOM_TERMINAL", 'default | <preset> | "cmd {script}"'),
+        ("  HCOM_CLAUDE_ARGS", "Default args (merged with CLI)"),
+        ("  HCOM_HINTS", "Appended to messages received"),
+        (
+            "  HCOM_SUBAGENT_TIMEOUT",
+            "Seconds claude subagents are kept alive after finishing task",
+        ),
+        ("", ""),
+        ("", 'Run "claude --help" for Claude CLI options'),
+    ],
+    "gemini": [
+        ("[N] gemini [args...]", "Launch N Gemini agents (default N=1)"),
+        ("", ""),
+        _dynamic_terminal_help("gemini"),
+        ("  hcom N gemini (N>1)", "Opens new terminal windows"),
+        ('  hcom N gemini "do task x"', "initial regular prompt"),
+        ("  hcom N gemini --yolo", "flags forwarded to gemini"),
+        ("  HCOM_TAG=api hcom 2 gemini", "Group tag (creates api-*)"),
+        ("", ""),
+        ("Environment:", ""),
+        ("  HCOM_TAG", "Group tag (agents become tag-*)"),
+        ("  HCOM_TERMINAL", 'default | <preset> | "cmd {script}"'),
+        ("  HCOM_GEMINI_ARGS", "Default args (merged with CLI)"),
+        ("  HCOM_HINTS", "Appended to all messages received"),
+        ("  HCOM_GEMINI_SYSTEM_PROMPT", "Use this for system prompt"),
+        ("", ""),
+        ("", 'Run "gemini --help" for Gemini CLI options'),
+    ],
+    "codex": [
+        ("[N] codex [args...]", "Launch N Codex agents (default N=1)"),
+        ("", ""),
+        _dynamic_terminal_help("codex"),
+        ("  hcom N codex (N>1)", "Opens new terminal windows"),
+        ('  hcom N codex "do task x"', "initial regular prompt"),
+        ("  hcom codex --sandbox danger-full-access", "flags forwarded to codex"),
+        ("  HCOM_TAG=api hcom 2 codex", "Group tag (creates api-*)"),
+        ("", ""),
+        ("Environment:", ""),
+        ("  HCOM_TAG", "Group tag (agents become tag-*)"),
+        ("  HCOM_TERMINAL", 'default | <preset> | "cmd {script}"'),
+        ("  HCOM_CODEX_ARGS", "Default args (merged with CLI)"),
+        ("  HCOM_HINTS", "Appended to messages received"),
+        ("  HCOM_CODEX_SYSTEM_PROMPT", "Use this for system prompt"),
+        ("", ""),
+        ("", 'Run "codex --help" for Codex CLI options'),
+    ],
+    "status": [
+        ("status", "Show hcom installation status and diagnostics"),
+        ("status --logs", "Include recent errors and warnings"),
+        ("status --json", "Machine-readable output"),
+    ],
+    "hooks": [
+        ("hooks", "Show hook status"),
+        ("hooks status", "Same as above"),
+        ("hooks add [tool]", "Add hooks (claude|gemini|codex|all)"),
+        ("hooks remove [tool]", "Remove hooks (claude|gemini|codex|all)"),
+        ("", ""),
+        ("", "Hooks enable automatic message delivery and status tracking."),
+        ("", "Without hooks, use ad-hoc mode (run hcom start in any ai tool)."),
+        ("", ""),
+        ("", "After adding, restart the tool to activate hooks."),
+        ("", "Remove cleans both global (~/) and HCOM_DIR-local if set."),
     ],
 }
 
@@ -141,73 +334,79 @@ def get_command_help(name: str) -> str:
     """Get formatted help for a single command."""
     if name not in COMMAND_HELP:
         return f"Usage: hcom {name}"
-    lines = ['Usage:']
-    for usage, desc in COMMAND_HELP[name]:
+    lines = ["Usage:"]
+    for entry in COMMAND_HELP[name]:
+        # Handle callable entries (dynamic content)
+        usage, desc = entry() if callable(entry) else entry
         if not usage:  # Empty line or plain text
-            lines.append(f"  {desc}" if desc else '')
-        elif usage.startswith('  '):  # Option/setting line
-            lines.append(f"  {usage:<20} {desc}")
-        elif usage.endswith(':'):  # Section header
+            lines.append(f"  {desc}" if desc else "")
+        elif usage.startswith("  "):  # Option/setting line (indented)
+            lines.append(f"  {usage:<32} {desc}")
+        elif usage.endswith(":"):  # Section header
             lines.append(f"\n{usage} {desc}" if desc else f"\n{usage}")
         else:  # Command line
-            lines.append(f"  hcom {usage:<18} {desc}")
-    return '\n'.join(lines)
-
-
-def _format_commands_section() -> str:
-    """Generate Commands section from registry."""
-    lines = []
-    for name, entries in COMMAND_HELP.items():
-        for usage, desc in entries:
-            if usage.startswith('  '):  # Option
-                lines.append(f"  {usage:<18} {desc}")
-            else:  # Command
-                lines.append(f"  {usage:<18} {desc}")
-        lines.append('')  # Blank line between commands
-    return '\n'.join(lines).rstrip()
+            lines.append(f"  hcom {usage:<26} {desc}")
+    return "\n".join(lines)
 
 
 def get_help_text() -> str:
     """Generate help text with current version"""
-    return f"""hcom v{__version__} - Hook-based communication for Claude Code instances
+    return f"""hcom (hook-comms) v{__version__} - multi-agent communication
 
 Usage:
-  hcom                               TUI dashboard
-  [env vars] hcom <N> [claude ...]   Launch instances
-  hcom <command>                     Run command
+  hcom                                  TUI dashboard
+  hcom <N> claude|gemini|codex [args]   Launch (args passed to tool)
+  hcom <command>                        Run command
 
 Commands:
-  send      Send message to your buddies
-  list      Show participants, status, read receipts
-  start     Enable hcom participation
-  stop      Disable hcom participation
-  events    Query events / subscribe for push notifications
-  transcript View conversation transcript
-  config    Get/set config environment variables
-  relay     Cross-device live chat
-  archive   Query archived sessions
-  reset     Archive and clear database or hooks
+  send         Send message to your buddies
+  listen       Block and receive messages
+  list         Show participants, status, read receipts
+  start        Enable hcom participation
+  stop         Disable hcom participation
+  events       Query events / subscribe for push notifications
+  transcript   View another agent's conversation
+  run          Run workflows from ~/.hcom/scripts/
+  config       Get/set config environment variables
+  relay        Cross-device live chat
+  archive      Query archived sessions
+  reset        Archive & clear database
+  hooks        Add or remove hooks
+  status       Show installation status and diagnostics
+
+Identity:
+  1. Run hcom start to get name
+  2. Use --name in all the other hcom commands
 
 Run 'hcom <command> --help' for details.
 """
 
 
 # Known flags per command - for validation against hallucinated flags
-# --agentid required for subagents to identify themselves
+# Global flags accepted by all commands: identity (--name) and help (--help, -h)
+_GLOBAL_FLAGS = {"--name", "--help", "-h"}
 KNOWN_FLAGS: dict[str, set[str]] = {
-    'send': {'--agentid', '--from', '--wait', '--intent', '--reply-to', '--thread'},
-    'events': {'--last', '--wait', '--sql', '--agentid'},
-    'events sub': {'--once', '--for'},
-    'events unsub': set(),
-    'events launch': set(),
-    'list': {'--json', '-v', '--verbose', '--sh', '--agentid'},
-    'start': {'--agentid'},
-    'stop': {'--agentid'},
-    'transcript': {'--last', '--range', '--json', '--full', '--detailed', '--agentid'},
-    'config': {'--json', '--edit', '--reset', '-i'},
-    'reset': set(),  # Just subcommands
-    'relay': {'--name', '--update'},  # For relay hf
-    'archive': {'--json', '--here', '--sql', '--last', '--agentid'},
+    "send": _GLOBAL_FLAGS
+    | {"--intent", "--reply-to", "--thread", "--stdin", "--from", "-b"},
+    "events": _GLOBAL_FLAGS | {"--last", "--wait", "--sql"},
+    "events sub": _GLOBAL_FLAGS | {"--once", "--for"},
+    "events unsub": _GLOBAL_FLAGS,
+    "events launch": _GLOBAL_FLAGS,
+    "list": _GLOBAL_FLAGS | {"--json", "-v", "--verbose", "--sh"},
+    "listen": _GLOBAL_FLAGS | {"--timeout", "--json", "--sql"},
+    "start": _GLOBAL_FLAGS | {"--as"},
+    "kill": _GLOBAL_FLAGS,
+    "stop": _GLOBAL_FLAGS,
+    "transcript": _GLOBAL_FLAGS
+    | {"--last", "--range", "--json", "--full", "--detailed"},
+    "transcript timeline": _GLOBAL_FLAGS | {"--last", "--json", "--full", "--detailed"},
+    "config": _GLOBAL_FLAGS | {"--json", "--edit", "--reset", "-i", "--info"},
+    "reset": _GLOBAL_FLAGS,
+    "relay": _GLOBAL_FLAGS | {"--space", "--update"},
+    "archive": _GLOBAL_FLAGS | {"--json", "--here", "--sql", "--last"},
+    "status": _GLOBAL_FLAGS | {"--json", "--logs"},
+    "run": _GLOBAL_FLAGS,
+    "hooks": _GLOBAL_FLAGS,
 }
 
 
@@ -218,7 +417,7 @@ def validate_flags(cmd: str, argv: list[str]) -> str | None:
     """
     known = KNOWN_FLAGS.get(cmd, set())
     for arg in argv:
-        if arg.startswith('-') and arg not in known:
+        if arg.startswith("-") and arg not in known:
             help_text = get_command_help(cmd)
             return f"Unknown flag '{arg}'\n\n{help_text}"
     return None
@@ -237,136 +436,73 @@ def is_interactive() -> bool:
     return sys.stdin.isatty() and sys.stdout.isatty()
 
 
-def resolve_identity(subagent_id: str | None = None, custom_from: str | None = None, system_sender: str | None = None) -> SenderIdentity:
-    """Resolve identity in CLI/hook context.
+def validate_message(message: str) -> str | None:
+    """Validate message size and content. Returns formatted error or None if valid."""
+    from ..core.messages import validate_message as core_validate
+
+    error = core_validate(message)
+    return format_error(error) if error else None
+
+
+def parse_name_flag(argv: list[str]) -> tuple[str | None, list[str]]:
+    """Parse --name flag from argv.
+
+    The --name flag is the identity flag (strict instance lookup).
+
+    Resolution (handled by resolve_from_name in core.identity):
+    - Instance name → kind='instance'
+    - Agent ID (UUID) → kind='instance'
+    - Error if not found (no external fallback)
 
     Args:
-        subagent_id: Explicit subagent ID (from Task tool context)
-        custom_from: Custom display name (--from flag)
-        system_sender: System notification sender name (e.g., 'hcom-launcher')
+        argv: Command line arguments
 
     Returns:
-        SenderIdentity with kind, name, and instance_data
-
-    Identity kind:
-        - 'external': Custom sender or CLI (--from or bigboss)
-        - 'instance': Real instance (Claude Code with session)
-        - 'system': System notifications (launcher, watchdog, etc)
-    """
-    import os
-    from ..shared import MAPID
-    from ..core.instances import load_instance_position, resolve_instance_name
-    from ..core.config import get_config
-
-    # System sender (internal notifications) - always system
-    if system_sender:
-        return SenderIdentity(kind='system', name=system_sender, instance_data=None)
-
-    # Custom sender (--from) - always external
-    if custom_from:
-        return SenderIdentity(kind='external', name=custom_from, instance_data=None)
-
-    # Subagent explicit (Task tool)
-    if subagent_id:
-        data = load_instance_position(subagent_id)
-        if not data:
-            # This shouldn't happen - cmd_send validates before calling
-            raise HcomError(f"Subagent '{subagent_id}' position data missing")
-        return SenderIdentity(kind='instance', name=subagent_id, instance_data=data, session_id=data.get('session_id'))
-
-    # CLI context (not in Claude Code)
-    if os.environ.get('CLAUDECODE') != '1':
-        return SenderIdentity(kind='external', name=SENDER, instance_data=None)
-
-    # Inside Claude: try session_id (Unix only - CLAUDE_ENV_FILE doesn't work on Windows)
-    session_id = os.environ.get('HCOM_SESSION_ID')
-    if session_id:
-        name, data = resolve_instance_name(session_id, get_config().tag)
-        # Return instance identity (data may be None if not opted in yet)
-        return SenderIdentity(kind='instance', name=name, instance_data=data, session_id=session_id)
-
-    # Try MAPID (Windows fallback - terminal session ID like WT_SESSION)
-    if MAPID:
-        from ..core.db import get_instance_by_mapid, get_db
-        from ..core.instances import resolve_instance_name
-
-        # First try to find existing instance by MAPID
-        data = get_instance_by_mapid(MAPID)
-        if data:
-            return SenderIdentity(kind='instance', name=data['name'], instance_data=data, session_id=data.get('session_id'))
-
-        # No instance for this MAPID - look up session_id from mapping
-        # This handles Windows resume in different terminal (MAPID changes but session_id stays same)
-        conn = get_db()
-        row = conn.execute(
-            "SELECT session_id FROM mapid_sessions WHERE mapid = ?",
-            (MAPID,)
-        ).fetchone()
-
-        if row:
-            # Found session_id mapping - use it for consistent naming across terminals
-            session_id = row['session_id']
-            name, data = resolve_instance_name(session_id, get_config().tag)
-            # Return instance identity (data may be None if not opted in yet)
-            return SenderIdentity(kind='instance', name=name, instance_data=data, session_id=session_id)
-
-    # No identity available - fail with error directing to --from
-    raise HcomError("Cannot resolve identity - use: hcom send --from <yourname> \"message\"")
-
-
-def validate_message(message: str) -> str | None:
-    """Validate message size and content. Returns error message or None if valid."""
-    if not message or not message.strip():
-        return format_error("Message required")
-
-    # Reject control characters (except \n, \r, \t)
-    if re.search(r'[\x00-\x08\x0B-\x0C\x0E-\x1F\u0080-\u009F]', message):
-        return format_error("Message contains control characters")
-
-    if len(message) > MAX_MESSAGE_SIZE:
-        return format_error(f"Message too large (max {MAX_MESSAGE_SIZE} chars)")
-
-    return None
-
-
-def parse_agentid_flag(argv: list[str]) -> tuple[str | None, list[str], str | None]:
-    """Parse --agentid flag and return (instance_name, remaining_argv, agent_id_value)
-
-    Looks up instance by agent_id and returns the instance name.
-    Special case: --agentid parent returns parent's identity.
-
-    Returns:
-        (instance_name, argv, agent_id_value): Instance name if found (else None), argv with flag removed, agent_id value if flag was provided (else None).
+        (name_value, remaining_argv): Identity value if flag provided and argv with flag removed.
 
     Raises:
-        CLIError: If --agentid is provided without a value.
+        CLIError: If --name is provided without a value.
     """
-    if '--agentid' not in argv:
-        return None, argv, None
+    argv = argv.copy()  # Don't mutate original
+    name_value: str | None = None
 
-    idx = argv.index('--agentid')
-    if idx + 1 >= len(argv) or argv[idx + 1].startswith('-'):
-        raise CLIError("--agentid requires a value")
+    name_idxs = [i for i, a in enumerate(argv) if a == "--name"]
+    if len(name_idxs) > 1:
+        raise CLIError("Multiple --name values provided; use exactly one.")
+    if name_idxs:
+        idx = name_idxs[0]
+        if idx + 1 >= len(argv) or argv[idx + 1].startswith("-"):
+            raise CLIError("--name requires a value")
+        name_value = argv[idx + 1]
+        del argv[idx : idx + 2]
 
-    agent_id = argv[idx + 1]
-    argv = argv[:idx] + argv[idx + 2:]
+    return name_value, argv
 
-    # Special case: --agentid parent means use parent's identity
-    if agent_id == 'parent':
-        identity = resolve_identity()
-        # Warn if not in subagent context (subagents are dead)
-        from ..hooks.subagent import in_subagent_context
-        if identity.name and not in_subagent_context(identity.name):
-            import sys
-            print("Warning: --agentid parent not needed (no active subagents)", file=sys.stderr)
-        return identity.name, argv, 'parent'
 
-    # Look up instance by agent_id
-    from ..core.db import get_db
-    conn = get_db()
-    row = conn.execute(
-        "SELECT name FROM instances WHERE agent_id = ?",
-        (agent_id,)
-    ).fetchone()
+def append_unread_messages(instance_name: str, *, json_output: bool = False) -> None:
+    """Check for unread messages and print preview with listen instruction.
 
-    return (row['name'] if row else None), argv, agent_id
+    Called at end of commands with --name to notify of pending messages.
+    Does NOT mark messages as read - instance must run `hcom listen` to receive.
+
+    Args:
+        instance_name: The instance to check messages for
+        json_output: If True, skip appending (preserve machine-readable format)
+    """
+    # Skip for JSON output - would corrupt machine-readable format
+    if json_output:
+        return
+
+    from ..core.messages import get_unread_messages
+    from ..pty.pty_common import build_listen_instruction
+
+    # Check if messages exist WITHOUT marking as read
+    messages, _ = get_unread_messages(instance_name, update_position=False)
+    if not messages:
+        return
+
+    # Print preview with listen instruction (no status update needed)
+    print("\n" + "─" * 40)
+    print("[hcom] new message(s)")
+    print("─" * 40)
+    print(f"\n{build_listen_instruction(instance_name)}")

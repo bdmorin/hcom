@@ -5,12 +5,16 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "hcom"
 dynamic = ["version"]
-description = "Launch multiple Claude Code instances (terminal, headless, or subagents) that communicate together in real time via hooks."
+description = "Realtime messaging and context sharing for AI coding agents (Claude Code, Gemini CLI, Codex)"
 readme = "README.md"
 requires-python = ">=3.10"
 license = "MIT"
 authors = [{name = "aannoo"}]
-keywords = ["claude", "claude-code", "hooks", "agents", "cli", "multi-agent", "orchestration", "terminal"]
+keywords = ["claude", "claude-code", "gemini", "codex", "hooks", "agents", "cli", "multi-agent", "orchestration", "terminal"]
+dependencies = [
+    "ptyprocess>=0.7.0",
+    "pyte>=0.8.2",
+]
 classifiers = [
     "Development Status :: 4 - Beta",
     "Environment :: Console",
@@ -31,16 +35,27 @@ classifiers = [
 hcom = "hcom.__main__:main"
 
 [project.urls]
-Homepage = "https://github.com/aannoo/claude-hook-comms"
-Repository = "https://github.com/aannoo/claude-hook-comms"
-Issues = "https://github.com/aannoo/claude-hook-comms/issues"
-Documentation = "https://github.com/aannoo/claude-hook-comms#readme"
+Homepage = "https://github.com/aannoo/hcom"
+Repository = "https://github.com/aannoo/hcom"
+Issues = "https://github.com/aannoo/hcom/issues"
+Documentation = "https://github.com/aannoo/hcom#readme"
 
-[tool.setuptools]
-packages = ["hcom", "hcom.core", "hcom.hooks", "hcom.commands", "hcom.ui"]
+[tool.setuptools.packages.find]
+where = ["src"]
 
-[tool.setuptools.package-dir]
-"" = "src"
+[tool.setuptools.package-data]
+"hcom.scripts.bundled" = ["*.py"]
 
 [tool.setuptools.dynamic]
 version = {attr = "hcom.shared.__version__"}
+
+[tool.ruff]
+line-length = 120
+
+[tool.ruff.lint]
+select = ["E", "F", "W"]
+
+[tool.ruff.lint.per-file-ignores]
+# Intentional lazy imports for fast CLI startup
+"src/hcom/cli.py" = ["E402"]
+"src/hcom/tools/gemini/settings.py" = ["E402"]

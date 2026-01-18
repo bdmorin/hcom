@@ -1,22 +1,30 @@
 """Keyboard input handling and text editing"""
+
 from __future__ import annotations
 import os
 import select
 import sys
-import unicodedata
 from typing import List, Optional
+
+import wcwidth
 
 # Import from rendering module (single source of truth)
 from .rendering import ANSI_RE, MAX_INPUT_ROWS, ansi_len
 
-# Import ANSI codes from shared module
-from ..shared import (
-    DIM, FG_GRAY, FG_LIGHTGRAY, FG_WHITE,
-    HIDE_CURSOR, RESET, REVERSE, SHOW_CURSOR,
+# Import ANSI codes directly to avoid circular import with shared
+from .colors import (
+    DIM,
+    FG_GRAY,
+    FG_LIGHTGRAY,
+    FG_WHITE,
+    HIDE_CURSOR,
+    RESET,
+    REVERSE,
+    SHOW_CURSOR,
 )
 
 # Platform detection
-IS_WINDOWS = os.name == 'nt'
+IS_WINDOWS = os.name == "nt"
 
 
 def slice_by_visual_width(text: str, max_width: int) -> tuple[str, int]:
@@ -29,7 +37,7 @@ def slice_by_visual_width(text: str, max_width: int) -> tuple[str, int]:
 
     while char_pos < len(text) and visual_width < max_width:
         # Skip ANSI codes (preserve them but don't count their width)
-        if char_pos < len(text) and text[char_pos:char_pos+1] == '\x1b':
+        if char_pos < len(text) and text[char_pos : char_pos + 1] == "\x1b":
             match = ANSI_RE.match(text, char_pos)
             if match:
                 char_pos = match.end()
@@ -38,15 +46,11 @@ def slice_by_visual_width(text: str, max_width: int) -> tuple[str, int]:
         if char_pos >= len(text):
             break
 
-        # Check character width
+        # Check character width (wcwidth returns -1 for non-printable, 0 for zero-width)
         char = text[char_pos]
-        ea_width = unicodedata.east_asian_width(char)
-        if ea_width in ('F', 'W'):  # Fullwidth or Wide
-            char_width = 2
-        elif ea_width in ('Na', 'H', 'N', 'A'):  # Narrow, Half-width, Neutral, Ambiguous
-            char_width = 1
-        else:  # Zero-width characters (combining marks, etc.)
-            char_width = 0
+        char_width = wcwidth.wcwidth(char)
+        if char_width < 0:
+            char_width = 1  # Treat non-printable as width 1
 
         # Check if it fits
         if visual_width + char_width <= max_width:
@@ -66,6 +70,7 @@ class KeyboardInput:
         if not self.is_windows:
             import termios
             import tty
+
             self.termios = termios
             self.tty = tty
             self.fd = sys.stdin.fileno()
@@ -92,6 +97,7 @@ class KeyboardInput:
         """Check if input is available without blocking"""
         if self.is_windows:
             import msvcrt
+
             return msvcrt.kbhit()  # type: ignore[attr-defined]
         else:
             try:
@@ -103,28 +109,29 @@ class KeyboardInput:
         """Read single key press, return special key name or character"""
         if self.is_windows:
             import msvcrt
+
             if not msvcrt.kbhit():  # type: ignore[attr-defined]
                 return None
             ch = msvcrt.getwch()  # type: ignore[attr-defined]
-            if ch in ('\x00', '\xe0'):
+            if ch in ("\x00", "\xe0"):
                 ch2 = msvcrt.getwch()  # type: ignore[attr-defined]
-                keys = {'H': 'UP', 'P': 'DOWN', 'K': 'LEFT', 'M': 'RIGHT'}
+                keys = {"H": "UP", "P": "DOWN", "K": "LEFT", "M": "RIGHT"}
                 return keys.get(ch2, None)
             # Distinguish manual Enter from pasted newlines (Windows)
-            if ch in ('\r', '\n'):
+            if ch in ("\r", "\n"):
                 # If more input is immediately available, it's likely a paste
                 if msvcrt.kbhit():  # type: ignore[attr-defined]
-                    return '\n'  # Pasted newline, keep as literal
+                    return "\n"  # Pasted newline, keep as literal
                 else:
-                    return 'ENTER'  # Manual Enter key press
-            if ch == '\x1b':
-                return 'ESC'
-            if ch in ('\x08', '\x7f'):
-                return 'BACKSPACE'
-            if ch == ' ':
-                return 'SPACE'
-            if ch == '\t':
-                return 'TAB'
+                    return "ENTER"  # Manual Enter key press
+            if ch == "\x1b":
+                return "ESC"
+            if ch in ("\x08", "\x7f"):
+                return "BACKSPACE"
+            if ch == " ":
+                return "SPACE"
+            if ch == "\t":
+                return "TAB"
             return ch if ch else None
         else:
             try:
@@ -134,80 +141,114 @@ class KeyboardInput:
             if not has_data:
                 return None
             try:
-                ch = os.read(self.fd, 1).decode('utf-8', errors='ignore')
-            except OSError:
+                first_byte = os.read(self.fd, 1)
+                if not first_byte:
+                    return None
+                # Determine UTF-8 sequence length from first byte
+                b = first_byte[0]
+                if b < 0x80:
+                    # ASCII (1 byte)
+                    ch = first_byte.decode("utf-8")
+                elif b < 0xC0:
+                    # Invalid leading byte (continuation byte), skip
+                    return None
+                elif b < 0xE0:
+                    # 2-byte sequence
+                    remaining = os.read(self.fd, 1)
+                    ch = (first_byte + remaining).decode("utf-8", errors="replace")
+                elif b < 0xF0:
+                    # 3-byte sequence
+                    remaining = os.read(self.fd, 2)
+                    ch = (first_byte + remaining).decode("utf-8", errors="replace")
+                else:
+                    # 4-byte sequence
+                    remaining = os.read(self.fd, 3)
+                    ch = (first_byte + remaining).decode("utf-8", errors="replace")
+                # Skip replacement characters from malformed sequences
+                if ch == "\ufffd":
+                    return None
+            except (OSError, UnicodeDecodeError):
                 return None
-            if ch == '\x1b':
+            if ch == "\x1b":
                 try:
                     has_escape_data = select.select([self.fd], [], [], 0.1)[0]
                 except (InterruptedError, OSError):
-                    return 'ESC'
+                    return "ESC"
                 if has_escape_data:
                     try:
-                        next1 = os.read(self.fd, 1).decode('utf-8', errors='ignore')
-                        if next1 == '[':
-                            next2 = os.read(self.fd, 1).decode('utf-8', errors='ignore')
-                            keys = {'A': 'UP', 'B': 'DOWN', 'C': 'RIGHT', 'D': 'LEFT'}
+                        next1 = os.read(self.fd, 1).decode("utf-8", errors="ignore")
+                        if next1 == "[":
+                            next2 = os.read(self.fd, 1).decode("utf-8", errors="ignore")
+                            keys = {"A": "UP", "B": "DOWN", "C": "RIGHT", "D": "LEFT"}
                             if next2 in keys:
                                 return keys[next2]
                     except (OSError, UnicodeDecodeError):
                         pass
-                return 'ESC'
+                return "ESC"
             # Distinguish manual Enter from pasted newlines
-            if ch in ('\r', '\n'):
+            if ch in ("\r", "\n"):
                 # If more input is immediately available, it's likely a paste
                 try:
                     has_paste_data = select.select([self.fd], [], [], 0.0)[0]
                 except (InterruptedError, OSError):
-                    return 'ENTER'
+                    return "ENTER"
                 if has_paste_data:
-                    return '\n'  # Pasted newline, keep as literal
+                    return "\n"  # Pasted newline, keep as literal
                 else:
-                    return 'ENTER'  # Manual Enter key press
-            if ch in ('\x7f', '\x08'):
-                return 'BACKSPACE'
-            if ch == ' ':
-                return 'SPACE'
-            if ch == '\t':
-                return 'TAB'
-            if ch == '\x03':
-                return 'CTRL_C'
-            if ch == '\x04':
-                return 'CTRL_D'
-            if ch == '\x01':
-                return 'CTRL_A'
-            if ch == '\x12':
-                return 'CTRL_R'
+                    return "ENTER"  # Manual Enter key press
+            if ch in ("\x7f", "\x08"):
+                return "BACKSPACE"
+            if ch == " ":
+                return "SPACE"
+            if ch == "\t":
+                return "TAB"
+            if ch == "\x03":
+                return "CTRL_C"
+            if ch == "\x04":
+                return "CTRL_D"
+            if ch == "\x0b":
+                return "CTRL_K"
+            if ch == "\x07":
+                return "CTRL_G"
+            if ch == "\x12":
+                return "CTRL_R"
             return ch
 
 
 # Text input helper functions (shared between MANAGE and LAUNCH)
 
+
 def text_input_insert(buffer: str, cursor: int, text: str) -> tuple[str, int]:
     """Insert text at cursor position, return (new_buffer, new_cursor)"""
     # Strip ANSI codes from pasted text (prevents cursor/layout issues)
-    clean_text = ANSI_RE.sub('', text)
+    clean_text = ANSI_RE.sub("", text)
     new_buffer = buffer[:cursor] + clean_text + buffer[cursor:]
     new_cursor = cursor + len(clean_text)
     return new_buffer, new_cursor
 
+
 def text_input_backspace(buffer: str, cursor: int) -> tuple[str, int]:
     """Delete char before cursor, return (new_buffer, new_cursor)"""
     if cursor > 0:
-        new_buffer = buffer[:cursor-1] + buffer[cursor:]
+        new_buffer = buffer[: cursor - 1] + buffer[cursor:]
         new_cursor = cursor - 1
         return new_buffer, new_cursor
     return buffer, cursor
+
 
 def text_input_move_left(cursor: int) -> int:
     """Move cursor left, return new position"""
     return max(0, cursor - 1)
 
+
 def text_input_move_right(buffer: str, cursor: int) -> int:
     """Move cursor right, return new position"""
     return min(len(buffer), cursor + 1)
 
-def calculate_text_input_rows(text: str, width: int, max_rows: int = MAX_INPUT_ROWS) -> int:
+
+def calculate_text_input_rows(
+    text: str, width: int, max_rows: int = MAX_INPUT_ROWS
+) -> int:
     """Calculate rows needed for wrapped text with literal newlines"""
     if not text:
         return 1
@@ -216,7 +257,7 @@ def calculate_text_input_rows(text: str, width: int, max_rows: int = MAX_INPUT_R
     if width <= 0:
         return max_rows
 
-    lines = text.split('\n')
+    lines = text.split("\n")
     total_rows = 0
     for line in lines:
         if not line:
@@ -227,7 +268,14 @@ def calculate_text_input_rows(text: str, width: int, max_rows: int = MAX_INPUT_R
     return min(total_rows, max_rows)
 
 
-def render_text_input(buffer: str, cursor: int, width: int, max_rows: int, prefix: str = "> ", send_state: str = None) -> List[str]:
+def render_text_input(
+    buffer: str,
+    cursor: int,
+    width: int,
+    max_rows: int,
+    prefix: str = "> ",
+    send_state: str | None = None,
+) -> List[str]:
     """
     Render text input with cursor, wrapping, and literal newlines.
 
@@ -243,10 +291,10 @@ def render_text_input(buffer: str, cursor: int, width: int, max_rows: int, prefi
         List of formatted lines with cursor (█)
     """
     # Determine colors based on send state
-    if send_state == 'sending':
+    if send_state == "sending":
         prefix_color = DIM + FG_GRAY
         text_color = DIM + FG_GRAY
-    elif send_state == 'sent':
+    elif send_state == "sent":
         prefix_color = FG_LIGHTGRAY
         text_color = FG_WHITE
     else:
@@ -267,14 +315,14 @@ def render_text_input(buffer: str, cursor: int, width: int, max_rows: int, prefi
     if cursor < len(buffer):
         # Cursor inverts the character at cursor position
         cursor_char = buffer[cursor]
-        after = buffer[cursor+1:]
+        after = buffer[cursor + 1 :]
         full = before + REVERSE + cursor_char + RESET + after
     else:
         # Cursor at end - show inverted space after last char
-        full = before + REVERSE + ' ' + RESET
+        full = before + REVERSE + " " + RESET
 
     # Split on literal newlines first
-    lines = full.split('\n')
+    lines = full.split("\n")
 
     # Wrap each line if needed
     wrapped = []
@@ -282,7 +330,9 @@ def render_text_input(buffer: str, cursor: int, width: int, max_rows: int, prefi
         if not line:
             # Empty line (from consecutive newlines or trailing newline)
             line_prefix = prefix if line_idx == 0 else " " * len(prefix)
-            wrapped.append(f"{prefix_color if line_idx == 0 else text_color}{line_prefix}{RESET}")
+            wrapped.append(
+                f"{prefix_color if line_idx == 0 else text_color}{line_prefix}{RESET}"
+            )
         else:
             # Wrap long lines by visual width (handles wide chars and ANSI codes)
             char_offset = 0
@@ -294,10 +344,12 @@ def render_text_input(buffer: str, cursor: int, width: int, max_rows: int, prefi
                 is_prefix_line = line_idx == 0 and is_first_chunk
                 line_prefix = prefix if is_prefix_line else " " * len(prefix)
                 pcolor = prefix_color if is_prefix_line else text_color
-                wrapped.append(f"{pcolor}{line_prefix}{RESET}{text_color}{chunk}{RESET}")
+                wrapped.append(
+                    f"{pcolor}{line_prefix}{RESET}{text_color}{chunk}{RESET}"
+                )
                 char_offset += consumed
                 is_first_chunk = False
 
     # Pad or truncate to max_rows
-    result = wrapped + [''] * max(0, max_rows - len(wrapped))
+    result = wrapped + [""] * max(0, max_rows - len(wrapped))
     return result[:max_rows]

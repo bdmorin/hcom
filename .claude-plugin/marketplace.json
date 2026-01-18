@@ -4,13 +4,13 @@
     "name": "aannoo",
     "url": "https://github.com/aannoo"
   },
-  "description": "Multi-agent communication for Claude Code - launch multiple terminals with real-time messaging",
-  "homepage": "https://github.com/aannoo/claude-hook-comms",
+  "description": "Multi-agent communication for AI CLI tools (Claude Code, Gemini CLI, Codex)",
+  "homepage": "https://github.com/aannoo/hcom",
   "plugins": [
     {
       "name": "hcom",
       "source": "./plugin/hcom",
-      "description": "CLI tool for launching multiple Claude Code terminals with interactive subagents, headless persistence, and real-time communication via hooks"
+      "description": "Real-time messaging and context sharing for AI coding agents with hooks integration"
     }
   ]
 }

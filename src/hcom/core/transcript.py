@@ -188,13 +188,13 @@ def summarize_action(text: str, max_len: int = 200) -> str:
     first = lines[0]
     for prefix in ("I'll ", "I will ", "Let me ", "Sure, ", "Okay, ", "OK, "):
         if first.startswith(prefix):
-            first = first[len(prefix):]
+            first = first[len(prefix) :]
             break
     lines[0] = first
 
     summary = " ".join(lines[:3])
     if len(summary) > max_len:
-        summary = summary[:max_len - 3] + "..."
+        summary = summary[: max_len - 3] + "..."
 
     if total_len > len(summary) + 50:
         summary += f" (+{total_len - len(summary)} chars)"
@@ -290,7 +290,7 @@ def _collect_responses_until_next_prompt(
     action_parts = []
     files = []
 
-    for m in messages[start_idx + 1:]:
+    for m in messages[start_idx + 1 :]:
         if m["type"] == "user" and has_user_text(m["content"]):
             break
         if m["type"] == "assistant":
@@ -333,7 +333,7 @@ def parse_claude_thread(
     # Select which messages to process
     if range_tuple:
         start, end = range_tuple
-        selected = user_messages[start - 1:end]  # 1-indexed to 0-indexed
+        selected = user_messages[start - 1 : end]  # 1-indexed to 0-indexed
         base_pos = start
     else:
         selected = user_messages[-last:]
@@ -351,18 +351,22 @@ def parse_claude_thread(
         files = []
 
         if user_idx >= 0:
-            action_parts, files = _collect_responses_until_next_prompt(messages, user_idx)
+            action_parts, files = _collect_responses_until_next_prompt(
+                messages, user_idx
+            )
             if action_parts:
                 action = "\n".join(action_parts)
             files = sorted(set(files))[:5]
 
-        exchanges.append({
-            "position": base_pos + idx,
-            "user": user_text[:300],
-            "action": action,
-            "files": files,
-            "timestamp": user_msg["timestamp"],
-        })
+        exchanges.append(
+            {
+                "position": base_pos + idx,
+                "user": user_text[:300],
+                "action": action,
+                "files": files,
+                "timestamp": user_msg["timestamp"],
+            }
+        )
 
     return {"exchanges": exchanges, "total": total, "error": None}
 
@@ -401,7 +405,7 @@ def parse_claude_thread_detailed(
     # Select which messages to process
     if range_tuple:
         start, end = range_tuple
-        selected = user_messages[start - 1:end]  # 1-indexed to 0-indexed
+        selected = user_messages[start - 1 : end]  # 1-indexed to 0-indexed
         base_pos = start
     else:
         selected = user_messages[-last:]
@@ -449,7 +453,7 @@ def _build_detailed_exchange(
         action_parts = []
         session_id = user_msg["session_id"]
 
-        for m in messages[user_idx + 1:]:
+        for m in messages[user_idx + 1 :]:
             if m["type"] == "user" and has_user_text(m["content"]):
                 break
 
@@ -470,7 +474,12 @@ def _build_detailed_exchange(
                     if edit_info:
                         edits.append(edit_info)
                     if is_err:
-                        errors.append({"tool": tool_record["name"], "content": tr.get("content", "")[:300]})
+                        errors.append(
+                            {
+                                "tool": tool_record["name"],
+                                "content": tr.get("content", "")[:300],
+                            }
+                        )
                         last_was_error = True
                     else:
                         last_was_error = False
@@ -666,6 +675,287 @@ def _format_error_lines(lines: list[str], err: dict) -> None:
 
 
 # =============================================================================
+# Gemini/Codex Parsers
+# =============================================================================
+
+# Tool name normalization for cross-tool consistency
+TOOL_ALIASES = {
+    # Gemini tool names
+    "run_shell_command": "Bash",
+    "read_file": "Read",
+    "write_file": "Write",
+    "edit_file": "Edit",
+    "search_files": "Grep",
+    "list_files": "Glob",
+    "list_directory": "Glob",
+    # Codex tool names
+    "shell": "Bash",
+    "apply_patch": "Edit",
+}
+
+
+def _normalize_tool_name(name: str) -> str:
+    """Normalize tool name to Claude-style for consistency."""
+    # Strip prefixes like "default_api:" or "functions."
+    if ":" in name:
+        name = name.split(":")[-1]
+    if "." in name:
+        name = name.split(".")[-1]
+    return TOOL_ALIASES.get(name, name)
+
+
+def parse_gemini_thread(
+    transcript_path: str | Path,
+    last: int = 10,
+    range_tuple: tuple[int, int] | None = None,
+    detailed: bool = False,
+) -> dict:
+    """Parse Gemini CLI session JSON into structured exchanges.
+
+    Gemini stores sessions as single JSON files with a messages array.
+    Format: ~/.gemini/tmp/<hash>/chats/session-*.json
+
+    Args:
+        transcript_path: Path to session JSON file
+        last: Number of recent exchanges (ignored if range_tuple provided)
+        range_tuple: (start, end) absolute positions, 1-indexed inclusive
+        detailed: If True, include tool usage details
+
+    Returns:
+        {"exchanges": [...], "total": int, "error": str | None}
+    """
+    path = Path(transcript_path)
+    if not path.exists():
+        return {"exchanges": [], "total": 0, "error": f"Transcript not found: {path}"}
+
+    try:
+        with open(path, "r") as f:
+            data = json.load(f)
+    except json.JSONDecodeError as e:
+        return {"exchanges": [], "total": 0, "error": f"Invalid JSON: {e}"}
+    except Exception as e:
+        return {"exchanges": [], "total": 0, "error": f"Error reading file: {e}"}
+
+    messages = data.get("messages", [])
+    if not messages:
+        return {"exchanges": [], "total": 0, "error": None}
+
+    # Find user messages (prompts)
+    user_messages = [m for m in messages if m.get("type") == "user"]
+    total = len(user_messages)
+
+    # Select which messages to process
+    if range_tuple:
+        start, end = range_tuple
+        selected = user_messages[start - 1 : end]
+        base_pos = start
+    else:
+        selected = user_messages[-last:]
+        base_pos = max(1, total - last + 1)
+
+    # Build message index for quick lookup
+    msg_index = {m.get("id"): i for i, m in enumerate(messages)}
+
+    exchanges = []
+    for idx, user_msg in enumerate(selected):
+        user_text = user_msg.get("content", "")
+        if not user_text:
+            continue
+
+        # Find responses after this user message
+        user_idx = msg_index.get(user_msg.get("id"), -1)
+        action_parts = []
+        files = []
+        tools = []
+
+        if user_idx >= 0:
+            for m in messages[user_idx + 1 :]:
+                if m.get("type") == "user":
+                    break  # Stop at next user message
+                if m.get("type") == "gemini":
+                    # Extract text content
+                    content = m.get("content", "")
+                    if content:
+                        action_parts.append(content)
+
+                    # Extract tool calls
+                    for tc in m.get("toolCalls", []):
+                        raw_name = tc.get("name", "")
+                        tool_name = _normalize_tool_name(raw_name)
+                        args = tc.get("args", {})
+
+                        # Extract file paths from common fields for summary
+                        for field in ("file", "path", "file_path", "directory"):
+                            if field in args:
+                                files.append(Path(args[field]).name)
+
+                        if detailed:
+                            tool_record = {
+                                "name": tool_name,
+                                "is_error": False,
+                            }  # Gemini JSON doesn't capture tool errors reliably yet
+
+                            if tool_name == "Bash":
+                                tool_record["command"] = args.get("command", "")
+                                # Gemini transcript might store output in a separate toolResult message or field
+                                # But for now we just capture the call args
+                            elif tool_name == "Read":
+                                tool_record["target"] = args.get("file_path", "")
+                            elif tool_name == "Write":
+                                tool_record["target"] = args.get("file_path", "")
+                            elif tool_name == "Edit":
+                                tool_record["file"] = args.get("file_path", "")
+                            elif tool_name in ("Glob", "Grep"):
+                                tool_record["target"] = args.get(
+                                    "dir_path"
+                                ) or args.get("pattern", "")
+
+                            tools.append(tool_record)
+
+        action = "\n".join(action_parts) if action_parts else "(no response)"
+        files = sorted(set(files))[:5]
+
+        exchange = {
+            "position": base_pos + idx,
+            "user": user_text[:300],
+            "action": action,
+            "files": files,
+            "timestamp": user_msg.get("timestamp", ""),
+        }
+
+        if detailed:
+            exchange["tools"] = tools
+            # Edits/Errors not easily available in current Gemini JSON format
+            exchange["edits"] = []
+            exchange["errors"] = []
+
+        exchanges.append(exchange)
+
+    return {"exchanges": exchanges, "total": total, "error": None}
+
+
+def parse_codex_thread(
+    transcript_path: str | Path,
+    last: int = 10,
+    range_tuple: tuple[int, int] | None = None,
+) -> dict:
+    """Parse Codex CLI rollout JSONL into structured exchanges.
+
+    Codex stores sessions as JSONL with different entry types.
+    Format: ~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl
+
+    Args:
+        transcript_path: Path to rollout JSONL file
+        last: Number of recent exchanges (ignored if range_tuple provided)
+        range_tuple: (start, end) absolute positions, 1-indexed inclusive
+
+    Returns:
+        {"exchanges": [...], "total": int, "error": str | None}
+    """
+    path = Path(transcript_path)
+    if not path.exists():
+        return {"exchanges": [], "total": 0, "error": f"Transcript not found: {path}"}
+
+    # Parse all response_item entries
+    messages = []
+    try:
+        with open(path, "r") as f:
+            for line in f:
+                if not line.strip():
+                    continue
+                try:
+                    entry = json.loads(line)
+                    if entry.get("type") != "response_item":
+                        continue
+                    payload = entry.get("payload", {})
+                    if payload.get("type") != "message":
+                        continue
+
+                    role = payload.get("role")
+                    if role not in ("user", "assistant"):
+                        continue
+
+                    # Extract text content from content array
+                    content_parts = payload.get("content", [])
+                    text = ""
+                    for part in content_parts:
+                        if isinstance(part, dict):
+                            # input_text for user, output_text for assistant
+                            text += part.get("text", "")
+                        elif isinstance(part, str):
+                            text += part
+
+                    messages.append(
+                        {
+                            "type": "user" if role == "user" else "assistant",
+                            "content": text.strip(),
+                            "timestamp": entry.get("timestamp", ""),
+                        }
+                    )
+                except json.JSONDecodeError:
+                    continue
+    except Exception as e:
+        return {"exchanges": [], "total": 0, "error": f"Error reading file: {e}"}
+
+    if not messages:
+        return {"exchanges": [], "total": 0, "error": None}
+
+    # Find user messages (prompts)
+    user_messages = [m for m in messages if m.get("type") == "user"]
+    total = len(user_messages)
+
+    # Select which messages to process
+    if range_tuple:
+        start, end = range_tuple
+        selected_indices = list(range(start - 1, min(end, total)))
+        base_pos = start
+    else:
+        selected_indices = list(range(max(0, total - last), total))
+        base_pos = max(1, total - last + 1)
+
+    # Build message lookup by index
+    user_msg_indices = [i for i, m in enumerate(messages) if m.get("type") == "user"]
+
+    exchanges = []
+    for pos_offset, user_pos in enumerate(selected_indices):
+        if user_pos >= len(user_msg_indices):
+            continue
+        msg_idx = user_msg_indices[user_pos]
+        user_msg = messages[msg_idx]
+        user_text = user_msg.get("content", "")
+        if not user_text:
+            continue
+
+        # Find responses after this user message
+        action_parts = []
+        next_user_idx = (
+            user_msg_indices[user_pos + 1]
+            if user_pos + 1 < len(user_msg_indices)
+            else len(messages)
+        )
+
+        for m in messages[msg_idx + 1 : next_user_idx]:
+            if m.get("type") == "assistant":
+                content = m.get("content", "")
+                if content:
+                    action_parts.append(content)
+
+        action = "\n".join(action_parts) if action_parts else "(no response)"
+
+        exchanges.append(
+            {
+                "position": base_pos + pos_offset,
+                "user": user_text[:300],
+                "action": action,
+                "files": [],  # Codex doesn't easily expose file paths in this format
+                "timestamp": user_msg.get("timestamp", ""),
+            }
+        )
+
+    return {"exchanges": exchanges, "total": total, "error": None}
+
+
+# =============================================================================
 # Public API
 # =============================================================================
 
@@ -673,7 +963,195 @@ def _format_error_lines(lines: list[str], err: dict) -> None:
 PARSERS = {
     "claude": parse_claude_thread,
     "claude_detailed": parse_claude_thread_detailed,
+    "gemini": parse_gemini_thread,
+    "codex": parse_codex_thread,
 }
+
+
+def get_timeline(
+    instances: list[dict],
+    last: int = 10,
+    detailed: bool = False,
+) -> dict:
+    """Get unified timeline of exchanges across multiple transcripts.
+
+    Uses mtime-based sorting to efficiently find most recent exchanges
+    without parsing all transcripts.
+
+    Args:
+        instances: List of instance dicts with 'name', 'transcript_path', 'tool'
+        last: Number of recent exchanges to return
+        detailed: If True, include tool I/O details
+
+    Returns:
+        {"entries": [...], "error": str | None}
+        Each entry has: instance, position, user, action, timestamp, command, files
+    """
+    import os
+
+    # Filter to instances with transcript paths and get mtimes
+    transcript_info = []
+    for inst in instances:
+        path = inst.get("transcript_path", "")
+        if not path:
+            continue
+        try:
+            mtime = os.path.getmtime(path)
+            transcript_info.append(
+                {
+                    "name": inst.get("name", ""),
+                    "path": path,
+                    "tool": inst.get("tool", "claude"),
+                    "mtime": mtime,
+                }
+            )
+        except OSError:
+            continue  # File doesn't exist or inaccessible
+
+    if not transcript_info:
+        return {"entries": [], "error": "No transcripts found"}
+
+    # Sort by mtime descending (newest first)
+    transcript_info.sort(key=lambda x: x["mtime"], reverse=True)
+
+    # Collect exchanges from transcripts, newest files first
+    all_entries = []
+    for info in transcript_info:
+        # Parse this transcript
+        thread_data = get_thread(
+            info["path"],
+            last=last,  # Get up to 'last' from each initially
+            tool=info["tool"],
+            detailed=detailed,
+        )
+
+        if thread_data.get("error"):
+            continue
+
+        for ex in thread_data.get("exchanges", []):
+            all_entries.append(
+                {
+                    "instance": info["name"],
+                    "position": ex.get("position", 0),
+                    "user": ex.get("user", ""),
+                    "action": ex.get("action", ""),
+                    "timestamp": ex.get("timestamp", ""),
+                    "files": ex.get("files", []),
+                    "command": f"hcom transcript @{info['name']} {ex.get('position', '')}",
+                    # Include detailed fields if present
+                    "tools": ex.get("tools", []) if detailed else [],
+                    "edits": ex.get("edits", []) if detailed else [],
+                    "errors": ex.get("errors", []) if detailed else [],
+                }
+            )
+
+    if not all_entries:
+        return {"entries": [], "error": None}
+
+    # Sort all entries by timestamp descending
+    all_entries.sort(key=lambda x: x["timestamp"], reverse=True)
+
+    # Take the last N
+    entries = all_entries[:last]
+
+    # Reverse to show oldest first (chronological order)
+    entries.reverse()
+
+    return {"entries": entries, "error": None}
+
+
+def format_timeline(timeline_data: dict, full: bool = False) -> str:
+    """Format timeline data for human-readable output."""
+    entries = timeline_data.get("entries", [])
+    error = timeline_data.get("error")
+
+    if error:
+        return f"Error: {error}"
+    if not entries:
+        return "No conversation exchanges found."
+
+    lines = [f"Timeline ({len(entries)} exchanges):", ""]
+
+    for entry in entries:
+        # Parse timestamp for display
+        ts = entry.get("timestamp", "")
+        if ts:
+            # Extract time portion (HH:MM) from ISO timestamp
+            try:
+                time_part = ts.split("T")[1][:5] if "T" in ts else ts[:5]
+            except (IndexError, TypeError):
+                time_part = "??:??"
+        else:
+            time_part = "??:??"
+
+        user = entry.get("user", "")
+        if len(user) > 80:
+            user = user[:77] + "..."
+
+        lines.append(f'[{time_part}] "{user}"')
+
+        action = entry.get("action", "")
+        if full:
+            # Show full action
+            for action_line in action.split("\n")[:10]:
+                lines.append(f"  {action_line}")
+            if action.count("\n") > 10:
+                lines.append(f"  ... (+{action.count(chr(10)) - 10} lines)")
+        else:
+            # Summarized action
+            lines.append(f"  → {summarize_action(action, max_len=100)}")
+
+        if entry.get("files"):
+            lines.append(f"  Files: {', '.join(entry['files'][:5])}")
+
+        lines.append(f"  {entry.get('command', '')}")
+        lines.append("")
+
+    return "\n".join(lines).rstrip()
+
+
+def format_timeline_detailed(timeline_data: dict) -> str:
+    """Format timeline data with tool details."""
+    entries = timeline_data.get("entries", [])
+    error = timeline_data.get("error")
+
+    if error:
+        return f"Error: {error}"
+    if not entries:
+        return "No conversation exchanges found."
+
+    lines = [f"Timeline ({len(entries)} exchanges) [detailed]", "=" * 40, ""]
+
+    for entry in entries:
+        # Parse timestamp
+        ts = entry.get("timestamp", "")
+        try:
+            time_part = ts.split("T")[1][:5] if "T" in ts else ts[:5]
+        except (IndexError, TypeError):
+            time_part = "??:??"
+
+        user = entry.get("user", "")
+        if len(user) > 100:
+            user = user[:97] + "..."
+
+        lines.append(f'[{time_part}] "{user}"')
+
+        # Tools executed
+        for tool in entry.get("tools", []):
+            _format_tool_line(lines, tool)
+
+        # Edits
+        for edit in entry.get("edits", []):
+            _format_edit_lines(lines, edit)
+
+        # Errors
+        for err in entry.get("errors", []):
+            _format_error_lines(lines, err)
+
+        lines.append(f"  {entry.get('command', '')}")
+        lines.append("")
+
+    return "\n".join(lines).rstrip()
 
 
 def get_thread(
@@ -697,5 +1175,11 @@ def get_thread(
     """
     if detailed and tool == "claude":
         return parse_claude_thread_detailed(transcript_path, last, range_tuple)
+
+    if tool == "gemini":
+        return parse_gemini_thread(
+            transcript_path, last, range_tuple, detailed=detailed
+        )
+
     parser = PARSERS.get(tool, parse_claude_thread)
     return parser(transcript_path, last, range_tuple)
