@@ -30,9 +30,7 @@ def get_group_session_id(instance_data: dict[str, Any] | None) -> str | None:
     return instance_data.get("session_id")
 
 
-def in_same_group_by_id(
-    group_id: str | None, receiver_data: dict[str, Any] | None
-) -> bool:
+def in_same_group_by_id(group_id: str | None, receiver_data: dict[str, Any] | None) -> bool:
     """Check if receiver is in the same group as the given group_id.
 
     Args:
@@ -60,9 +58,7 @@ def validate_scope(scope: str) -> None:
         ValueError: If scope is not in VALID_SCOPES
     """
     if scope not in VALID_SCOPES:
-        raise ValueError(
-            f"Invalid scope '{scope}'. Must be one of: {', '.join(sorted(VALID_SCOPES))}"
-        )
+        raise ValueError(f"Invalid scope '{scope}'. Must be one of: {', '.join(sorted(VALID_SCOPES))}")
 
 
 def validate_intent(intent: str) -> None:
@@ -75,9 +71,7 @@ def validate_intent(intent: str) -> None:
         ValueError: If intent is not in VALID_INTENTS
     """
     if intent not in VALID_INTENTS:
-        raise ValueError(
-            f"Invalid intent '{intent}'. Must be one of: {', '.join(sorted(VALID_INTENTS))}"
-        )
+        raise ValueError(f"Invalid intent '{intent}'. Must be one of: {', '.join(sorted(VALID_INTENTS))}")
 
 
 def is_mentioned(text: str, name: str, tag: str | None = None) -> bool:

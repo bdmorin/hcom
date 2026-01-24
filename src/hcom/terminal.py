@@ -124,9 +124,7 @@ def resolve_terminal_preset(preset_name: str) -> str | None:
 def build_env_string(env_vars: dict[str, Any], format_type: str = "bash") -> str:
     """Build environment variable string for bash shells"""
     # Filter out invalid bash variable names (must be letters, digits, underscores only)
-    valid_vars = {
-        k: v for k, v in env_vars.items() if re.match(r"^[a-zA-Z_][a-zA-Z0-9_]*$", k)
-    }
+    valid_vars = {k: v for k, v in env_vars.items() if re.match(r"^[a-zA-Z_][a-zA-Z0-9_]*$", k)}
 
     # On Windows, exclude PATH (let Git Bash handle it to avoid Windows vs Unix path format issues)
     if platform.system() == "Windows":
@@ -134,9 +132,7 @@ def build_env_string(env_vars: dict[str, Any], format_type: str = "bash") -> str
 
     if format_type == "bash_export":
         # Properly escape values for bash
-        return " ".join(
-            f"export {k}={shlex.quote(str(v))};" for k, v in valid_vars.items()
-        )
+        return " ".join(f"export {k}={shlex.quote(str(v))};" for k, v in valid_vars.items())
     else:
         return " ".join(f"{k}={shlex.quote(str(v))}" for k, v in valid_vars.items())
 
@@ -160,9 +156,7 @@ def find_bash_on_windows() -> str | None:
         if base:
             candidates.extend(
                 [
-                    str(
-                        Path(base) / "Git" / "usr" / "bin" / "bash.exe"
-                    ),  # usr/bin is more common
+                    str(Path(base) / "Git" / "usr" / "bin" / "bash.exe"),  # usr/bin is more common
                     str(Path(base) / "Git" / "bin" / "bash.exe"),
                 ]
             )
@@ -176,9 +170,7 @@ def find_bash_on_windows() -> str | None:
             ]
         )
     # 3. PATH bash (if not WSL's launcher)
-    if (path_bash := shutil.which("bash")) and not path_bash.lower().endswith(
-        r"system32\bash.exe"
-    ):
+    if (path_bash := shutil.which("bash")) and not path_bash.lower().endswith(r"system32\bash.exe"):
         candidates.append(path_bash)
     # 4. Hardcoded fallbacks (last resort)
     candidates.extend(
@@ -238,9 +230,7 @@ def create_bash_script(
         if platform.system() != "Windows":
             # Check for 'claude' command (with or without args)
             cmd_stripped = command_str.lstrip()
-            is_claude_command = cmd_stripped == "claude" or cmd_stripped.startswith(
-                "claude "
-            )
+            is_claude_command = cmd_stripped == "claude" or cmd_stripped.startswith("claude ")
             if is_claude_command:
                 # 1. Discover paths once
                 claude_path = shutil.which("claude")
@@ -290,9 +280,7 @@ def create_bash_script(
                     )
                 else:
                     # Mac/Linux: use full path (PATH now has node if needed)
-                    command_str = command_str.replace(
-                        "claude ", f"{shlex.quote(claude_path)} ", 1
-                    )
+                    command_str = command_str.replace("claude ", f"{shlex.quote(claude_path)} ", 1)
         else:
             # Windows: no PATH modification needed
             f.write(build_env_string(env, "bash_export") + "\n")
@@ -538,15 +526,9 @@ def launch_terminal(
     # macOS default mode uses .command
     # All other cases (custom terminal, other platforms, background) use .sh
     terminal_mode = get_config().terminal
-    use_command_ext = (
-        not background and platform.system() == "Darwin" and terminal_mode == "default"
-    )
+    use_command_ext = not background and platform.system() == "Darwin" and terminal_mode == "default"
     extension = ".command" if use_command_ext else ".sh"
-    script_file = str(
-        hcom_path(
-            LAUNCH_DIR, f"hcom_{os.getpid()}_{random.randint(1000, 9999)}{extension}"
-        )
-    )
+    script_file = str(hcom_path(LAUNCH_DIR, f"hcom_{os.getpid()}_{random.randint(1000, 9999)}{extension}"))
 
     # Detect tool from command for terminal title
     cmd_lower = command_str.lower()
@@ -606,9 +588,7 @@ def launch_terminal(
         # Health check
         time.sleep(0.2)
         if process.poll() is not None:
-            error_output = read_file_with_retry(
-                log_file, lambda f: f.read()[:1000], default=""
-            )
+            error_output = read_file_with_retry(log_file, lambda f: f.read()[:1000], default="")
             print(format_error("Headless failed immediately"), file=sys.stderr)
             if error_output:
                 print(f"  Output: {error_output}", file=sys.stderr)
@@ -657,9 +637,7 @@ def launch_terminal(
     if terminal_mode == "default":
         custom_cmd = None  # Will use platform default
     elif terminal_mode in TERMINAL_PRESETS:
-        custom_cmd = resolve_terminal_preset(
-            terminal_mode
-        )  # Handles app bundle fallback
+        custom_cmd = resolve_terminal_preset(terminal_mode)  # Handles app bundle fallback
     else:
         custom_cmd = terminal_mode  # Custom command with {script}
 
@@ -812,14 +790,9 @@ def _spawn_terminal_process(argv: list[str], format_error) -> bool:
                 returncode=returncode,
                 stderr=stderr_text,
             )
-            error_msg = (
-                f"Terminal launch failed (exit code {returncode})"
-                + (f": {stderr_text}" if stderr_text else "")
-            )
+            error_msg = f"Terminal launch failed (exit code {returncode})" + (f": {stderr_text}" if stderr_text else "")
             if argv and argv[0] == "open" and os.environ.get("CODEX_SANDBOX"):
-                error_msg += (
-                    " (Codex sandbox blocks LaunchServices; use Agent full access or run outside sandbox)"
-                )
+                error_msg += " (Codex sandbox blocks LaunchServices; use Agent full access or run outside sandbox)"
             raise HcomError(error_msg)
 
         log_info(
@@ -835,9 +808,8 @@ def _spawn_terminal_process(argv: list[str], format_error) -> bool:
     result = subprocess.run(argv, capture_output=True, text=True)
     if result.returncode != 0:
         stderr_text = (result.stderr or "").strip()
-        error_msg = (
-            f"Terminal launch failed (exit code {result.returncode})"
-            + (f": {stderr_text}" if stderr_text else "")
+        error_msg = f"Terminal launch failed (exit code {result.returncode})" + (
+            f": {stderr_text}" if stderr_text else ""
         )
         raise HcomError(error_msg)
     return True

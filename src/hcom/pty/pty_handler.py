@@ -135,11 +135,13 @@ def _get_default_retry() -> TwoPhaseRetryPolicy:
 # Gate configurations per tool
 #
 # Claude: require_ready_prompt=False because status bar hides in accept-edits mode.
-#         require_prompt_empty=True parses ❯ prompt to distinguish placeholder vs user text.
+#         require_prompt_empty=False - Claude removed ↵ indicator from AI suggestions,
+#         and pyte can't detect dim text, so we can't distinguish AI suggestions from user input.
+#         Instead, rely on longer user_activity_cooldown (3s) as safety against clobbering.
 CLAUDE_GATE = DeliveryGate(
     require_idle=True,
     require_ready_prompt=False,
-    require_prompt_empty=True,
+    require_prompt_empty=False,
     require_output_stable_seconds=OUTPUT_STABLE_SECONDS,
     block_on_user_activity=True,
     block_on_approval=True,
@@ -179,6 +181,7 @@ TOOL_CONFIGS: dict[str, PTYToolConfig] = {
         start_pending=True,
         use_termux_bypass=False,
         extra_env={"HCOM_PTY_MODE": "1"},
+        user_activity_cooldown=3.0,  # Longer cooldown since we can't detect AI suggestions
     ),
     "gemini": PTYToolConfig(
         tool="gemini",
@@ -366,9 +369,7 @@ def _run_receiver_thread(
             wrapper=typing.cast(PTYLike, gate_wrapper),
             has_pending=has_pending,
             try_deliver_text=try_deliver_text,
-            try_deliver_text_with_hint=(
-                try_deliver_text_with_hint if config.build_inject_text_with_hint else None
-            ),
+            try_deliver_text_with_hint=(try_deliver_text_with_hint if config.build_inject_text_with_hint else None),
             try_enter=try_enter,
             get_pending_snapshot=get_pending_snapshot,
             is_idle=is_idle if config.is_idle_fn else None,
@@ -485,6 +486,7 @@ def run_pty_with_hcom(
         port=0,
         ready_pattern=config.ready_pattern,
         on_ready=on_ready,
+        user_activity_cooldown=config.user_activity_cooldown,
     )
     gate_wrapper_ref[0] = GateWrapperView(wrapper)
 
@@ -572,9 +574,7 @@ def create_runner_script(
     from ..core.paths import hcom_path, LAUNCH_DIR
 
     config = TOOL_CONFIGS.get(tool)
-    script_file = str(
-        hcom_path(LAUNCH_DIR, f"{tool}_{instance_name}_{random.randint(1000, 9999)}.sh")
-    )
+    script_file = str(hcom_path(LAUNCH_DIR, f"{tool}_{instance_name}_{random.randint(1000, 9999)}.sh"))
 
     python_path = sys.executable
     module_dir = Path(__file__).parent.parent
@@ -711,9 +711,7 @@ def launch_pty(
         runner_extra_kwargs=runner_extra_kwargs,
     )
 
-    success = launch_terminal(
-        f"bash {shlex.quote(script_file)}", env, cwd=cwd, run_here=run_here
-    )
+    success = launch_terminal(f"bash {shlex.quote(script_file)}", env, cwd=cwd, run_here=run_here)
     return instance_name if success else None
 
 

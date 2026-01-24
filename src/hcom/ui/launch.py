@@ -285,7 +285,10 @@ class LaunchScreen:
         count_selected = self.state.launch.current_field == LaunchField.COUNT
         if count_selected:
             selected_field_start_line = len(lines)
-            line = f"  {BG_CHARCOAL}{FG_WHITE}{BOLD}\u25b8 Count:{RESET}{BG_CHARCOAL} {FG_ORANGE}{self.state.launch.count}{RESET}{BG_CHARCOAL}  {FG_GRAY}\u2022 \u2190\u2192 adjust{RESET}"
+            line = (
+                f"  {BG_CHARCOAL}{FG_WHITE}{BOLD}\u25b8 Count:{RESET}{BG_CHARCOAL} {FG_ORANGE}{self.state.launch.count}{RESET}"
+                f"{BG_CHARCOAL}  {FG_GRAY}\u2022 \u2190\u2192 adjust{RESET}"
+            )
             lines.append(bg_ljust(line, width, BG_CHARCOAL))
         else:
             lines.append(f"  {FG_WHITE}Count:{RESET} {FG_ORANGE}{self.state.launch.count}{RESET}")

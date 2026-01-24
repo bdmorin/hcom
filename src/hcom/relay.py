@@ -56,9 +56,7 @@ def _get_auth_headers() -> dict[str, str]:
     return headers
 
 
-def _http(
-    method: str, url: str, data: bytes | None = None, timeout: int = 5
-) -> tuple[int, bytes]:
+def _http(method: str, url: str, data: bytes | None = None, timeout: int = 5) -> tuple[int, bytes]:
     """HTTP request."""
     req = urllib.request.Request(url, data=data, method=method)
     for k, v in _get_auth_headers().items():
@@ -309,9 +307,7 @@ def _apply_remote_devices(devices: dict[str, dict], own_device: str) -> None:
         cached_reset = float(kv_get(f"relay_reset_{device_id}") or 0)
         if reset_ts > cached_reset:
             with _write_lock:
-                conn.execute(
-                    "DELETE FROM instances WHERE origin_device_id = ?", (device_id,)
-                )
+                conn.execute("DELETE FROM instances WHERE origin_device_id = ?", (device_id,))
                 conn.execute(
                     "DELETE FROM events WHERE json_extract(data, '$._relay.device') = ?",
                     (device_id,),
@@ -328,9 +324,7 @@ def _apply_remote_devices(devices: dict[str, dict], own_device: str) -> None:
         # Get current remote instances for this device (to detect removals)
         current_remote = {
             row["name"]
-            for row in conn.execute(
-                "SELECT name FROM instances WHERE origin_device_id = ?", (device_id,)
-            ).fetchall()
+            for row in conn.execute("SELECT name FROM instances WHERE origin_device_id = ?", (device_id,)).fetchall()
         }
 
         # Upsert instances from state (no lifecycle reconstruction!)
@@ -344,9 +338,7 @@ def _apply_remote_devices(devices: dict[str, dict], own_device: str) -> None:
             namespaced = f"{name}:{short_id}"
             seen_instances.add(namespaced)
             # Namespace parent with short_id suffix
-            parent_namespaced = (
-                f"{inst['parent']}:{short_id}" if inst.get("parent") else None
-            )
+            parent_namespaced = f"{inst['parent']}:{short_id}" if inst.get("parent") else None
             try:
                 with _write_lock:
                     conn.execute(
@@ -385,9 +377,7 @@ def _apply_remote_devices(devices: dict[str, dict], own_device: str) -> None:
                     )
                     conn.commit()
             except sqlite3.Error as e:
-                log_error(
-                    "relay", "relay.error", e, op="instance_upsert", instance=namespaced
-                )
+                log_error("relay", "relay.error", e, op="instance_upsert", instance=namespaced)
 
         # Remove instances no longer in state (stopped/removed on remote)
         stale = current_remote - seen_instances
@@ -419,9 +409,7 @@ def _apply_remote_devices(devices: dict[str, dict], own_device: str) -> None:
                     reason=f"id_regression:{remote_max_id}<{last_event_id}",
                 )
                 with _write_lock:
-                    conn.execute(
-                        "DELETE FROM instances WHERE origin_device_id = ?", (device_id,)
-                    )
+                    conn.execute("DELETE FROM instances WHERE origin_device_id = ?", (device_id,))
                     conn.execute(
                         "DELETE FROM events WHERE json_extract(data, '$._relay.device') = ?",
                         (device_id,),
@@ -445,9 +433,7 @@ def _apply_remote_devices(devices: dict[str, dict], own_device: str) -> None:
             try:
                 event_id = int(raw_event_id)
             except (TypeError, ValueError):
-                log_warn(
-                    "relay", "relay.bad_event_id", device=short_id, raw=raw_event_id
-                )
+                log_warn("relay", "relay.bad_event_id", device=short_id, raw=raw_event_id)
                 continue
             if event_id <= last_event_id:
                 continue  # Already have this event
@@ -467,16 +453,12 @@ def _apply_remote_devices(devices: dict[str, dict], own_device: str) -> None:
             if "from" in data and ":" not in data["from"]:
                 data["from"] = f"{data['from']}:{short_id}"
             if "mentions" in data:
-                data["mentions"] = [
-                    f"{m}:{short_id}" if ":" not in m else m for m in data["mentions"]
-                ]
+                data["mentions"] = [f"{m}:{short_id}" if ":" not in m else m for m in data["mentions"]]
 
             # Strip our device suffix from delivered_to so local instances match
             if "delivered_to" in data:
                 data["delivered_to"] = [
-                    name.rsplit(":", 1)[0]
-                    if name.upper().endswith(f":{own_short_id}")
-                    else name
+                    name.rsplit(":", 1)[0] if name.upper().endswith(f":{own_short_id}") else name
                     for name in data["delivered_to"]
                 ]
 
@@ -562,9 +544,7 @@ def send_control(action: str, target: str, device_short_id: str) -> bool:
     return False
 
 
-def _handle_control_events(
-    events: list[dict], own_short_id: str, source_device: str
-) -> None:
+def _handle_control_events(events: list[dict], own_short_id: str, source_device: str) -> None:
     """Process control events targeting this device."""
     from .core.tool_utils import stop_instance
 

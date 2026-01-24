@@ -30,26 +30,8 @@ import sys
 import json
 
 from ...core.log import log_error
-
-
-def _derive_transcript_path(thread_id: str | None) -> str | None:
-    """Try to derive transcript_path from thread_id."""
-    if not thread_id:
-        return None
-    try:
-        import glob
-        from pathlib import Path
-
-        # Respect CODEX_HOME env var if set, else default to ~/.codex
-        codex_base = os.environ.get("CODEX_HOME") or str(Path.home() / ".codex")
-        codex_home = Path(codex_base) / "sessions"
-        pattern = str(codex_home / "**" / f"rollout-*-{thread_id}.jsonl")
-        matches = glob.glob(pattern, recursive=True)
-        if matches:
-            return matches[0]
-    except Exception:
-        pass
-    return None
+from ...hooks.family import bind_vanilla_instance_from_marker
+from ...core.transcript import derive_codex_transcript_path
 
 
 def _bind_vanilla_instance(payload: dict) -> str | None:
@@ -65,45 +47,27 @@ def _bind_vanilla_instance(payload: dict) -> str | None:
 
     thread_id = payload.get("thread-id")
     transcript_path = (
-        payload.get("transcript_path")
-        or payload.get("session_path")
-        or _derive_transcript_path(thread_id)
+        payload.get("transcript_path") or payload.get("session_path") or derive_codex_transcript_path(thread_id)
     )
 
     if not transcript_path:
         return None
 
-    # Search transcript for binding marker: [HCOM:BIND:<name>]
+    # Read transcript to search for binding marker
     try:
         with open(transcript_path, "r") as f:
             content = f.read()
     except Exception:
         return None
 
-    from ...shared import BIND_MARKER_RE
-
-    match = BIND_MARKER_RE.search(content)
-    if not match:
-        return None
-
-    instance_name = match.group(1)
-
-    try:
-        from ...core.instances import update_instance_position
-        from ...core.db import rebind_instance_session
-
-        updates: dict[str, str] = {"tool": "codex"}
-        if thread_id:
-            updates["session_id"] = thread_id
-            rebind_instance_session(instance_name, thread_id)
-        if transcript_path:
-            updates["transcript_path"] = transcript_path
-        if updates:
-            update_instance_position(instance_name, updates)
-        return instance_name
-    except Exception as e:
-        log_error("hooks", "hook.error", e, hook="codex-notify", op="bind_vanilla")
-        return None
+    return bind_vanilla_instance_from_marker(
+        marker_text=content,
+        session_id=thread_id,
+        transcript_path=transcript_path,
+        tool="codex",
+        hook="codex-notify",
+        error_returns_instance=False,
+    )
 
 
 def handle_codex_hook(hook_name: str) -> None:
@@ -172,9 +136,7 @@ def handle_notify() -> None:
         return
     thread_id = payload.get("thread-id")
     transcript_path = (
-        payload.get("transcript_path")
-        or payload.get("session_path")
-        or _derive_transcript_path(thread_id)
+        payload.get("transcript_path") or payload.get("session_path") or derive_codex_transcript_path(thread_id)
     )
 
     if thread_id or transcript_path:
@@ -202,9 +164,7 @@ def handle_notify() -> None:
                 updates["transcript_path"] = transcript_path
             update_instance_position(instance_name, updates)
         except Exception as e:
-            log_error(
-                "hooks", "hook.error", e, hook="codex-notify", op="update_instance"
-            )
+            log_error("hooks", "hook.error", e, hook="codex-notify", op="update_instance")
 
     # Update instance status (row exists = participating)
     try:
@@ -243,7 +203,7 @@ def resolve_instance(payload: dict | None = None) -> tuple[dict | None, dict | N
         transcript_path = payload.get("transcript_path") or payload.get("session_path")
     # Codex can derive transcript_path from thread_id
     if not transcript_path and session_id:
-        transcript_path = _derive_transcript_path(session_id)
+        transcript_path = derive_codex_transcript_path(session_id)
 
     instance = resolve_instance_from_binding(
         session_id=session_id,

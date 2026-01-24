@@ -363,9 +363,7 @@ def _config_instance(target: str, argv: list[str], json_output: bool) -> int:
             identity = resolve_identity()
         except Exception as e:
             print(format_error(f"Cannot resolve identity: {e}"), file=sys.stderr)
-            print(
-                "-i self requires running inside Claude/Gemini/Codex", file=sys.stderr
-            )
+            print("-i self requires running inside Claude/Gemini/Codex", file=sys.stderr)
             return 1
         instance_name = identity.name
     else:
@@ -427,6 +425,7 @@ def _config_instance(target: str, argv: list[str], json_output: bool) -> int:
     new_value = " ".join(argv[1:])  # Allow spaces in hints
 
     # Validate and convert based on key type
+    db_value: str | int | None
     if key == "tag":
         if new_value and not all(c.isalnum() or c == "-" for c in new_value):
             print(
@@ -438,9 +437,7 @@ def _config_instance(target: str, argv: list[str], json_output: bool) -> int:
 
     elif key in ("timeout", "subagent_timeout"):
         if new_value == "" or new_value.lower() == "default":
-            db_value = (
-                None if key == "subagent_timeout" else 86400
-            )  # timeout has a default
+            db_value = None if key == "subagent_timeout" else 86400  # timeout has a default
         else:
             try:
                 db_value = int(new_value)
@@ -460,7 +457,7 @@ def _config_instance(target: str, argv: list[str], json_output: bool) -> int:
         db_value = new_value
 
     # Update in DB
-    update_instance_position(instance_name, {db_column: db_value})
+    update_instance_position(instance_name, {db_column: db_value})  # type: ignore[misc]
 
     # Show result
     new_data = load_instance_position(instance_name)
@@ -470,9 +467,7 @@ def _config_instance(target: str, argv: list[str], json_output: bool) -> int:
         if key == "tag":
             new_full_name = get_full_name(new_data)
             if db_value:
-                print(
-                    f"Tag set to '{db_value}' - display name is now '{new_full_name}'"
-                )
+                print(f"Tag set to '{db_value}' - display name is now '{new_full_name}'")
             else:
                 print(f"Tag cleared - display name is now '{new_full_name}'")
         elif key == "timeout":
@@ -569,9 +564,7 @@ def cmd_config(argv: list[str], *, ctx: CommandContext | None = None) -> int:
                     editor = ed
                     break
         if not editor:
-            print(
-                "No editor found. Set $EDITOR or install code/vim/nano", file=sys.stderr
-            )
+            print("No editor found. Set $EDITOR or install code/vim/nano", file=sys.stderr)
             return 1
 
         # Ensure config exists
@@ -668,9 +661,7 @@ def cmd_config(argv: list[str], *, ctx: CommandContext | None = None) -> int:
                     src = "[env]" if key in os.environ else "[file]"
                     print(f"  {key}={display_val}  {src}")
 
-            print(
-                "\n[env] = environment, [file] = config.env, [runtime] = agent override, (blank) = default"
-            )
+            print("\n[env] = environment, [file] = config.env, [runtime] = agent override, (blank) = default")
             print("\nEdit: hcom config --edit")
         return 0
 
@@ -746,9 +737,7 @@ def cmd_config(argv: list[str], *, ctx: CommandContext | None = None) -> int:
             from .utils import get_command_help
 
             print(f"Unknown config key: {key}", file=sys.stderr)
-            print(
-                f"Valid keys: {', '.join(sorted(KNOWN_CONFIG_KEYS))}\n", file=sys.stderr
-            )
+            print(f"Valid keys: {', '.join(sorted(KNOWN_CONFIG_KEYS))}\n", file=sys.stderr)
             print(get_command_help("config"), file=sys.stderr)
             return 1
 
@@ -787,13 +776,9 @@ def cmd_config(argv: list[str], *, ctx: CommandContext | None = None) -> int:
                 pass  # Codex hooks may not be set up
 
             if enabled:
-                print(
-                    "Auto-approve enabled for safe hcom commands in Claude/Gemini/Codex"
-                )
+                print("Auto-approve enabled for safe hcom commands in Claude/Gemini/Codex")
             else:
-                print(
-                    "Auto-approve disabled - safe hcom commands will require approval"
-                )
+                print("Auto-approve disabled - safe hcom commands will require approval")
 
         return 0
 

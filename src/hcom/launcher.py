@@ -622,6 +622,9 @@ def launch(
         instance_env["HCOM_LAUNCH_BATCH_ID"] = batch_id
         # Propagate resolved HCOM_DIR to children for root consistency
         instance_env["HCOM_DIR"] = str(hcom_path())
+        # Propagate HCOM_DEV_ROOT if set (dev worktree mode)
+        if dev_root := os.environ.get("HCOM_DEV_ROOT"):
+            instance_env["HCOM_DEV_ROOT"] = dev_root
         process_id = str(uuid.uuid4())
         instance_env["HCOM_PROCESS_ID"] = process_id
         instance_name = generate_unique_name()

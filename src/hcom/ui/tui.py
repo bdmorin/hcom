@@ -2066,13 +2066,7 @@ class HcomTUI:
         else:
             print()
 
-        # Show query hint for stopped instance
-        selected_inst = instances[cursor] if 0 <= cursor < len(instances) else None
-        if selected_inst and selected_inst.get("stopped"):
-            name = selected_inst["name"]
-            print(f"{FG_GRAY}full details: hcom events --sql \"life_action='stopped' AND instance='{name}'\"{RESET}")
-        else:
-            print()
+        print()
 
         return displayed, total
 

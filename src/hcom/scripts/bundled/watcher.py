@@ -64,7 +64,9 @@ def build_watcher_prompt(target: str, once: bool, active: bool) -> str:
         trigger_desc = "every 10 tool uses (if no listening)"
     else:
         # Default: listening-only
-        subscription = f'''hcom events sub "type='status' AND instance='{target}' AND status_val='listening'"{once_flag}'''
+        subscription = (
+            f'''hcom events sub "type='status' AND instance='{target}' AND status_val='listening'"{once_flag}'''
+        )
         trigger_desc = "each [event] notification (they went listening)"
 
     return f'''You are watching @{target}.
@@ -126,9 +128,7 @@ Examples:
     )
     parser.add_argument("--target", required=True, help="Instance to watch and review")
     parser.add_argument("--name", help="Your identity")
-    parser.add_argument(
-        "--once", action="store_true", help="Do one review then exit (spot check mode)"
-    )
+    parser.add_argument("--once", action="store_true", help="Do one review then exit (spot check mode)")
     parser.add_argument(
         "--active",
         "-a",

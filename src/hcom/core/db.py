@@ -20,9 +20,7 @@ _thread_local = threading.local()  # Per-thread connection storage
 _write_lock = threading.Lock()  # Protect concurrent writes
 
 # Error messages
-DB_LOCK_ERROR = (
-    "hcom: DB locked by another process. Close other hcom instances and retry."
-)
+DB_LOCK_ERROR = "hcom: DB locked by another process. Close other hcom instances and retry."
 
 # ==================== Connection Management ====================
 
@@ -192,12 +190,7 @@ def check_schema_version(conn: sqlite3.Connection) -> bool:
 
     # Check what tables exist
     try:
-        tables = {
-            r[0]
-            for r in conn.execute(
-                "SELECT name FROM sqlite_master WHERE type='table'"
-            ).fetchall()
-        }
+        tables = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()}
     except Exception:
         tables = set()
 
@@ -354,12 +347,8 @@ def init_db(conn: Optional[sqlite3.Connection] = None) -> None:
             PRIMARY KEY (instance, kind)
         )
     """)
-    conn.execute(
-        "CREATE INDEX IF NOT EXISTS idx_notify_endpoints_instance ON notify_endpoints(instance)"
-    )
-    conn.execute(
-        "CREATE INDEX IF NOT EXISTS idx_notify_endpoints_port ON notify_endpoints(port)"
-    )
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_notify_endpoints_instance ON notify_endpoints(instance)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_notify_endpoints_port ON notify_endpoints(port)")
 
     # Process bindings: map process_id -> canonical instance/session
     conn.execute("""
@@ -370,12 +359,8 @@ def init_db(conn: Optional[sqlite3.Connection] = None) -> None:
             updated_at REAL NOT NULL
         )
     """)
-    conn.execute(
-        "CREATE INDEX IF NOT EXISTS idx_process_bindings_instance ON process_bindings(instance_name)"
-    )
-    conn.execute(
-        "CREATE INDEX IF NOT EXISTS idx_process_bindings_session ON process_bindings(session_id)"
-    )
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_process_bindings_instance ON process_bindings(instance_name)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_process_bindings_session ON process_bindings(session_id)")
 
     # Session bindings: map session_id -> canonical instance for hook gating
     # Binding existence = hook participation. No binding = ad-hoc only.
@@ -387,9 +372,7 @@ def init_db(conn: Optional[sqlite3.Connection] = None) -> None:
             FOREIGN KEY (instance_name) REFERENCES instances(name) ON DELETE CASCADE
         )
     """)
-    conn.execute(
-        "CREATE INDEX IF NOT EXISTS idx_session_bindings_instance ON session_bindings(instance_name)"
-    )
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_session_bindings_instance ON session_bindings(instance_name)")
 
     # Create instances table
     # Row exists = participating. No enabled flag.
@@ -438,26 +421,18 @@ def init_db(conn: Optional[sqlite3.Connection] = None) -> None:
     conn.execute("CREATE INDEX IF NOT EXISTS idx_timestamp ON events(timestamp)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_type ON events(type)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_instance ON events(instance)")
-    conn.execute(
-        "CREATE INDEX IF NOT EXISTS idx_type_instance ON events(type, instance)"
-    )
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_type_instance ON events(type, instance)")
 
     # Create instance indexes
     conn.execute("CREATE INDEX IF NOT EXISTS idx_session_id ON instances(session_id)")
-    conn.execute(
-        "CREATE INDEX IF NOT EXISTS idx_parent_session_id ON instances(parent_session_id)"
-    )
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_parent_session_id ON instances(parent_session_id)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_parent_name ON instances(parent_name)")
-    conn.execute(
-        "CREATE INDEX IF NOT EXISTS idx_created_at ON instances(created_at DESC)"
-    )
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_created_at ON instances(created_at DESC)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_status ON instances(status)")
     conn.execute(
         "CREATE UNIQUE INDEX IF NOT EXISTS idx_agent_id_unique ON instances(agent_id) WHERE agent_id IS NOT NULL"
     )
-    conn.execute(
-        "CREATE INDEX IF NOT EXISTS idx_instances_origin ON instances(origin_device_id)"
-    )
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_instances_origin ON instances(origin_device_id)")
 
     # Create flattened events view for simpler SQL queries
     # DROP first to ensure schema changes are applied (CREATE VIEW IF NOT EXISTS won't update)
@@ -527,9 +502,7 @@ def upsert_notify_endpoint(instance: str, kind: str, port: int) -> None:
         conn.commit()
 
 
-def delete_notify_endpoint(
-    instance: str, *, kind: str | None = None, port: int | None = None
-) -> None:
+def delete_notify_endpoint(instance: str, *, kind: str | None = None, port: int | None = None) -> None:
     """Best-effort removal of a notify endpoint (used to prune dead ports)."""
     conn = get_db()
     q = "DELETE FROM notify_endpoints WHERE instance = ?"
@@ -567,9 +540,7 @@ def get_process_binding(process_id: str) -> dict[str, Any] | None:
     return dict(row) if row else None
 
 
-def set_process_binding(
-    process_id: str, session_id: str | None, instance_name: str | None
-) -> None:
+def set_process_binding(process_id: str, session_id: str | None, instance_name: str | None) -> None:
     """Upsert process binding."""
     if not process_id:
         return
@@ -691,9 +662,7 @@ def set_session_binding(session_id: str, instance_name: str) -> None:
         # Check if this is a subagent trying to bind without --name <agent_id>
         # Subagents share parent's session but need explicit agent_id registration
         conn = get_db()
-        row = conn.execute(
-            "SELECT running_tasks FROM instances WHERE name = ?", (existing,)
-        ).fetchone()
+        row = conn.execute("SELECT running_tasks FROM instances WHERE name = ?", (existing,)).fetchone()
 
         if row and row["running_tasks"]:
             import json
@@ -713,17 +682,12 @@ def set_session_binding(session_id: str, instance_name: str) -> None:
                 pass
 
         # Default error for non-subagent case
-        raise HcomError(
-            f"Session {session_id[:8]}... already bound to {existing}, "
-            f"cannot bind to {instance_name}"
-        )
+        raise HcomError(f"Session {session_id[:8]}... already bound to {existing}, cannot bind to {instance_name}")
 
     _upsert_session_binding(session_id, instance_name)
 
 
-def clear_session_id_from_other_instances(
-    session_id: str, exclude_instance: str
-) -> None:
+def clear_session_id_from_other_instances(session_id: str, exclude_instance: str) -> None:
     """Clear session_id from any instance that has it, except exclude_instance.
 
     Prevents UNIQUE constraint violation on instances.session_id when reassigning sessions.
@@ -1044,9 +1008,7 @@ def save_instance(name: str, data: dict[str, Any]) -> bool:
             # UPSERT - simpler and race-free
             columns = ", ".join(data.keys())
             placeholders = ", ".join("?" * len(data))
-            update_clause = ", ".join(
-                f"{k} = excluded.{k}" for k in data.keys() if k != "name"
-            )
+            update_clause = ", ".join(f"{k} = excluded.{k}" for k in data.keys() if k != "name")
 
             conn.execute(
                 f"""
@@ -1308,9 +1270,7 @@ def kv_set(key: str, value: str | None) -> None:
         if value is None:
             conn.execute("DELETE FROM kv WHERE key = ?", (key,))
         else:
-            conn.execute(
-                "INSERT OR REPLACE INTO kv (key, value) VALUES (?, ?)", (key, value)
-            )
+            conn.execute("INSERT OR REPLACE INTO kv (key, value) VALUES (?, ?)", (key, value))
         conn.commit()
 
 
@@ -1327,9 +1287,7 @@ def _log_sub_error(sub_id: str, error: str, exc: Exception | None = None) -> Non
         log_warn("core", "subscription.error", error, sub_id=sub_id)
 
 
-def _format_sub_notification(
-    sub_id: str, event_id: int, event_type: str, instance: str, data: dict[str, Any]
-) -> str:
+def _format_sub_notification(sub_id: str, event_id: int, event_type: str, instance: str, data: dict[str, Any]) -> str:
     """Format event notification - concise pipe-delimited for readability.
 
     Note: @mentions in quoted text are escaped to prevent routing to unintended recipients.
@@ -1392,9 +1350,7 @@ def _check_event_subscriptions(
 
     conn = get_db()
     try:
-        rows = conn.execute(
-            "SELECT key, value FROM kv WHERE key LIKE 'events_sub:%'"
-        ).fetchall()
+        rows = conn.execute("SELECT key, value FROM kv WHERE key LIKE 'events_sub:%'").fetchall()
     except Exception as e:
         _log_sub_error("*", "query failed", e)
         return
@@ -1434,9 +1390,7 @@ def _check_event_subscriptions(
                 _log_sub_error(sub_id, "no caller")
                 continue
 
-            notification = _format_sub_notification(
-                sub_id, event_id, event_type, instance, data
-            )
+            notification = _format_sub_notification(sub_id, event_id, event_type, instance, data)
             notify_result = _send_sub_notification(caller, notification)
             if notify_result == "dead":
                 _log_sub_error(sub_id, f"caller {caller} no longer exists")
@@ -1469,9 +1423,7 @@ def _send_sub_notification(caller: str, message: str) -> bool | str:
     # Lookup instance to get full name (with tag prefix if any)
     # This is needed because mention matching uses full names
     conn = get_db()
-    row = conn.execute(
-        "SELECT name, tag FROM instances WHERE name = ?", (caller,)
-    ).fetchone()
+    row = conn.execute("SELECT name, tag FROM instances WHERE name = ?", (caller,)).fetchone()
 
     if not row:
         # Instance no longer exists
@@ -1493,9 +1445,7 @@ def _send_sub_notification(caller: str, message: str) -> bool | str:
 RECENTLY_STOPPED_MINUTES = 10  # Duration for "recently stopped" display
 
 
-def get_recently_stopped(
-    exclude_active: set[str] | None = None, minutes: int = RECENTLY_STOPPED_MINUTES
-) -> list[str]:
+def get_recently_stopped(exclude_active: set[str] | None = None, minutes: int = RECENTLY_STOPPED_MINUTES) -> list[str]:
     """Get names of instances stopped in last N minutes from events.
 
     Used by TUI and CLI to show recently stopped instances without cluttering

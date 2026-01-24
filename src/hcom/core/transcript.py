@@ -2,13 +2,110 @@
 
 from __future__ import annotations
 
+import glob
 import json
+import os
 import re
 from pathlib import Path
 from typing import Any, Callable
 
 # Error detection patterns
 ERROR_PATTERNS = re.compile(r"rejected|interrupted|error:|traceback|failed|exception", re.I)
+
+
+# =============================================================================
+# Transcript Path Discovery
+# =============================================================================
+
+
+def get_claude_config_dir() -> Path:
+    """Get Claude config directory, respecting CLAUDE_CONFIG_DIR env var.
+
+    Returns:
+        Path to Claude config directory (default: ~/.claude)
+    """
+    claude_dir = os.environ.get("CLAUDE_CONFIG_DIR")
+    if claude_dir:
+        return Path(claude_dir)
+    return Path.home() / ".claude"
+
+
+def derive_gemini_transcript_path(session_id: str | None) -> str | None:
+    """Derive Gemini CLI transcript path from session_id.
+
+    Gemini's ChatRecordingService isn't initialized at SessionStart, so the
+    transcript_path field is empty. This function derives it from the session_id
+    by searching the Gemini chats directory.
+
+    Args:
+        session_id: Gemini session ID (format: prefix-uuid)
+
+    Returns:
+        Full path to transcript file if found, None otherwise
+
+    Search Strategy:
+        - Extract prefix from session_id (everything before first hyphen)
+        - Search ~/.gemini/tmp/**/chats/ for session-*-{prefix}*.json
+        - Return most recently modified match
+
+    Example:
+        >>> derive_gemini_transcript_path("abc123-uuid-here")
+        '/Users/user/.gemini/tmp/project/chats/session-1-abc123-rest.json'
+    """
+    if not session_id:
+        return None
+
+    try:
+        session_prefix = session_id.split("-")[0]
+        gemini_chats = Path.home() / ".gemini" / "tmp"
+        pattern = str(gemini_chats / "**" / "chats" / f"session-*-{session_prefix}*.json")
+        matches = glob.glob(pattern, recursive=True)
+        if matches:
+            # Return most recently modified
+            return max(matches, key=lambda p: Path(p).stat().st_mtime)
+    except Exception:
+        pass
+
+    return None
+
+
+def derive_codex_transcript_path(thread_id: str | None) -> str | None:
+    """Derive Codex CLI transcript path from thread_id.
+
+    Searches the Codex sessions directory for rollout files matching the thread_id.
+    Respects CODEX_HOME environment variable if set.
+
+    Args:
+        thread_id: Codex thread ID (UUID format)
+
+    Returns:
+        Full path to transcript file if found, None otherwise
+
+    Search Strategy:
+        - Use $CODEX_HOME/sessions if set, else ~/.codex/sessions
+        - Search for rollout-*-{thread_id}.jsonl recursively
+        - Return most recently modified match (deterministic selection)
+
+    Example:
+        >>> derive_codex_transcript_path("abc-123-def")
+        '/Users/user/.codex/sessions/project/rollout-1-abc-123-def.jsonl'
+    """
+    if not thread_id:
+        return None
+
+    try:
+        # Respect CODEX_HOME env var if set, else default to ~/.codex
+        codex_base = os.environ.get("CODEX_HOME") or str(Path.home() / ".codex")
+        codex_home = Path(codex_base) / "sessions"
+        pattern = str(codex_home / "**" / f"rollout-*-{thread_id}.jsonl")
+        matches = glob.glob(pattern, recursive=True)
+        if matches:
+            # Return most recently modified for deterministic selection
+            return max(matches, key=lambda p: Path(p).stat().st_mtime)
+    except Exception:
+        pass
+
+    return None
 
 
 # =============================================================================
@@ -564,6 +661,12 @@ def format_thread(thread_data: dict, instance: str = "", full: bool = False) -> 
             lines.append(f"FILES: {', '.join(ex['files'])}")
         lines.append("")
 
+    # Add hints
+    if not full:
+        lines.append("Note: Output truncated. Use --full for full text.")
+    else:
+        lines.append("Note: Tool outputs & file edits hidden. Use --detailed for full details.")
+
     return "\n".join(lines).rstrip()
 
 
@@ -673,6 +776,7 @@ TOOL_ALIASES = {
     "list_directory": "Glob",
     # Codex tool names
     "shell": "Bash",
+    "shell_command": "Bash",
     "apply_patch": "Edit",
 }
 
@@ -819,16 +923,22 @@ def parse_codex_thread(
     transcript_path: str | Path,
     last: int = 10,
     range_tuple: tuple[int, int] | None = None,
+    detailed: bool = False,
 ) -> dict:
     """Parse Codex CLI rollout JSONL into structured exchanges.
 
-    Codex stores sessions as JSONL with different entry types.
+    Codex stores sessions as JSONL with different entry types:
+    - response_item with payload.type="message" for user/assistant messages
+    - response_item with payload.type="function_call" for tool calls
+    - response_item with payload.type="function_call_output" for tool results
+
     Format: ~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl
 
     Args:
         transcript_path: Path to rollout JSONL file
         last: Number of recent exchanges (ignored if range_tuple provided)
         range_tuple: (start, end) absolute positions, 1-indexed inclusive
+        detailed: If True, include tool usage details
 
     Returns:
         {"exchanges": [...], "total": int, "error": str | None}
@@ -837,8 +947,8 @@ def parse_codex_thread(
     if not path.exists():
         return {"exchanges": [], "total": 0, "error": f"Transcript not found: {path}"}
 
-    # Parse all response_item entries
-    messages = []
+    # Parse all response_item entries - messages, function calls, and outputs
+    entries: list[dict] = []
     try:
         with open(path, "r") as f:
             for line in f:
@@ -849,37 +959,68 @@ def parse_codex_thread(
                     if entry.get("type") != "response_item":
                         continue
                     payload = entry.get("payload", {})
-                    if payload.get("type") != "message":
-                        continue
+                    payload_type = payload.get("type")
 
-                    role = payload.get("role")
-                    if role not in ("user", "assistant"):
-                        continue
-
-                    # Extract text content from content array
-                    content_parts = payload.get("content", [])
-                    text = ""
-                    for part in content_parts:
-                        if isinstance(part, dict):
-                            # input_text for user, output_text for assistant
-                            text += part.get("text", "")
-                        elif isinstance(part, str):
-                            text += part
-
-                    messages.append(
-                        {
-                            "type": "user" if role == "user" else "assistant",
-                            "content": text.strip(),
-                            "timestamp": entry.get("timestamp", ""),
-                        }
-                    )
+                    if payload_type == "message":
+                        role = payload.get("role")
+                        if role not in ("user", "assistant"):
+                            continue
+                        # Extract text content from content array
+                        content_parts = payload.get("content", [])
+                        text = ""
+                        for part in content_parts:
+                            if isinstance(part, dict):
+                                text += part.get("text", "")
+                            elif isinstance(part, str):
+                                text += part
+                        entries.append(
+                            {
+                                "entry_type": "message",
+                                "type": "user" if role == "user" else "assistant",
+                                "content": text.strip(),
+                                "timestamp": entry.get("timestamp", ""),
+                            }
+                        )
+                    elif payload_type == "function_call" and detailed:
+                        # Parse tool call arguments
+                        args_str = payload.get("arguments", "{}")
+                        try:
+                            args = json.loads(args_str) if isinstance(args_str, str) else args_str
+                        except json.JSONDecodeError:
+                            args = {}
+                        entries.append(
+                            {
+                                "entry_type": "function_call",
+                                "call_id": payload.get("call_id", ""),
+                                "name": payload.get("name", "unknown"),
+                                "arguments": args,
+                                "timestamp": entry.get("timestamp", ""),
+                            }
+                        )
+                    elif payload_type == "function_call_output" and detailed:
+                        entries.append(
+                            {
+                                "entry_type": "function_call_output",
+                                "call_id": payload.get("call_id", ""),
+                                "output": payload.get("output", ""),
+                                "timestamp": entry.get("timestamp", ""),
+                            }
+                        )
                 except json.JSONDecodeError:
                     continue
     except Exception as e:
         return {"exchanges": [], "total": 0, "error": f"Error reading file: {e}"}
 
+    messages = [e for e in entries if e.get("entry_type") == "message"]
     if not messages:
         return {"exchanges": [], "total": 0, "error": None}
+
+    # Build function call output index for detailed mode
+    call_outputs: dict[str, str] = {}
+    if detailed:
+        for entry in entries:
+            if entry.get("entry_type") == "function_call_output":
+                call_outputs[entry["call_id"]] = entry.get("output", "")
 
     # Find user messages (prompts)
     user_messages = [m for m in messages if m.get("type") == "user"]
@@ -894,8 +1035,17 @@ def parse_codex_thread(
         selected_indices = list(range(max(0, total - last), total))
         base_pos = max(1, total - last + 1)
 
-    # Build message lookup by index
+    # Build message lookup by index within messages list
     user_msg_indices = [i for i, m in enumerate(messages) if m.get("type") == "user"]
+
+    # Build entry index for detailed mode - map message to entry position
+    msg_to_entry_idx: dict[int, int] = {}
+    if detailed:
+        msg_idx = 0
+        for entry_idx, entry in enumerate(entries):
+            if entry.get("entry_type") == "message":
+                msg_to_entry_idx[msg_idx] = entry_idx
+                msg_idx += 1
 
     exchanges = []
     for pos_offset, user_pos in enumerate(selected_indices):
@@ -907,7 +1057,7 @@ def parse_codex_thread(
         if not user_text:
             continue
 
-        # Find responses after this user message
+        # Find responses after this user message until next user message
         action_parts = []
         next_user_idx = user_msg_indices[user_pos + 1] if user_pos + 1 < len(user_msg_indices) else len(messages)
 
@@ -919,15 +1069,72 @@ def parse_codex_thread(
 
         action = "\n".join(action_parts) if action_parts else "(no response)"
 
-        exchanges.append(
-            {
-                "position": base_pos + pos_offset,
-                "user": user_text[:300],
-                "action": action,
-                "files": [],  # Codex doesn't easily expose file paths in this format
-                "timestamp": user_msg.get("timestamp", ""),
-            }
-        )
+        exchange: dict = {
+            "position": base_pos + pos_offset,
+            "user": user_text[:300] if not detailed else user_text[:500],
+            "action": action,
+            "files": [],
+            "timestamp": user_msg.get("timestamp", ""),
+        }
+
+        # Extract tool calls for detailed mode
+        if detailed:
+            tools = []
+            # Find entry range for this exchange
+            entry_start = msg_to_entry_idx.get(msg_idx, 0)
+            entry_end = (
+                msg_to_entry_idx.get(next_user_idx, len(entries)) if next_user_idx < len(messages) else len(entries)
+            )
+
+            for entry in entries[entry_start:entry_end]:
+                if entry.get("entry_type") != "function_call":
+                    continue
+
+                raw_name = entry.get("name", "unknown")
+                tool_name = _normalize_tool_name(raw_name)
+                args = entry.get("arguments", {})
+                call_id = entry.get("call_id", "")
+                output = call_outputs.get(call_id, "")
+
+                # Check for errors in output - look for non-zero exit codes
+                # Codex format: "Exit code: N\n..." at start of output
+                is_err = False
+                if output:
+                    # Check for non-zero exit code (Codex format)
+                    if output.startswith("Exit code:"):
+                        exit_line = output.split("\n")[0]
+                        if "Exit code: 0" not in exit_line:
+                            is_err = True
+                    # Also check for error patterns in first 200 chars
+                    elif any(p in output[:200].lower() for p in ("error:", "traceback", "exception")):
+                        is_err = True
+
+                tool_record: dict = {
+                    "name": tool_name,
+                    "is_error": is_err,
+                }
+
+                if tool_name == "Bash" or raw_name in ("shell", "shell_command"):
+                    cmd = args.get("command", "")
+                    tool_record["command"] = cmd
+                    # Truncate output for display
+                    if len(output) > 500:
+                        output = output[:500] + f"... (+{len(output) - 500} chars)"
+                    tool_record["output"] = output
+                elif tool_name == "Edit" or raw_name == "apply_patch":
+                    tool_record["file"] = args.get("file_path") or args.get("path", "")
+                elif tool_name in ("Read", "Glob", "Grep"):
+                    tool_record["target"] = args.get("file_path") or args.get("path") or args.get("pattern", "")
+
+                tools.append(tool_record)
+
+            exchange["tools"] = tools
+            exchange["edits"] = []  # Codex doesn't provide structured edit info
+            exchange["errors"] = [
+                {"tool": t["name"], "content": t.get("output", "")[:300]} for t in tools if t.get("is_error")
+            ]
+
+        exchanges.append(exchange)
 
     return {"exchanges": exchanges, "total": total, "error": None}
 
@@ -1143,7 +1350,7 @@ def get_thread(
     Args:
         transcript_path: Path to transcript file
         last: Number of recent exchanges (ignored if range_tuple provided)
-        tool: AI tool type ('claude', 'gemini', etc.)
+        tool: AI tool type ('claude', 'gemini', 'codex')
         detailed: If True, use detailed parser with tool I/O
         range_tuple: (start, end) absolute positions, 1-indexed inclusive
 
@@ -1155,6 +1362,9 @@ def get_thread(
 
     if tool == "gemini":
         return parse_gemini_thread(transcript_path, last, range_tuple, detailed=detailed)
+
+    if tool == "codex":
+        return parse_codex_thread(transcript_path, last, range_tuple, detailed=detailed)
 
     parser = PARSERS.get(tool, parse_claude_thread)
     return parser(transcript_path, last, range_tuple)
@@ -1196,14 +1406,23 @@ def _get_live_transcript_paths(agent_filter: str | None = None) -> list[str]:
 def _agent_from_path(path: str) -> str:
     """Determine agent type from transcript path."""
     p = Path(path)
+
+    # Check if path is under Claude config dir (respects CLAUDE_CONFIG_DIR)
+    try:
+        claude_projects = get_claude_config_dir() / "projects"
+        if p.is_relative_to(claude_projects):
+            return "claude"
+    except (ValueError, AttributeError):
+        pass
+
+    # Fallback to checking path parts for other agents
     parts = p.parts
     for i, part in enumerate(parts):
-        if part == ".claude" and i + 1 < len(parts) and parts[i + 1] == "projects":
-            return "claude"
         if part == ".gemini":
             return "gemini"
         if part == ".codex" and i + 1 < len(parts) and parts[i + 1] == "sessions":
             return "codex"
+
     return "unknown"
 
 
@@ -1417,7 +1636,7 @@ def search_transcripts(
             return {"results": [], "count": 0, "scope": scope}
     else:  # scope == "all"
         if agent_filter is None or agent_filter == "claude":
-            p = home / ".claude" / "projects"
+            p = get_claude_config_dir() / "projects"
             if p.exists():
                 search_paths.append(str(p))
         if agent_filter is None or agent_filter == "gemini":

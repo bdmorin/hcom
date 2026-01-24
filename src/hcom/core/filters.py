@@ -23,27 +23,27 @@ from typing import Any
 
 # Mapping of CLI flags to internal filter keys
 FLAG_MAP = {
-    '--agent': 'instance',
-    '--type': 'type',
-    '--status': 'status',
-    '--context': 'context',
-    '--file': 'file',
-    '--cmd': 'cmd',
-    '--from': 'from',
-    '--mention': 'mention',
-    '--action': 'action',
-    '--after': 'after',
-    '--before': 'before',
-    '--intent': 'intent',
-    '--thread': 'thread',
-    '--reply-to': 'reply_to',
-    '--collision': 'collision',
+    "--agent": "instance",
+    "--type": "type",
+    "--status": "status",
+    "--context": "context",
+    "--file": "file",
+    "--cmd": "cmd",
+    "--from": "from",
+    "--mention": "mention",
+    "--action": "action",
+    "--after": "after",
+    "--before": "before",
+    "--intent": "intent",
+    "--thread": "thread",
+    "--reply-to": "reply_to",
+    "--collision": "collision",
 }
 
 # Flags that require specific event types
-STATUS_FLAGS = {'status', 'context', 'file', 'cmd'}
-MESSAGE_FLAGS = {'from', 'mention', 'intent', 'thread', 'reply_to'}
-LIFE_FLAGS = {'action'}
+STATUS_FLAGS = {"status", "context", "file", "cmd"}
+MESSAGE_FLAGS = {"from", "mention", "intent", "thread", "reply_to"}
+LIFE_FLAGS = {"action"}
 
 # Tool context constants for SQL filters
 # File-write tool contexts by platform:
@@ -51,6 +51,24 @@ LIFE_FLAGS = {'action'}
 #   Gemini: tool:write_file, tool:replace
 #   Codex: tool:apply_patch
 FILE_WRITE_CONTEXTS = "('tool:Write', 'tool:Edit', 'tool:write_file', 'tool:replace', 'tool:apply_patch')"
+
+# File read contexts:
+#   Claude: tool:Read
+#   Gemini: tool:read_file
+#   Codex: (none tracked)
+FILE_READ_CONTEXTS = "('tool:Read', 'tool:read_file')"
+
+# All file operation contexts (for queries and formatting)
+FILE_OP_CONTEXTS = (
+    "tool:Write",
+    "tool:Edit",
+    "tool:Read",
+    "tool:write_file",
+    "tool:replace",
+    "tool:read_file",
+    "tool:apply_patch",
+)
+FILE_OP_CONTEXTS_SQL = f"({','.join(repr(c) for c in FILE_OP_CONTEXTS)})"
 
 # Shell tool contexts:
 #   Claude: tool:Bash
@@ -85,8 +103,8 @@ def parse_event_flags(argv: list[str]) -> tuple[dict[str, list[Any]], list[str]]
         arg = argv[i]
 
         # Boolean flag (no value)
-        if arg == '--collision':
-            filters.setdefault('collision', []).append(True)
+        if arg == "--collision":
+            filters.setdefault("collision", []).append(True)
             i += 1
         # Value flag
         elif arg in FLAG_MAP:
@@ -123,21 +141,19 @@ def validate_type_constraints(filters: dict[str, list[Any]]) -> None:
 
     # Check which types are required by filters
     if any(flag in filters for flag in STATUS_FLAGS):
-        required_types.add('status')
+        required_types.add("status")
     if any(flag in filters for flag in MESSAGE_FLAGS):
-        required_types.add('message')
+        required_types.add("message")
     if any(flag in filters for flag in LIFE_FLAGS):
-        required_types.add('life')
+        required_types.add("life")
 
     # Explicit --type flag takes precedence
-    if 'type' in filters:
-        explicit_types = set(filters['type'])
+    if "type" in filters:
+        explicit_types = set(filters["type"])
         # Check if explicit type conflicts with inferred requirements
         if required_types and not required_types.issubset(explicit_types):
             conflicting = required_types - explicit_types
-            raise ValueError(
-                f"Filters require type {conflicting} but --type specified {explicit_types}"
-            )
+            raise ValueError(f"Filters require type {conflicting} but --type specified {explicit_types}")
 
     # Check for conflicting requirements
     if len(required_types) > 1:
@@ -183,10 +199,7 @@ def _escape_sql_like(s: str) -> str:
         >>> _escape_sql_like("50%_off")
         "50\\%\\_off"
     """
-    return (s.replace("\\", "\\\\")
-             .replace("%", "\\%")
-             .replace("_", "\\_")
-             .replace("'", "''"))
+    return s.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_").replace("'", "''")
 
 
 def build_sql_from_flags(filters: dict[str, list[Any]]) -> str:
@@ -227,19 +240,19 @@ def build_sql_from_flags(filters: dict[str, list[Any]]) -> str:
     clauses: list[str] = []
 
     # Instance filter
-    if 'instance' in filters:
-        if len(filters['instance']) == 1:
+    if "instance" in filters:
+        if len(filters["instance"]) == 1:
             clauses.append(f"instance = '{_escape_sql(filters['instance'][0])}'")
         else:
-            instances = "', '".join(_escape_sql(x) for x in filters['instance'])
+            instances = "', '".join(_escape_sql(x) for x in filters["instance"])
             clauses.append(f"instance IN ('{instances}')")
 
     # Type filter (explicit)
-    if 'type' in filters:
-        if len(filters['type']) == 1:
+    if "type" in filters:
+        if len(filters["type"]) == 1:
             clauses.append(f"type = '{_escape_sql(filters['type'][0])}'")
         else:
-            types = "', '".join(_escape_sql(x) for x in filters['type'])
+            types = "', '".join(_escape_sql(x) for x in filters["type"])
             clauses.append(f"type IN ('{types}')")
     # Auto-infer type from filters (validation already checked no conflicts)
     elif any(flag in filters for flag in STATUS_FLAGS):
@@ -250,22 +263,22 @@ def build_sql_from_flags(filters: dict[str, list[Any]]) -> str:
         clauses.append("type = 'life'")
 
     # Status filter
-    if 'status' in filters:
-        if len(filters['status']) == 1:
+    if "status" in filters:
+        if len(filters["status"]) == 1:
             clauses.append(f"status_val = '{_escape_sql(filters['status'][0])}'")
         else:
-            statuses = "', '".join(_escape_sql(x) for x in filters['status'])
+            statuses = "', '".join(_escape_sql(x) for x in filters["status"])
             clauses.append(f"status_val IN ('{statuses}')")
 
     # Context filter
-    if 'context' in filters:
+    if "context" in filters:
         context_clauses = []
-        for pattern in filters['context']:
-            if '*' in pattern:
+        for pattern in filters["context"]:
+            if "*" in pattern:
                 # Glob pattern: tool:* → tool:%
                 # Split by *, escape each part, join with % (avoids null byte marker)
-                parts = pattern.split('*')
-                sql_pattern = '%'.join(_escape_sql_like(p) for p in parts)
+                parts = pattern.split("*")
+                sql_pattern = "%".join(_escape_sql_like(p) for p in parts)
                 context_clauses.append(f"status_context LIKE '{sql_pattern}' ESCAPE '\\'")
             else:
                 # Exact match
@@ -277,16 +290,16 @@ def build_sql_from_flags(filters: dict[str, list[Any]]) -> str:
             clauses.append(f"({' OR '.join(context_clauses)})")
 
     # File filter (status_detail for file write tools)
-    if 'file' in filters:
+    if "file" in filters:
         clauses.append(f"status_context IN {FILE_WRITE_CONTEXTS}")
 
         file_clauses = []
-        for pattern in filters['file']:
-            if '*' in pattern:
+        for pattern in filters["file"]:
+            if "*" in pattern:
                 # Glob: *.py → %.py
                 # Split by *, escape each part, join with % (avoids null byte marker)
-                parts = pattern.split('*')
-                sql_pattern = '%'.join(_escape_sql_like(p) for p in parts)
+                parts = pattern.split("*")
+                sql_pattern = "%".join(_escape_sql_like(p) for p in parts)
                 file_clauses.append(f"status_detail LIKE '{sql_pattern}' ESCAPE '\\'")
             else:
                 # Contains (default)
@@ -298,15 +311,15 @@ def build_sql_from_flags(filters: dict[str, list[Any]]) -> str:
             clauses.append(f"({' OR '.join(file_clauses)})")
 
     # Cmd filter (status_detail for shell tools)
-    if 'cmd' in filters:
+    if "cmd" in filters:
         clauses.append(f"status_context IN {SHELL_TOOL_CONTEXTS}")
 
         cmd_clauses = []
-        for pattern in filters['cmd']:
-            if pattern.startswith('='):
+        for pattern in filters["cmd"]:
+            if pattern.startswith("="):
                 # Exact match: =git status
                 cmd_clauses.append(f"status_detail = '{_escape_sql(pattern[1:])}'")
-            elif pattern.startswith('^'):
+            elif pattern.startswith("^"):
                 # Starts with: ^git
                 cmd_clauses.append(f"status_detail LIKE '{_escape_sql_like(pattern[1:])}%' ESCAPE '\\'")
             else:
@@ -319,16 +332,16 @@ def build_sql_from_flags(filters: dict[str, list[Any]]) -> str:
             clauses.append(f"({' OR '.join(cmd_clauses)})")
 
     # Message filters
-    if 'from' in filters:
-        if len(filters['from']) == 1:
+    if "from" in filters:
+        if len(filters["from"]) == 1:
             clauses.append(f"msg_from = '{_escape_sql(filters['from'][0])}'")
         else:
-            froms = "', '".join(_escape_sql(x) for x in filters['from'])
+            froms = "', '".join(_escape_sql(x) for x in filters["from"])
             clauses.append(f"msg_from IN ('{froms}')")
 
-    if 'mention' in filters:
+    if "mention" in filters:
         mention_clauses = []
-        for name in filters['mention']:
+        for name in filters["mention"]:
             mention_clauses.append(f"msg_mentions LIKE '%{_escape_sql_like(name)}%' ESCAPE '\\'")
 
         if len(mention_clauses) == 1:
@@ -336,46 +349,46 @@ def build_sql_from_flags(filters: dict[str, list[Any]]) -> str:
         else:
             clauses.append(f"({' OR '.join(mention_clauses)})")
 
-    if 'intent' in filters:
-        if len(filters['intent']) == 1:
+    if "intent" in filters:
+        if len(filters["intent"]) == 1:
             clauses.append(f"msg_intent = '{_escape_sql(filters['intent'][0])}'")
         else:
-            intents = "', '".join(_escape_sql(x) for x in filters['intent'])
+            intents = "', '".join(_escape_sql(x) for x in filters["intent"])
             clauses.append(f"msg_intent IN ('{intents}')")
 
-    if 'thread' in filters:
-        if len(filters['thread']) == 1:
+    if "thread" in filters:
+        if len(filters["thread"]) == 1:
             clauses.append(f"msg_thread = '{_escape_sql(filters['thread'][0])}'")
         else:
-            threads = "', '".join(_escape_sql(x) for x in filters['thread'])
+            threads = "', '".join(_escape_sql(x) for x in filters["thread"])
             clauses.append(f"msg_thread IN ('{threads}')")
 
-    if 'reply_to' in filters:
-        if len(filters['reply_to']) == 1:
+    if "reply_to" in filters:
+        if len(filters["reply_to"]) == 1:
             clauses.append(f"msg_reply_to = '{_escape_sql(filters['reply_to'][0])}'")
         else:
-            reply_tos = "', '".join(_escape_sql(x) for x in filters['reply_to'])
+            reply_tos = "', '".join(_escape_sql(x) for x in filters["reply_to"])
             clauses.append(f"msg_reply_to IN ('{reply_tos}')")
 
     # Life filters
-    if 'action' in filters:
-        if len(filters['action']) == 1:
+    if "action" in filters:
+        if len(filters["action"]) == 1:
             clauses.append(f"life_action = '{_escape_sql(filters['action'][0])}'")
         else:
-            actions = "', '".join(_escape_sql(x) for x in filters['action'])
+            actions = "', '".join(_escape_sql(x) for x in filters["action"])
             clauses.append(f"life_action IN ('{actions}')")
 
     # Time range filters
-    if 'after' in filters:
-        for ts in filters['after']:
+    if "after" in filters:
+        for ts in filters["after"]:
             clauses.append(f"timestamp >= '{_escape_sql(ts)}'")
 
-    if 'before' in filters:
-        for ts in filters['before']:
+    if "before" in filters:
+        for ts in filters["before"]:
             clauses.append(f"timestamp < '{_escape_sql(ts)}'")
 
     # Collision filter (special case - complex EXISTS query)
-    if 'collision' in filters:
+    if "collision" in filters:
         collision_sql = f"""type = 'status' AND status_context IN {FILE_WRITE_CONTEXTS}
 AND EXISTS (
     SELECT 1 FROM events_v e
@@ -411,11 +424,11 @@ def expand_shortcuts(argv: list[str]) -> list[str]:
     i = 0
 
     while i < len(argv):
-        if argv[i] == '--idle' and i + 1 < len(argv):
-            expanded.extend(['--agent', argv[i + 1], '--status', 'listening'])
+        if argv[i] == "--idle" and i + 1 < len(argv):
+            expanded.extend(["--agent", argv[i + 1], "--status", "listening"])
             i += 2
-        elif argv[i] == '--blocked' and i + 1 < len(argv):
-            expanded.extend(['--agent', argv[i + 1], '--status', 'blocked'])
+        elif argv[i] == "--blocked" and i + 1 < len(argv):
+            expanded.extend(["--agent", argv[i + 1], "--status", "blocked"])
             i += 2
         else:
             # Pass through (including --collision)

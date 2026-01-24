@@ -85,9 +85,7 @@ def _setup_tcp_notification(instance_name: str) -> tuple[socket.socket | None, b
 
         return (notify_server, True)
     except Exception as e:
-        log_error(
-            "hooks", "hook.error", e, hook="tcp_notification", instance=instance_name
-        )
+        log_error("hooks", "hook.error", e, hook="tcp_notification", instance=instance_name)
         return (None, False)
 
 
@@ -205,9 +203,7 @@ def poll_messages(
                     log_error("relay", "relay.error", e, hook="poll_messages")
 
                 # Poll BEFORE select() to catch messages from PostToolUse→Stop transition gap
-                messages, max_event_id = get_unread_messages(
-                    instance_id, update_position=False
-                )
+                messages, max_event_id = get_unread_messages(instance_id, update_position=False)
 
                 if messages:
                     # Orphan detection - don't mark as read if Claude died
@@ -218,12 +214,8 @@ def poll_messages(
                     deliver_messages = messages[:MAX_MESSAGES_PER_DELIVERY]
 
                     # Mark as read only through the last delivered event ID.
-                    delivered_last_event_id = deliver_messages[-1].get(
-                        "event_id", max_event_id
-                    )
-                    update_instance_position(
-                        instance_id, {"last_event_id": delivered_last_event_id}
-                    )
+                    delivered_last_event_id = deliver_messages[-1].get("event_id", max_event_id)
+                    update_instance_position(instance_id, {"last_event_id": delivered_last_event_id})
 
                     formatted = format_messages_json(deliver_messages, instance_id)
                     set_status(
@@ -286,3 +278,107 @@ def poll_messages(
         # Participant context (after gates) - log errors for debugging
         log_error("hooks", "hook.error", e, hook="poll_messages")
         return (0, None, False)
+
+
+# ==================== Tool Detail Extraction ====================
+
+
+TOOL_NAME_MAPPINGS: dict[str, dict[str, list[str]]] = {
+    "claude": {
+        "bash": ["Bash"],
+        "file": ["Write", "Edit"],
+        "delegate": ["Task"],
+    },
+    "gemini": {
+        "bash": ["run_shell_command"],
+        "file": ["write_file", "replace"],
+        "delegate": ["delegate_to_agent"],
+    },
+    "codex": {
+        "bash": ["execute_command", "shell", "shell_command"],
+        "file": ["apply_patch"],
+    },
+}
+
+
+def extract_tool_detail(tool: str, tool_name: str, tool_input: dict) -> str:
+    """Extract human-readable detail from tool input for status display.
+
+    Centralizes tool detail extraction across claude/gemini/codex hooks.
+
+    Args:
+        tool: Tool type ("claude", "gemini", "codex")
+        tool_name: Specific tool name from hook payload
+        tool_input: Tool input dictionary from hook_data
+
+    Returns:
+        Relevant detail string, or empty string if tool not recognized.
+    """
+    mappings = TOOL_NAME_MAPPINGS.get(tool, {})
+    for category, tool_names in mappings.items():
+        if tool_name in tool_names:
+            match category:
+                case "bash":
+                    return tool_input.get("command", "")
+                case "file":
+                    return tool_input.get("file_path", "")
+                case "delegate":
+                    return tool_input.get("prompt", "") or tool_input.get("task", "")
+    return ""
+
+
+# ==================== Vanilla Binding ====================
+
+
+def bind_vanilla_instance_from_marker(
+    *,
+    marker_text: str,
+    session_id: str | None,
+    transcript_path: str | None,
+    tool: str,
+    hook: str,
+    error_returns_instance: bool,
+) -> str | None:
+    """Bind instance based on [HCOM:BIND:name] marker.
+
+    Centralizes vanilla binding logic for codex (and potentially other tools).
+    Gemini keeps its own parsing due to complex tool_response format.
+
+    Args:
+        marker_text: Text content to search for binding marker
+        session_id: Session ID to bind (if available)
+        transcript_path: Transcript path to store (if available)
+        tool: Tool name (claude/gemini/codex)
+        hook: Hook name for logging
+        error_returns_instance: Return instance_name on errors if True
+    """
+    if not marker_text:
+        return None
+
+    from ..shared import BIND_MARKER_RE
+
+    match = BIND_MARKER_RE.search(marker_text)
+    if not match:
+        return None
+
+    instance_name = match.group(1)
+    if not session_id and not transcript_path:
+        return instance_name
+
+    try:
+        from ..core.instances import update_instance_position
+        from ..core.db import rebind_instance_session
+
+        updates: dict[str, str] = {"tool": tool}
+        if session_id:
+            updates["session_id"] = session_id
+            rebind_instance_session(instance_name, session_id)
+        if transcript_path:
+            updates["transcript_path"] = transcript_path
+        if updates:
+            update_instance_position(instance_name, updates)
+        log_info("hooks", f"{tool}.bind.success", instance=instance_name, session_id=session_id)
+        return instance_name
+    except Exception as e:
+        log_error("hooks", "hook.error", e, hook=hook, op="bind_vanilla")
+        return instance_name if error_returns_instance else None

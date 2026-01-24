@@ -51,26 +51,28 @@ Subcommand: TypeAlias = Literal["exec", "resume", "fork", "review", None]
 _EXEC_SUBCOMMANDS: Final[frozenset[str]] = frozenset({"exec", "e"})  # e is alias for exec
 
 # All known subcommands (from codex --help)
-_SUBCOMMANDS: Final[frozenset[str]] = frozenset({
-    "exec",
-    "e",  # e is alias for exec
-    "resume",
-    "fork",
-    "review",
-    "mcp",
-    "mcp-server",
-    "app-server",
-    "login",
-    "logout",
-    "completion",
-    "sandbox",
-    "debug",  # debug is alias for sandbox
-    "apply",
-    "a",  # a is alias for apply
-    "cloud",
-    "features",
-    "help",
-})
+_SUBCOMMANDS: Final[frozenset[str]] = frozenset(
+    {
+        "exec",
+        "e",  # e is alias for exec
+        "resume",
+        "fork",
+        "review",
+        "mcp",
+        "mcp-server",
+        "app-server",
+        "login",
+        "logout",
+        "completion",
+        "sandbox",
+        "debug",  # debug is alias for sandbox
+        "apply",
+        "a",  # a is alias for apply
+        "cloud",
+        "features",
+        "help",
+    }
+)
 
 # ==================== Flag Classification ====================
 
@@ -91,95 +93,105 @@ _FLAG_ALIASES: Final[Mapping[str, str]] = {
 # -C is --cd (uppercase C), -c is --config (lowercase c)
 _CASE_SENSITIVE_FLAGS: Final[Mapping[str, str]] = {"-C": "--cd", "-c": "--config"}
 
+# Case-sensitive boolean flags (must match exactly, not lowercased)
+# -V is uppercase for version (Codex CLI rejects lowercase -v)
+_CASE_SENSITIVE_BOOLEAN_FLAGS: Final[frozenset[str]] = frozenset({"-V"})
+
 # Boolean flags (no value required)
 # Note: Use lowercase for short flags since matching uses token.lower()
-_BOOLEAN_FLAGS: Final[frozenset[str]] = frozenset({
-    # Global
-    "--oss",
-    "--full-auto",
-    "--dangerously-bypass-approvals-and-sandbox",
-    "--search",
-    "--no-alt-screen",
-    "-h",
-    "--help",
-    "-v",
-    "--version",  # -v lowercase for token_lower matching
-    # Exec-specific
-    "--skip-git-repo-check",
-    "--json",
-    # Resume-specific
-    "--last",
-    "--all",
-    # Review-specific
-    "--uncommitted",
-})
+_BOOLEAN_FLAGS: Final[frozenset[str]] = frozenset(
+    {
+        # Global
+        "--oss",
+        "--full-auto",
+        "--dangerously-bypass-approvals-and-sandbox",
+        "--search",
+        "--no-alt-screen",
+        "-h",
+        "--help",
+        "--version",  # Note: -V is handled case-sensitively in _CASE_SENSITIVE_BOOLEAN_FLAGS
+        # Exec-specific
+        "--skip-git-repo-check",
+        "--json",
+        # Resume-specific
+        "--last",
+        "--all",
+        # Review-specific
+        "--uncommitted",
+    }
+)
 
 # Flags that require a following value (lowercase for matching, except case-sensitive ones)
-_VALUE_FLAGS: Final[frozenset[str]] = frozenset({
-    # Global (short and long forms)
-    "-c",
-    "--config",
-    "--enable",
-    "--disable",
-    "-i",
-    "--image",
-    "-m",
-    "--model",
-    "--local-provider",
-    "-p",
-    "--profile",
-    "-s",
-    "--sandbox",
-    "-a",
-    "--ask-for-approval",
-    "--cd",  # Long form of -C
-    "--add-dir",
-    # Exec-specific
-    "--color",
-    "-o",
-    "--output-last-message",
-    "--output-schema",
-    # Review-specific
-    "--base",
-    "--commit",
-    "--title",
-})
+_VALUE_FLAGS: Final[frozenset[str]] = frozenset(
+    {
+        # Global (short and long forms)
+        "-c",
+        "--config",
+        "--enable",
+        "--disable",
+        "-i",
+        "--image",
+        "-m",
+        "--model",
+        "--local-provider",
+        "-p",
+        "--profile",
+        "-s",
+        "--sandbox",
+        "-a",
+        "--ask-for-approval",
+        "--cd",  # Long form of -C
+        "--add-dir",
+        # Exec-specific
+        "--color",
+        "-o",
+        "--output-last-message",
+        "--output-schema",
+        # Review-specific
+        "--base",
+        "--commit",
+        "--title",
+    }
+)
 
 # Case-sensitive value flags (must match exactly)
 _CASE_SENSITIVE_VALUE_FLAGS: Final[frozenset[str]] = frozenset({"-C", "-c"})
 
 # Flags with = syntax prefixes (lowercase for matching)
-_VALUE_FLAG_PREFIXES: Final[frozenset[str]] = frozenset({
-    "-c=",
-    "--config=",
-    "--enable=",
-    "--disable=",
-    "-i=",
-    "--image=",
-    "-m=",
-    "--model=",
-    "--local-provider=",
-    "-p=",
-    "--profile=",
-    "-s=",
-    "--sandbox=",
-    "-a=",
-    "--ask-for-approval=",
-    "--cd=",
-    "--add-dir=",
-    "--color=",
-    "-o=",
-    "--output-last-message=",
-    "--output-schema=",
-    "--base=",
-    "--commit=",
-    "--title=",
-})
+_VALUE_FLAG_PREFIXES: Final[frozenset[str]] = frozenset(
+    {
+        "-c=",
+        "--config=",
+        "--enable=",
+        "--disable=",
+        "-i=",
+        "--image=",
+        "-m=",
+        "--model=",
+        "--local-provider=",
+        "-p=",
+        "--profile=",
+        "-s=",
+        "--sandbox=",
+        "-a=",
+        "--ask-for-approval=",
+        "--cd=",
+        "--add-dir=",
+        "--color=",
+        "-o=",
+        "--output-last-message=",
+        "--output-schema=",
+        "--base=",
+        "--commit=",
+        "--title=",
+    }
+)
 
 # Used for friendly "did you mean" suggestions when user typos a flag.
 _KNOWN_CODEX_OPTIONS: Final[list[str]] = sorted(
     {
         *_BOOLEAN_FLAGS,
+        *_CASE_SENSITIVE_BOOLEAN_FLAGS,
         *_VALUE_FLAGS,
         *_CASE_SENSITIVE_VALUE_FLAGS,
         *_SUBCOMMANDS,
@@ -192,15 +204,17 @@ _KNOWN_CODEX_OPTIONS: Final[list[str]] = sorted(
 _CASE_SENSITIVE_PREFIXES: Final[frozenset[str]] = frozenset({"-C=", "-c="})
 
 # Repeatable flags (can appear multiple times)
-_REPEATABLE_FLAGS: Final[frozenset[str]] = frozenset({
-    "-c",
-    "--config",
-    "--enable",
-    "--disable",
-    "-i",
-    "--image",
-    "--add-dir",
-})
+_REPEATABLE_FLAGS: Final[frozenset[str]] = frozenset(
+    {
+        "-c",
+        "--config",
+        "--enable",
+        "--disable",
+        "-i",
+        "--image",
+        "--add-dir",
+    }
+)
 
 
 @dataclass(frozen=True)
@@ -568,7 +582,13 @@ def _parse_tokens(
             i += 1
             continue
 
-        # Check for boolean flags
+        # Check for case-sensitive boolean flags first (e.g., -V for version)
+        if token in _CASE_SENSITIVE_BOOLEAN_FLAGS:
+            clean.append(token)
+            i += 1
+            continue
+
+        # Check for boolean flags (lowercase matching)
         if token_lower in _BOOLEAN_FLAGS:
             clean.append(token)
             if token_lower == "--json":
@@ -661,7 +681,12 @@ def _parse_tokens(
 
 
 def _looks_like_flag(token_lower: str) -> bool:
-    """Check if token looks like a flag."""
+    """Check if token looks like a flag.
+
+    Note: Case-sensitive boolean flags like -V are NOT checked here because
+    this function receives lowercased tokens. The parsing loop handles -V
+    case-sensitively before calling _looks_like_flag.
+    """
     if token_lower in _BOOLEAN_FLAGS:
         return True
     if token_lower in _VALUE_FLAGS:

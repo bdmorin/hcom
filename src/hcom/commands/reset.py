@@ -187,7 +187,8 @@ Set HCOM_GO=1 and run again to proceed:
 This will stop all instances, archive the database, remove hooks, and reset config.
 
 Current state:
-  • {instance_count} local instance{"s" if instance_count != 1 else ""}: {", ".join(local_instances[:5])}{" ..." if len(local_instances) > 5 else "" if local_instances else "(none)"}
+  • {instance_count} local instance{"s" if instance_count != 1 else ""}: \
+{", ".join(local_instances[:5])}{" ..." if len(local_instances) > 5 else "" if local_instances else "(none)"}
   • {event_count} events in database
 
 Actions:

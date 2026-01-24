@@ -169,12 +169,10 @@ class NotifyServer:
 
 
 # Re-export from core.instances (canonical location)
-from ..core.instances import wait_for_process_registration
+from ..core.instances import wait_for_process_registration  # noqa: E402
 
 
-def register_notify_port(
-    instance_name: str, notify_port: int | None, tcp_mode: bool
-) -> None:
+def register_notify_port(instance_name: str, notify_port: int | None, tcp_mode: bool) -> None:
     """Register notify port for PTY-based integrations.
 
     Uses notify_endpoints table so multiple waiters can coexist (e.g., PTY + `hcom listen`)
@@ -194,9 +192,7 @@ def register_notify_port(
                 port=notify_port,
             )
         except Exception as e:
-            log_error(
-                "pty", "notify.port.fail", e, instance=instance_name, port=notify_port
-            )
+            log_error("pty", "notify.port.fail", e, instance=instance_name, port=notify_port)
     # Keep tcp_mode as a UI hint; notify port is stored in notify_endpoints only.
     update_instance_position(instance_name, {"tcp_mode": tcp_mode})
 
@@ -262,9 +258,7 @@ class HeartbeatNotifier:
 
     def __init__(self, inner, instance_name: str | Callable[[], str]) -> None:
         self._inner = inner
-        self._name_resolver = (
-            instance_name if callable(instance_name) else lambda: instance_name
-        )
+        self._name_resolver = instance_name if callable(instance_name) else lambda: instance_name
 
     def wait(self, *, timeout: float) -> bool:
         result = self._inner.wait(timeout=timeout)
@@ -315,9 +309,7 @@ def create_sighup_handler(
             # Stop instance (delete row, log life event)
             from ..core.tool_utils import stop_instance
 
-            reason = (
-                exit_context.split(":")[-1] if ":" in exit_context else exit_context
-            )
+            reason = exit_context.split(":")[-1] if ":" in exit_context else exit_context
             stop_instance(resolved_name, initiated_by="pty", reason=reason)
             if log_fn:
                 log_fn(f"Stopped instance {resolved_name}")
@@ -332,13 +324,13 @@ def create_sighup_handler(
 # ==================== Cursor Tracking ====================
 
 # Re-export from core.instances (canonical location)
-from ..core.instances import get_instance_cursor
+from ..core.instances import get_instance_cursor  # noqa: E402
 
 
 # ==================== Message Preview ====================
 
 # Re-export from core.messages (canonical location)
-from ..core.messages import build_message_preview, PREVIEW_MAX_LEN
+from ..core.messages import build_message_preview, PREVIEW_MAX_LEN  # noqa: E402
 
 
 def build_listen_instruction(instance_name: str) -> str:

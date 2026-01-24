@@ -221,9 +221,7 @@ class ManageScreen:
 
         age_text = info.get("age_text", "")
         # "now" special case (listening status uses age=0)
-        age_str = (
-            age_text if age_text == "now" else (f"{age_text} ago" if age_text else "")
-        )
+        age_str = age_text if age_text == "now" else (f"{age_text} ago" if age_text else "")
         age_padded = age_str.rjust(10)
 
         # Badges
@@ -306,7 +304,10 @@ class ManageScreen:
                 border = f"{FG_YELLOW}▐{RESET}{BG_CHARCOAL} "
             else:
                 border = f"{BG_CHARCOAL} "
-            line = f"{tool_prefix}{border}{color}{icon} {weight}{color}{name_padded}{RESET}{BG_CHARCOAL}{weight}{FG_GRAY}{age_padded}{desc_sep}{display_text}{timeout_marker}{RESET}"
+            line = (
+                f"{tool_prefix}{border}{color}{icon} {weight}{color}{name_padded}{RESET}{BG_CHARCOAL}{weight}"
+                f"{FG_GRAY}{age_padded}{desc_sep}{display_text}{timeout_marker}{RESET}"
+            )
             line = truncate_ansi(line, width)
             line = bg_ljust(line, width, BG_CHARCOAL)
         else:
@@ -319,9 +320,7 @@ class ManageScreen:
 
         return line
 
-    def _render_recently_stopped_row(
-        self, recently_stopped: list[str], display_idx: int, width: int
-    ) -> str:
+    def _render_recently_stopped_row(self, recently_stopped: list[str], display_idx: int, width: int) -> str:
         """Render the recently stopped summary row"""
         from ..core.db import RECENTLY_STOPPED_MINUTES
 
@@ -334,9 +333,7 @@ class ManageScreen:
         arrow = "[→]"
 
         # Format: "  ◌ Recently stopped (10m): luna, nova, kira  [→]"
-        content = (
-            f"  ◌ Recently stopped ({RECENTLY_STOPPED_MINUTES}m): {names}  {arrow}"
-        )
+        content = f"  ◌ Recently stopped ({RECENTLY_STOPPED_MINUTES}m): {names}  {arrow}"
 
         # Apply styling based on cursor position
         if display_idx == self.state.manage.cursor:
@@ -371,9 +368,7 @@ class ManageScreen:
         lines = []
 
         # Calculate layout using shared function
-        instance_rows, message_rows, input_rows = self.calculate_layout(
-            layout_height, width
-        )
+        instance_rows, message_rows, input_rows = self.calculate_layout(layout_height, width)
 
         from ..core.instances import is_remote_instance
         from ..core.db import get_recently_stopped
@@ -385,14 +380,8 @@ class ManageScreen:
         )
 
         # Separate local vs remote (row exists = participating, no stopped section)
-        local_instances = [
-            (n, i)
-            for n, i in all_instances
-            if not is_remote_instance(i.get("data", {}))
-        ]
-        remote_instances = [
-            (n, i) for n, i in all_instances if is_remote_instance(i.get("data", {}))
-        ]
+        local_instances = [(n, i) for n, i in all_instances if not is_remote_instance(i.get("data", {}))]
+        remote_instances = [(n, i) for n, i in all_instances if is_remote_instance(i.get("data", {}))]
         # Sort remote by created_at (all are participating)
         remote_instances.sort(key=lambda x: -x[1]["data"].get("created_at", 0.0))
         remote_count = len(remote_instances)
@@ -497,12 +486,8 @@ class ManageScreen:
             lines.append("")
             lines.append(f"{FG_GRAY}  Realtime messaging for AI coding agents{RESET}")
             lines.append("")
-            lines.append(
-                f"{FG_WHITE}  Tab → LAUNCH{RESET}          {FG_GRAY}Start agents here{RESET}"
-            )
-            lines.append(
-                f"{FG_WHITE}  hcom 3 claude{RESET}         {FG_GRAY}Quick launch 3 Claudes{RESET}"
-            )
+            lines.append(f"{FG_WHITE}  Tab → LAUNCH{RESET}          {FG_GRAY}Start agents here{RESET}")
+            lines.append(f"{FG_WHITE}  hcom 3 claude{RESET}         {FG_GRAY}Quick launch 3 Claudes{RESET}")
             lines.append(
                 f"{FG_WHITE}  hcom start{RESET}            {FG_GRAY}Connect hcom from inside any session{RESET}"
             )
@@ -530,29 +515,19 @@ class ManageScreen:
 
             # Calculate visible window
             max_scroll = max(0, display_count - instance_rows)
-            self.state.manage.instance_scroll_pos = max(
-                0, min(self.state.manage.instance_scroll_pos, max_scroll)
-            )
+            self.state.manage.instance_scroll_pos = max(0, min(self.state.manage.instance_scroll_pos, max_scroll))
 
             # Calculate dynamic name column width based on actual names
             all_for_width = list(local_instances)
             if self.state.manage.show_remote:
                 all_for_width += remote_instances
-            max_instance_name_len = max(
-                (len(name) for name, _ in all_for_width), default=0
-            )
+            max_instance_name_len = max((len(name) for name, _ in all_for_width), default=0)
             # Check if any instance has badges
-            has_background = any(
-                info.get("data", {}).get("background", False)
-                for _, info in all_for_width
-            )
+            has_background = any(info.get("data", {}).get("background", False) for _, info in all_for_width)
 
             # Check if multiple tool types exist (show tool prefix if so)
             all_instances_for_tool = local_instances + remote_instances
-            tool_types = set(
-                info.get("data", {}).get("tool", "claude")
-                for _, info in all_instances_for_tool
-            )
+            tool_types = set(info.get("data", {}).get("tool", "claude") for _, info in all_instances_for_tool)
             show_tool = len(tool_types) > 1
 
             # Check if multiple directories exist (show project tag if so)
@@ -606,11 +581,7 @@ class ManageScreen:
                 if display_idx < len(local_instances):
                     # Local instance
                     name, info = local_instances[display_idx]
-                    project_tag = (
-                        get_project_tag(info.get("data", {}).get("directory", ""))
-                        if show_project
-                        else ""
-                    )
+                    project_tag = get_project_tag(info.get("data", {}).get("directory", "")) if show_project else ""
                     line = self._render_instance_row(
                         name,
                         info,
@@ -631,24 +602,18 @@ class ManageScreen:
                         # Build device_id -> suffix mapping from remote instances
                         device_suffixes = {}
                         for name, info in remote_instances:
-                            origin_device = info.get("data", {}).get(
-                                "origin_device_id", ""
-                            )
+                            origin_device = info.get("data", {}).get("origin_device_id", "")
                             if origin_device and ":" in name:
                                 suffix = name.rsplit(":", 1)[1]
                                 device_suffixes[origin_device] = suffix
 
                         sync_parts = []
-                        for device, sync_time in sorted(
-                            self.state.manage.device_sync_times.items()
-                        ):
+                        for device, sync_time in sorted(self.state.manage.device_sync_times.items()):
                             if sync_time:
                                 sync_age = time.time() - sync_time
                                 suffix = device_suffixes.get(device, device[:4].upper())
                                 color = get_device_sync_color(sync_age)
-                                sync_parts.append(
-                                    f"{color}{suffix}:{format_age(sync_age)}{FG_GRAY}"
-                                )
+                                sync_parts.append(f"{color}{suffix}:{format_age(sync_age)}{FG_GRAY}")
 
                         if sync_parts:
                             sep_text = f" relay ({', '.join(sync_parts)}) {arrow} "
@@ -670,11 +635,7 @@ class ManageScreen:
                     remote_idx = display_idx - remote_sep - 1
                     if 0 <= remote_idx < remote_count:
                         name, info = remote_instances[remote_idx]
-                        project_tag = (
-                            get_project_tag(info.get("data", {}).get("directory", ""))
-                            if show_project
-                            else ""
-                        )
+                        project_tag = get_project_tag(info.get("data", {}).get("directory", "")) if show_project else ""
                         line = self._render_instance_row(
                             name,
                             info,
@@ -686,20 +647,13 @@ class ManageScreen:
                             project_tag=project_tag,
                         )
                         lines.append(line)
-                    elif (
-                        recently_stopped_pos >= 0
-                        and display_idx == recently_stopped_pos
-                    ):
+                    elif recently_stopped_pos >= 0 and display_idx == recently_stopped_pos:
                         # Recently stopped summary row
-                        line = self._render_recently_stopped_row(
-                            recently_stopped, display_idx, width
-                        )
+                        line = self._render_recently_stopped_row(recently_stopped, display_idx, width)
                         lines.append(line)
                 elif recently_stopped_pos >= 0 and display_idx == recently_stopped_pos:
                     # Recently stopped summary row (when remote not expanded or no remote)
-                    line = self._render_recently_stopped_row(
-                        recently_stopped, display_idx, width
-                    )
+                    line = self._render_recently_stopped_row(recently_stopped, display_idx, width)
                     lines.append(line)
 
             # Add scroll indicators if needed
@@ -742,9 +696,7 @@ class ManageScreen:
         # Instance detail section (if active) - render ABOVE messages
         detail_rows = 0
         if self.state.manage.show_instance_detail:
-            detail_lines = self.build_instance_detail(
-                self.state.manage.show_instance_detail, width
-            )
+            detail_lines = self.build_instance_detail(self.state.manage.show_instance_detail, width)
             lines.extend(detail_lines)
             detail_rows = len(detail_lines)
             # Separator after detail
@@ -768,16 +720,11 @@ class ManageScreen:
                 from ..core.instances import get_full_name
 
                 conn = get_db()
-                rows = conn.execute(
-                    "SELECT name, last_event_id, origin_device_id, tag FROM instances"
-                ).fetchall()
+                rows = conn.execute("SELECT name, last_event_id, origin_device_id, tag FROM instances").fetchall()
                 # Track full_name -> base_name mapping for DB queries
                 full_to_base = {}
                 for row in rows:
-                    full_name = (
-                        get_full_name({"name": row["name"], "tag": row["tag"]})
-                        or row["name"]
-                    )
+                    full_name = get_full_name({"name": row["name"], "tag": row["tag"]}) or row["name"]
                     full_to_base[full_name] = row["name"]
                     instance_reads[full_name] = row["last_event_id"]
                     if row["origin_device_id"]:
@@ -809,9 +756,7 @@ class ManageScreen:
                 # Format timestamp (convert UTC to local time)
                 dt = parse_iso_timestamp(time_str) if "T" in time_str else None
                 display_time = (
-                    dt.astimezone().strftime("%H:%M")
-                    if dt
-                    else (time_str[:5] if len(time_str) >= 5 else time_str)
+                    dt.astimezone().strftime("%H:%M") if dt else (time_str[:5] if len(time_str) >= 5 else time_str)
                 )
 
                 # Build recipient list with read receipts (width-aware truncation)
@@ -819,9 +764,7 @@ class ManageScreen:
                 if delivered_to:
                     # Calculate available width for recipients
                     # Format: "HH:MM sender → recipients"
-                    base_len = (
-                        len(display_time) + 1 + len(sender) + 3
-                    )  # +1 space, +3 for " → "
+                    base_len = len(display_time) + 1 + len(sender) + 3  # +1 space, +3 for " → "
                     available = width - base_len - 5  # Reserve for "+N more"
 
                     recipient_parts = []
@@ -838,9 +781,7 @@ class ManageScreen:
                         part = f"{recipient}{tick}"
 
                         # Calculate length with separator
-                        part_len = ansi_len(part) + (
-                            2 if shown > 0 else 0
-                        )  # +2 for ", "
+                        part_len = ansi_len(part) + (2 if shown > 0 else 0)  # +2 for ", "
 
                         if current_len + part_len <= available:
                             recipient_parts.append(part)
@@ -891,9 +832,7 @@ class ManageScreen:
                         all_wrapped_lines.append(line)
                 else:
                     # Fallback if width too small
-                    all_wrapped_lines.append(
-                        f"{indent}{FG_LIGHTGRAY}{display_message[: width - len(indent)]}{RESET}"
-                    )
+                    all_wrapped_lines.append(f"{indent}{FG_LIGHTGRAY}{display_message[: width - len(indent)]}{RESET}")
 
                 # Blank line after each message (for separation)
                 all_wrapped_lines.append("")
@@ -908,9 +847,7 @@ class ManageScreen:
         else:
             # No messages - show hint only if instances exist (empty state shows logo instead)
             if self.state.manage.instances:
-                lines.append(
-                    f"{FG_GRAY}No messages yet - type to compose | @ to mention{RESET}"
-                )
+                lines.append(f"{FG_GRAY}No messages yet - type to compose | @ to mention{RESET}")
 
         # Calculate how many lines are used before input (instances + detail + messages + separators)
         lines_before_input = len(lines)
@@ -950,14 +887,8 @@ class ManageScreen:
         )
 
         # Separate local vs remote (row exists = participating)
-        local_instances = [
-            (n, i)
-            for n, i in all_instances
-            if not is_remote_instance(i.get("data", {}))
-        ]
-        remote_instances = [
-            (n, i) for n, i in all_instances if is_remote_instance(i.get("data", {}))
-        ]
+        local_instances = [(n, i) for n, i in all_instances if not is_remote_instance(i.get("data", {}))]
+        remote_instances = [(n, i) for n, i in all_instances if is_remote_instance(i.get("data", {}))]
         # Sort remote by created_at (must match build())
         remote_instances.sort(key=lambda x: -x[1]["data"].get("created_at", 0.0))
 
@@ -1290,12 +1221,8 @@ class ManageScreen:
 
         # Calculate display count based on current collapse state
         all_instances = list(self.state.manage.instances.values())
-        local_instances = [
-            i for i in all_instances if not is_remote_instance(i.get("data", {}))
-        ]
-        remote_instances = [
-            i for i in all_instances if is_remote_instance(i.get("data", {}))
-        ]
+        local_instances = [i for i in all_instances if not is_remote_instance(i.get("data", {}))]
+        remote_instances = [i for i in all_instances if is_remote_instance(i.get("data", {}))]
 
         local_count = len(local_instances)
         remote_count = len(remote_instances)
@@ -1331,12 +1258,8 @@ class ManageScreen:
         if self.state.manage.cursor < self.state.manage.instance_scroll_pos:
             self.state.manage.instance_scroll_pos = self.state.manage.cursor
         # Scroll down if cursor moved below visible window
-        elif (
-            self.state.manage.cursor >= self.state.manage.instance_scroll_pos + visible_instance_rows
-        ):
-            self.state.manage.instance_scroll_pos = (
-                self.state.manage.cursor - visible_instance_rows + 1
-            )
+        elif self.state.manage.cursor >= self.state.manage.instance_scroll_pos + visible_instance_rows:
+            self.state.manage.instance_scroll_pos = self.state.manage.cursor - visible_instance_rows + 1
 
     def render_wrapped_input(self, width: int, input_rows: int) -> List[str]:
         """Render message input (delegates to shared helper)"""
@@ -1393,9 +1316,7 @@ class ManageScreen:
 
             # Get device sync time
             sync_time = self.state.manage.device_sync_times.get(origin_device, 0)
-            sync_str = (
-                f"{format_age(time.time() - sync_time)} ago" if sync_time else "never"
-            )
+            sync_str = f"{format_age(time.time() - sync_time)} ago" if sync_time else "never"
 
             lines.append(truncate_ansi(f"  device:     {device_short}", width))
             lines.append(truncate_ansi(f"  last_sync:  {sync_str}", width))
@@ -1412,9 +1333,7 @@ class ManageScreen:
 
             directory = data.get("directory")
             if directory:
-                lines.append(
-                    truncate_ansi(f"  directory:  {shorten_path(directory)}", width)
-                )
+                lines.append(truncate_ansi(f"  directory:  {shorten_path(directory)}", width))
 
             # Format status_time
             status_time = data.get("status_time", 0)
@@ -1447,11 +1366,7 @@ class ManageScreen:
 
             # Format created_at timestamp
             created_ts = data.get("created_at")
-            created = (
-                f"{format_age(time.time() - created_ts)} ago"
-                if created_ts
-                else "(unknown)"
-            )
+            created = f"{format_age(time.time() - created_ts)} ago" if created_ts else "(unknown)"
 
             # Tool type
             tool = data.get("tool", "claude")

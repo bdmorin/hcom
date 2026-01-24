@@ -103,9 +103,7 @@ def _find_real_binary(tool: str, shim_dir: Path) -> str | None:
     """Find real binary excluding shim dir from PATH (handles symlinks/trailing slashes)."""
     norm_shim = os.path.realpath(str(shim_dir)).rstrip("/")
     path_parts = os.environ.get("PATH", "").split(":")
-    clean_path = ":".join(
-        p for p in path_parts if os.path.realpath(p).rstrip("/") != norm_shim
-    )
+    clean_path = ":".join(p for p in path_parts if os.path.realpath(p).rstrip("/") != norm_shim)
     old_path = os.environ.get("PATH")
     try:
         os.environ["PATH"] = clean_path
@@ -124,9 +122,7 @@ def _get_shim_status() -> dict[str, dict]:
     for tool in SHIM_TOOLS:
         shim_path = shim_dir / tool
         shim_exists = shim_path.exists() and shim_path.is_symlink()
-        real_path = (
-            _find_real_binary(tool, shim_dir) if shim_exists else shutil.which(tool)
-        )
+        real_path = _find_real_binary(tool, shim_dir) if shim_exists else shutil.which(tool)
         which_result = shutil.which(tool)
         active = shim_exists and which_result == str(shim_path)
         result[tool] = {
@@ -160,9 +156,7 @@ def cmd_shim_install(argv: list[str]) -> int:
             elif shim_path.is_dir():
                 raise CLIError(f"Cannot install: {shim_path} is a directory")
             else:
-                raise CLIError(
-                    f"Cannot install: {shim_path} exists and is not a symlink"
-                )
+                raise CLIError(f"Cannot install: {shim_path} exists and is not a symlink")
         shim_path.symlink_to(hcom_path)
         created.append(tool)
 
@@ -256,9 +250,7 @@ def cmd_shim_status(argv: list[str]) -> int:
 
     print("Shim Status:")
     print(f"  Directory: {shim_dir}")
-    print(
-        f"  RC file: {rc_file} ({'configured' if rc_configured else 'not configured'})"
-    )
+    print(f"  RC file: {rc_file} ({'configured' if rc_configured else 'not configured'})")
     print(f"  PATH: {'active' if path_active else 'not in current PATH'}")
     print()
 
@@ -323,9 +315,7 @@ The shim works by:
     elif subcommand == "status":
         return cmd_shim_status(sub_argv)
     else:
-        raise CLIError(
-            f"Unknown shim subcommand: {subcommand}\nRun 'hcom shim --help' for usage"
-        )
+        raise CLIError(f"Unknown shim subcommand: {subcommand}\nRun 'hcom shim --help' for usage")
 
 
 __all__ = ["cmd_shim"]

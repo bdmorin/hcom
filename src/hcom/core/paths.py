@@ -24,9 +24,7 @@ ARCHIVE_DIR = "archive"
 
 # Cache for resolved hcom directory (per-process, thread-safe)
 _hcom_dir_cache: Path | None = None
-_hcom_dir_cache_key: tuple[str | None, str | None] | None = (
-    None  # (HCOM_DIR, CWD if relative)
-)
+_hcom_dir_cache_key: tuple[str | None, str | None] | None = None  # (HCOM_DIR, CWD if relative)
 _hcom_dir_cache_lock = threading.Lock()
 
 # ==================== Path Utilities ====================

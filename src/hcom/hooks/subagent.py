@@ -65,9 +65,7 @@ def in_subagent_context(session_id_or_name: str) -> bool:
         # Try as instance_name (for commands)
         instance_name = session_id_or_name
 
-    row = conn.execute(
-        "SELECT running_tasks FROM instances WHERE name = ? LIMIT 1", (instance_name,)
-    ).fetchone()
+    row = conn.execute("SELECT running_tasks FROM instances WHERE name = ? LIMIT 1", (instance_name,)).fetchone()
 
     if not row or not row["running_tasks"]:
         return False
@@ -79,9 +77,7 @@ def in_subagent_context(session_id_or_name: str) -> bool:
         return False
 
 
-def check_dead_subagents(
-    transcript_path: str, running_tasks: dict, subagent_timeout: int | None = None
-) -> list[str]:
+def check_dead_subagents(transcript_path: str, running_tasks: dict, subagent_timeout: int | None = None) -> list[str]:
     """Detect dead subagents by checking multiple death signals.
 
     Called by UserPromptSubmit after user interrupts a Task. To clean up orphaned
@@ -108,11 +104,7 @@ def check_dead_subagents(
     transcript_dir = Path(transcript_path).parent if transcript_path else None
     conn = get_db()
     # Subagent dead if transcript unchanged for 2x timeout (session ended before SubagentStop cleanup)
-    timeout = (
-        subagent_timeout
-        if subagent_timeout is not None
-        else get_config().subagent_timeout
-    )
+    timeout = subagent_timeout if subagent_timeout is not None else get_config().subagent_timeout
     stale_threshold = timeout * 2
 
     for subagent in running_tasks.get("subagents", []):
@@ -121,9 +113,7 @@ def check_dead_subagents(
             continue
 
         # Rare: instance not in DB but still in running_tasks (SubagentStop cleanup failed)
-        row = conn.execute(
-            "SELECT 1 FROM instances WHERE agent_id = ?", (agent_id,)
-        ).fetchone()
+        row = conn.execute("SELECT 1 FROM instances WHERE agent_id = ?", (agent_id,)).fetchone()
         if not row:
             dead.append(agent_id)
             continue
@@ -178,9 +168,7 @@ def cleanup_dead_subagents(session_id: str, transcript_path: str) -> None:
         return
 
     # Pass parent's subagent_timeout override to check_dead_subagents
-    dead_ids = check_dead_subagents(
-        transcript_path, running_tasks, instance_data.get("subagent_timeout")
-    )
+    dead_ids = check_dead_subagents(transcript_path, running_tasks, instance_data.get("subagent_timeout"))  # type: ignore[arg-type]
     if not dead_ids:
         return
 
@@ -189,9 +177,7 @@ def cleanup_dead_subagents(session_id: str, transcript_path: str) -> None:
         _remove_subagent_from_parent(instance_name, agent_id)
         # Also stop the subagent instance if it exists
         conn = get_db()
-        row = conn.execute(
-            "SELECT name FROM instances WHERE agent_id = ?", (agent_id,)
-        ).fetchone()
+        row = conn.execute("SELECT name FROM instances WHERE agent_id = ?", (agent_id,)).fetchone()
         if row:
             from ..core.tool_utils import stop_instance
 
@@ -220,9 +206,7 @@ def track_subagent(parent_session_id: str, agent_id: str, agent_type: str) -> No
         log_info("hooks", "track_subagent.no_binding", session_id=parent_session_id)
         return
 
-    log_info(
-        "hooks", "track_subagent.resolved", parent=instance_name, agent_id=agent_id
-    )
+    log_info("hooks", "track_subagent.resolved", parent=instance_name, agent_id=agent_id)
 
     instance_data = load_instance_position(instance_name)
     if not instance_data:
@@ -236,9 +220,7 @@ def track_subagent(parent_session_id: str, agent_id: str, agent_type: str) -> No
     subagents = running_tasks["subagents"]
     if not any(s.get("agent_id") == agent_id for s in subagents):
         subagents.append({"agent_id": agent_id, "type": agent_type})
-        update_instance_position(
-            instance_name, {"running_tasks": json.dumps(running_tasks)}
-        )
+        update_instance_position(instance_name, {"running_tasks": json.dumps(running_tasks)})
 
 
 def _remove_subagent_from_parent(parent_name: str, agent_id: str) -> None:
@@ -257,9 +239,7 @@ def _remove_subagent_from_parent(parent_name: str, agent_id: str) -> None:
         return
 
     # Remove subagent with matching agent_id
-    running_tasks["subagents"] = [
-        s for s in running_tasks["subagents"] if s.get("agent_id") != agent_id
-    ]
+    running_tasks["subagents"] = [s for s in running_tasks["subagents"] if s.get("agent_id") != agent_id]
 
     # If no more subagents, clear active flag
     if not running_tasks["subagents"]:
@@ -303,9 +283,7 @@ def posttooluse(
 
     agent_id = match.group(1)
     conn = get_db()
-    row = conn.execute(
-        "SELECT name FROM instances WHERE agent_id = ?", (agent_id,)
-    ).fetchone()
+    row = conn.execute("SELECT name FROM instances WHERE agent_id = ?", (agent_id,)).fetchone()
     if not row:
         sys.exit(0)
 
@@ -338,9 +316,7 @@ def posttooluse(
     if messages:
         deliver_messages = messages[:MAX_MESSAGES_PER_DELIVERY]
         delivered_last_event_id = deliver_messages[-1].get("event_id", max_event_id)
-        update_instance_position(
-            subagent_name, {"last_event_id": delivered_last_event_id}
-        )
+        update_instance_position(subagent_name, {"last_event_id": delivered_last_event_id})
 
         formatted = format_messages_json(deliver_messages, subagent_name)
         set_status(
@@ -363,11 +339,7 @@ def posttooluse(
         if len(outputs) == 1:
             print(json.dumps(outputs[0], ensure_ascii=False))
         else:
-            contexts = [
-                o["hookSpecificOutput"]["additionalContext"]
-                for o in outputs
-                if "hookSpecificOutput" in o
-            ]
+            contexts = [o["hookSpecificOutput"]["additionalContext"] for o in outputs if "hookSpecificOutput" in o]
             combined = {
                 "hookSpecificOutput": {
                     "hookEventName": "PostToolUse",

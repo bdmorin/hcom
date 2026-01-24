@@ -28,14 +28,12 @@ Message Delivery:
 import os
 import sys
 import json
-from pathlib import Path
 
 from ...core.log import log_error, log_info
+from ...hooks.family import extract_tool_detail
 
 
-def try_capture_transcript_path(
-    instance_name: str, payload: dict | None = None
-) -> None:
+def try_capture_transcript_path(instance_name: str, payload: dict | None = None) -> None:
     """Try to capture transcript_path from payload if not already set.
 
     Gemini's ChatRecordingService isn't initialized at SessionStart,
@@ -47,6 +45,7 @@ def try_capture_transcript_path(
         payload: Pre-read stdin payload (to avoid double-read). If None, reads stdin.
     """
     from ...core.instances import load_instance_position, update_instance_position
+    from ...core.transcript import derive_gemini_transcript_path
 
     data = load_instance_position(instance_name)
     if data and data.get("transcript_path"):
@@ -61,24 +60,11 @@ def try_capture_transcript_path(
             payload = {}
     transcript_path = payload.get("transcript_path", "") if payload else ""
 
+    # If not in payload, try deriving from session_id
     if not transcript_path:
         session_id = data.get("session_id", "") if data else ""
         if session_id:
-            try:
-                import glob
-
-                session_prefix = session_id.split("-")[0]
-                gemini_chats = Path.home() / ".gemini" / "tmp"
-                pattern = str(
-                    gemini_chats / "**" / "chats" / f"session-*-{session_prefix}*.json"
-                )
-                matches = glob.glob(pattern, recursive=True)
-                if matches:
-                    transcript_path = max(
-                        matches, key=lambda p: Path(p).stat().st_mtime
-                    )
-            except Exception:
-                pass
+            transcript_path = derive_gemini_transcript_path(session_id)
 
     if transcript_path:
         update_instance_position(instance_name, {"transcript_path": transcript_path})
@@ -112,9 +98,7 @@ def handle_sessionstart() -> None:
     try:
         hook_input = json.load(sys.stdin)
         real_session_id = hook_input.get("session_id") or hook_input.get("sessionId")
-        transcript_path = hook_input.get("transcript_path") or hook_input.get(
-            "session_path"
-        )
+        transcript_path = hook_input.get("transcript_path") or hook_input.get("session_path")
     except Exception:
         pass
 
@@ -142,9 +126,7 @@ def handle_sessionstart() -> None:
         # Orphaned PTY: process_id exists but no binding (e.g., after session clear)
         # Create fresh identity automatically
         if not instance_name and process_id:
-            instance_name = create_orphaned_pty_identity(
-                real_session_id, process_id, tool="gemini"
-            )
+            instance_name = create_orphaned_pty_identity(real_session_id, process_id, tool="gemini")
             log_info(
                 "hooks",
                 "gemini.sessionstart.orphan_created",
@@ -163,9 +145,7 @@ def handle_sessionstart() -> None:
         capture_and_store_launch_context(instance_name)
 
         if transcript_path:
-            update_instance_position(
-                instance_name, {"transcript_path": transcript_path}
-            )
+            update_instance_position(instance_name, {"transcript_path": transcript_path})
         set_status(instance_name, "listening", "start")
 
         from ...pty.pty_common import set_terminal_title
@@ -194,7 +174,6 @@ def handle_beforeagent() -> None:
 
     from ...core.messages import get_unread_messages, format_messages_json
     from ...core.instances import set_status, update_instance_position
-    from ...core.runtime import build_hcom_bootstrap_text
 
     from ...shared import MAX_MESSAGES_PER_DELIVERY
 
@@ -219,16 +198,15 @@ def handle_beforeagent() -> None:
             if process_id:
                 set_process_binding(process_id, session_id, instance_name)
 
-    try_capture_transcript_path(
-        instance_name, payload
-    )  # Pass payload to avoid double stdin read
+    try_capture_transcript_path(instance_name, payload)  # Pass payload to avoid double stdin read
 
     outputs: list[str] = []
 
-    if not instance.get("name_announced", False):
-        bootstrap = build_hcom_bootstrap_text(instance_name, tool="gemini")
+    # Inject bootstrap if not already announced
+    from ...hooks.utils import inject_bootstrap_once
+
+    if bootstrap := inject_bootstrap_once(instance_name, instance, tool="gemini"):
         outputs.append(bootstrap)
-        update_instance_position(instance_name, {"name_announced": True})
 
     # Deliver pending messages
     messages, max_id = get_unread_messages(instance_name, update_position=False)
@@ -279,19 +257,6 @@ def handle_afteragent() -> None:
     notify_instance(instance_name)
 
 
-def _extract_tool_detail(tool_name: str, tool_input: dict) -> str:
-    """Extract status detail from Gemini tool input."""
-    match tool_name:
-        case "run_shell_command":
-            return tool_input.get("command", "")
-        case "write_file" | "replace":
-            return tool_input.get("file_path", "")
-        case "delegate_to_agent":
-            return tool_input.get("prompt", "") or tool_input.get("task", "")
-        case _:
-            return ""
-
-
 def handle_beforetool() -> None:
     """Handle BeforeTool hook - fires before tool execution."""
     try:
@@ -311,7 +276,7 @@ def handle_beforetool() -> None:
         tool_name = payload.get("tool_name", payload.get("toolName", "unknown"))
         tool_input = payload.get("tool_input", {})
 
-    detail = _extract_tool_detail(tool_name, tool_input)
+    detail = extract_tool_detail("gemini", tool_name, tool_input)
     set_status(instance["name"], "active", f"tool:{tool_name}", detail=detail)
 
 
@@ -370,9 +335,7 @@ def _bind_vanilla_instance(payload: dict) -> str | None:
             updates["transcript_path"] = transcript_path
         if updates:
             update_instance_position(instance_name, updates)
-        log_info(
-            "hooks", "gemini.bind.success", instance=instance_name, session_id=session_id
-        )
+        log_info("hooks", "gemini.bind.success", instance=instance_name, session_id=session_id)
         return instance_name
     except Exception as e:
         log_error("hooks", "hook.error", e, hook="gemini-aftertool", op="bind_vanilla")
@@ -411,16 +374,16 @@ def handle_aftertool() -> None:
 
     from ...core.messages import get_unread_messages, format_messages_json
     from ...core.instances import set_status, update_instance_position
-    from ...core.runtime import build_hcom_bootstrap_text
     from ...shared import MAX_MESSAGES_PER_DELIVERY
 
     instance_name = instance["name"]
     outputs: list[str] = []
 
-    if not instance.get("name_announced", False):
-        bootstrap = build_hcom_bootstrap_text(instance_name, tool="gemini")
+    # Inject bootstrap if not already announced
+    from ...hooks.utils import inject_bootstrap_once
+
+    if bootstrap := inject_bootstrap_once(instance_name, instance, tool="gemini"):
         outputs.append(bootstrap)
-        update_instance_position(instance_name, {"name_announced": True})
 
     # Deliver pending messages (XML format)
     messages, max_id = get_unread_messages(instance_name, update_position=False)

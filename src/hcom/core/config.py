@@ -57,9 +57,7 @@ class HcomConfigError(ValueError):
     def __init__(self, errors: dict[str, str]):
         self.errors = errors
         if errors:
-            message = "Invalid config:\n" + "\n".join(
-                f"  - {msg}" for msg in errors.values()
-            )
+            message = "Invalid config:\n" + "\n".join(f"  - {msg}" for msg in errors.values())
         else:
             message = "Invalid config"
         super().__init__(message)
@@ -157,10 +155,7 @@ class HcomConfig:
         else:
             # 'print' mode shows script content without executing (for debugging)
             # 'here' mode forces running in current terminal (internal/debug)
-            if (
-                self.terminal not in ("default", "print", "here")
-                and self.terminal not in TERMINAL_PRESETS
-            ):
+            if self.terminal not in ("default", "print", "here") and self.terminal not in TERMINAL_PRESETS:
                 if "{script}" not in self.terminal:
                     set_error(
                         "terminal",
@@ -185,9 +180,7 @@ class HcomConfig:
                 # Test if it can be parsed as shell args
                 shlex.split(self.claude_args)
             except ValueError as e:
-                set_error(
-                    "claude_args", f"claude_args contains invalid shell quoting: {e}"
-                )
+                set_error("claude_args", f"claude_args contains invalid shell quoting: {e}")
 
         # Validate gemini_args (must be valid shell-quoted string)
         if not isinstance(self.gemini_args, str):
@@ -200,9 +193,7 @@ class HcomConfig:
                 # Test if it can be parsed as shell args
                 shlex.split(self.gemini_args)
             except ValueError as e:
-                set_error(
-                    "gemini_args", f"gemini_args contains invalid shell quoting: {e}"
-                )
+                set_error("gemini_args", f"gemini_args contains invalid shell quoting: {e}")
 
         # Validate codex_args (must be valid shell-quoted string)
         if not isinstance(self.codex_args, str):
@@ -215,9 +206,7 @@ class HcomConfig:
                 # Test if it can be parsed as shell args
                 shlex.split(self.codex_args)
             except ValueError as e:
-                set_error(
-                    "codex_args", f"codex_args contains invalid shell quoting: {e}"
-                )
+                set_error("codex_args", f"codex_args contains invalid shell quoting: {e}")
 
         # Validate codex_sandbox_mode (must be one of valid modes)
         valid_sandbox_modes = ("workspace", "untrusted", "danger-full-access", "none")
@@ -234,9 +223,7 @@ class HcomConfig:
 
         # Validate relay (optional string - URL)
         if not isinstance(self.relay, str):
-            set_error(
-                "relay", f"relay must be a string, got {type(self.relay).__name__}"
-            )
+            set_error("relay", f"relay must be a string, got {type(self.relay).__name__}")
 
         # Validate relay_token (optional string)
         if not isinstance(self.relay_token, str):
@@ -353,9 +340,7 @@ class HcomConfig:
 
         # Load relay string values
         relay = get_var("HCOM_RELAY")
-        if (
-            relay is not None
-        ):  # Allow empty string for relay (valid value - means disabled)
+        if relay is not None:  # Allow empty string for relay (valid value - means disabled)
             data["relay"] = relay
         relay_token = get_var("HCOM_RELAY_TOKEN")
         if relay_token is not None:  # Allow empty string for token (valid value)
@@ -474,14 +459,10 @@ def dict_to_hcom_config(data: dict[str, str]) -> HcomConfig:
             try:
                 kwargs["subagent_timeout"] = int(stripped)
             except ValueError:
-                errors["subagent_timeout"] = (
-                    f"subagent_timeout must be an integer, got '{subagent_raw}'"
-                )
+                errors["subagent_timeout"] = f"subagent_timeout must be an integer, got '{subagent_raw}'"
         else:
             # Explicit empty string is an error (can't be blank)
-            errors["subagent_timeout"] = (
-                "subagent_timeout cannot be empty (must be positive integer)"
-            )
+            errors["subagent_timeout"] = "subagent_timeout cannot be empty (must be positive integer)"
 
     terminal_val = data.get("HCOM_TERMINAL")
     if terminal_val is not None:
@@ -490,9 +471,7 @@ def dict_to_hcom_config(data: dict[str, str]) -> HcomConfig:
             kwargs["terminal"] = stripped
         else:
             # Explicit empty string is an error (can't be blank)
-            errors["terminal"] = (
-                "terminal cannot be empty (must be: default, preset name, or custom command)"
-            )
+            errors["terminal"] = "terminal cannot be empty (must be: default, preset name, or custom command)"
 
     # Optional fields - allow empty strings
     if "HCOM_HINTS" in data:
@@ -624,9 +603,7 @@ def save_config_snapshot(snapshot: ConfigSnapshot) -> None:
 
 def save_config(core: HcomConfig, extras: dict[str, str]) -> None:
     """Convenience helper for writing canonical config."""
-    snapshot = ConfigSnapshot(
-        core=core, extras=extras, values=hcom_config_to_dict(core)
-    )
+    snapshot = ConfigSnapshot(core=core, extras=extras, values=hcom_config_to_dict(core))
     save_config_snapshot(snapshot)
 
 
@@ -636,12 +613,7 @@ def save_config(core: HcomConfig, extras: dict[str, str]) -> None:
 def _write_default_config(config_path: Path) -> None:
     """Write default config file with documentation"""
     try:
-        content = (
-            "\n".join(DEFAULT_CONFIG_HEADER)
-            + "\n"
-            + "\n".join(DEFAULT_CONFIG_DEFAULTS)
-            + "\n"
-        )
+        content = "\n".join(DEFAULT_CONFIG_HEADER) + "\n" + "\n".join(DEFAULT_CONFIG_DEFAULTS) + "\n"
         atomic_write(config_path, content)
     except Exception:
         pass

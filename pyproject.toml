@@ -50,10 +50,11 @@ where = ["src"]
 version = {attr = "hcom.shared.__version__"}
 
 [tool.ruff]
-line-length = 120
+line-length = 180
 
 [tool.ruff.lint]
 select = ["E", "F", "W"]
+ignore = ["W291", "W293"]  # Trailing whitespace (bootstrap.py has intentional formatting)
 
 [tool.ruff.lint.per-file-ignores]
 # Intentional lazy imports for fast CLI startup

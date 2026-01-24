@@ -18,6 +18,7 @@ from ..core.paths import ensure_hcom_directories
 from ..core.db import init_db
 from ..core.instances import load_instance_position, set_status, get_instance_status
 from ..core.messages import (
+    MessageEnvelope,
     unescape_bash,
     send_message,
     get_unread_messages,
@@ -105,9 +106,7 @@ def get_recipient_feedback(delivered_to: list[str]) -> str:
     return f"Sent to: {', '.join(recipient_status)}"
 
 
-def cmd_send(
-    argv: list[str], quiet: bool = False, *, ctx: CommandContext | None = None
-) -> int:
+def cmd_send(argv: list[str], quiet: bool = False, *, ctx: CommandContext | None = None) -> int:
     """Send message to hcom: hcom send "message" [--name NAME] [--from NAME]"""
     if not ensure_hcom_directories():
         print(format_error("Failed to create HCOM directories"), file=sys.stderr)
@@ -153,16 +152,9 @@ def cmd_send(
                 actor = resolve_identity()
             except Exception:
                 actor = None
-        if (
-            actor
-            and actor.kind == "instance"
-            and actor.instance_data
-            and actor.instance_data.get("parent_name")
-        ):
+        if actor and actor.kind == "instance" and actor.instance_data and actor.instance_data.get("parent_name"):
             print(
-                format_error(
-                    "Subagents cannot use --from/-b (external sender spoofing)"
-                ),
+                format_error("Subagents cannot use --from/-b (external sender spoofing)"),
                 file=sys.stderr,
             )
             return 1
@@ -193,7 +185,7 @@ def cmd_send(
                     return 1
 
     # Extract envelope flags (optional structured messaging)
-    envelope = {}
+    envelope: MessageEnvelope = {}
 
     # --intent {request|inform|ack|error}
     try:
@@ -207,7 +199,8 @@ def cmd_send(
             except ValueError as e:
                 print(format_error(str(e)), file=sys.stderr)
                 return 1
-            envelope["intent"] = intent_val
+            # Cast is safe - validate_intent() ensures it's a valid MessageIntent
+            envelope["intent"] = intent_val  # type: ignore[typeddict-item]
     except CLIError:
         print(format_error("--intent requires a value (request|inform|ack|error)"), file=sys.stderr)
         return 1
@@ -237,43 +230,18 @@ def cmd_send(
         print(format_error("--thread requires a thread name"), file=sys.stderr)
         return 1
 
-    # Optional: bundle payload (JSON or file)
-    import json as json_mod
-    from pathlib import Path
+    # Parse inline bundle flags (--title, --description, etc.)
+    from ..core.bundles import parse_inline_bundle_flags, get_bundle_instance_name
 
     bundle_data = None
-
     try:
-        bundle_raw, argv = parse_flag_value(argv, "--bundle")
-        if bundle_raw:
-            try:
-                bundle_data = json_mod.loads(bundle_raw)
-            except json_mod.JSONDecodeError as e:
-                print(format_error(f"Invalid --bundle JSON: {e}"), file=sys.stderr)
-                return 1
-    except CLIError:
-        print(format_error("--bundle requires JSON value"), file=sys.stderr)
+        inline_bundle, argv = parse_inline_bundle_flags(argv)
+    except ValueError as e:
+        print(format_error(str(e)), file=sys.stderr)
         return 1
 
-    try:
-        bundle_file, argv = parse_flag_value(argv, "--bundle-file")
-        if bundle_file:
-            if bundle_data is not None:
-                print(format_error("--bundle and --bundle-file are mutually exclusive"), file=sys.stderr)
-                return 1
-            path = Path(bundle_file)
-            try:
-                raw = path.read_text(encoding="utf-8")
-                bundle_data = json_mod.loads(raw)
-            except OSError as e:
-                print(format_error(f"Failed to read --bundle-file: {e}"), file=sys.stderr)
-                return 1
-            except json_mod.JSONDecodeError as e:
-                print(format_error(f"Invalid --bundle-file JSON: {e}"), file=sys.stderr)
-                return 1
-    except CLIError:
-        print(format_error("--bundle-file requires a path"), file=sys.stderr)
-        return 1
+    if inline_bundle is not None:
+        bundle_data = inline_bundle
 
     # Validation: ack requires reply_to
     if envelope.get("intent") == "ack" and "reply_to" not in envelope:
@@ -362,11 +330,7 @@ def cmd_send(
         # Guard: Block sends from vanilla Claude before opt-in
         import os
 
-        if (
-            identity.kind == "instance"
-            and not identity.instance_data
-            and os.environ.get("CLAUDECODE") == "1"
-        ):
+        if identity.kind == "instance" and not identity.instance_data and os.environ.get("CLAUDECODE") == "1":
             print(format_error("Cannot send without identity."), file=sys.stderr)
             print("Run 'hcom start' first, then use 'hcom send'.", file=sys.stderr)
             return 1
@@ -399,16 +363,9 @@ def cmd_send(
                 for h in hints:
                     print(f"  - {h}", file=sys.stderr)
 
-            if identity.kind == "external":
-                bundle_instance = f"ext_{identity.name}"
-            elif identity.kind == "system":
-                bundle_instance = f"sys_{identity.name}"
-            else:
-                bundle_instance = identity.name
+            bundle_instance = get_bundle_instance_name(identity)
 
-            bundle_id = create_bundle_event(
-                bundle_data, instance=bundle_instance, created_by=identity.name
-            )
+            bundle_id = create_bundle_event(bundle_data, instance=bundle_instance, created_by=identity.name)
             envelope["bundle_id"] = bundle_id
             # Append bundle payload to message text
             refs = bundle_data.get("refs", {})
@@ -420,6 +377,20 @@ def cmd_send(
             def _join(vals):
                 return ", ".join(str(v) for v in vals) if vals else ""
 
+            def _format_transcript_refs(refs):
+                """Format transcript refs back to range:detail format for display."""
+                if not refs:
+                    return ""
+                formatted = []
+                for ref in refs:
+                    if isinstance(ref, dict):
+                        # Normalized dict format from validate_bundle
+                        formatted.append(f"{ref['range']}:{ref['detail']}")
+                    else:
+                        # Original string format (shouldn't happen after validation)
+                        formatted.append(str(ref))
+                return ", ".join(formatted)
+
             bundle_lines = [
                 f"[Bundle {bundle_id}]",
                 f"Title: {bundle_data.get('title', '')}",
@@ -427,10 +398,18 @@ def cmd_send(
                 "Refs:",
                 f"  events: {_join(events)}",
                 f"  files: {_join(files)}",
-                f"  transcript: {_join(transcript)}",
+                f"  transcript: {_format_transcript_refs(transcript)}",
             ]
             if extends:
                 bundle_lines.append(f"Extends: {extends}")
+
+            bundle_lines.extend(
+                [
+                    "",
+                    "View bundle:",
+                    f"  hcom bundle cat {bundle_id}",
+                ]
+            )
 
             message = message.rstrip() + "\n\n" + "\n".join(bundle_lines)
             # Re-validate after append to avoid oversized payloads
@@ -441,9 +420,7 @@ def cmd_send(
 
         # Send message and get delivered_to list
         try:
-            delivered_to = send_message(
-                identity, message, envelope if envelope else None
-            )
+            delivered_to = send_message(identity, message, envelope if envelope else None)
         except HcomError as e:
             print(f"Error: {e}", file=sys.stderr)
             return 1
@@ -484,15 +461,11 @@ def cmd_send(
                 max_msgs = MAX_MESSAGES_PER_DELIVERY
 
                 if main_msgs:
-                    formatted = format_hook_messages(
-                        main_msgs[:max_msgs], identity.name
-                    )
+                    formatted = format_hook_messages(main_msgs[:max_msgs], identity.name)
                     output_parts.append(f"\n{formatted}")
 
                 if subagent_msgs:
-                    formatted = format_hook_messages(
-                        subagent_msgs[:max_msgs], identity.name
-                    )
+                    formatted = format_hook_messages(subagent_msgs[:max_msgs], identity.name)
                     output_parts.append(f"\n[Subagent messages]\n{formatted}")
 
                 print("".join(output_parts))
@@ -561,23 +534,17 @@ def _listen_with_filter(
                         "event_id": recent["id"],
                         "type": recent["type"],
                         "instance": recent["instance"],
-                        "data": json_mod.loads(recent["data"])
-                        if recent["data"]
-                        else {},
+                        "data": json_mod.loads(recent["data"]) if recent["data"] else {},
                     }
                 )
             )
         else:
-            print(
-                f"[Match found] #{recent['id']} {recent['type']}:{recent['instance']}"
-            )
+            print(f"[Match found] #{recent['id']} {recent['type']}:{recent['instance']}")
         return 0
 
     # Create temp --once subscription
     now = time.time()
-    sub_id = (
-        f"listen-{sha256(f'{instance_name}{sql_filter}{now}'.encode()).hexdigest()[:6]}"
-    )
+    sub_id = f"listen-{sha256(f'{instance_name}{sql_filter}{now}'.encode()).hexdigest()[:6]}"
     sub_key = f"events_sub:{sub_id}"
 
     # Mark instance as listening BEFORE capturing last_id
@@ -638,11 +605,7 @@ def _listen_with_filter(
             if messages:
                 # Look for subscription notification from [hcom-events]
                 for msg in messages:
-                    if msg.get(
-                        "from"
-                    ) == "[hcom-events]" and f"[sub:{sub_id}]" in msg.get(
-                        "message", ""
-                    ):
+                    if msg.get("from") == "[hcom-events]" and f"[sub:{sub_id}]" in msg.get("message", ""):
                         # Match found - subscription auto-deleted by --once
                         if json_output:
                             # Parse event details from notification
@@ -659,12 +622,18 @@ def _listen_with_filter(
                         set_status(instance_name, "active", "filter matched")
                         return 0
 
-                # Other messages received - still waiting for filter match
-                # But show them if not json mode
-                if not json_output:
-                    formatted = format_hook_messages(messages, instance_name)
-                    print(f"\n{formatted}")
-                    print("[Still waiting for filter match...]", file=sys.stderr)
+                # Other messages received - exit to let agent process them
+                # Filter out system messages (subscription notifications we didn't match)
+                real_messages = [m for m in messages if not m.get("from", "").startswith("[")]
+                if real_messages:
+                    if json_output:
+                        for msg in real_messages:
+                            print(json_mod.dumps({"from": msg["from"], "text": msg["message"]}))
+                    else:
+                        formatted = format_hook_messages(real_messages, instance_name)
+                        print(f"\n{formatted}")
+                    set_status(instance_name, "active", "message received")
+                    return 0
 
             # Update heartbeat
             _update_heartbeat(instance_name)
@@ -748,9 +717,7 @@ def cmd_listen(argv: list[str], *, ctx: CommandContext | None = None) -> int:
             identity = resolve_identity()
             instance_name = identity.name
         except Exception:
-            print(
-                format_error("--name required (no identity context)"), file=sys.stderr
-            )
+            print(format_error("--name required (no identity context)"), file=sys.stderr)
             print("Usage: hcom listen --name <name> [--timeout N]", file=sys.stderr)
             return 1
 
@@ -786,15 +753,18 @@ def cmd_listen(argv: list[str], *, ctx: CommandContext | None = None) -> int:
 
     # PHASE 1: Expand filter shortcuts (--idle, --blocked)
     from ..core.filters import expand_shortcuts
+
     argv = expand_shortcuts(argv)
 
     # PHASE 2: Parse composable filter flags
     from ..core.filters import parse_event_flags, build_sql_from_flags
+
     filters, argv = parse_event_flags(argv)
 
     # PHASE 3: Validate type constraints
     if filters:
         from ..core.filters import validate_type_constraints
+
         try:
             validate_type_constraints(filters)
         except ValueError as e:
@@ -836,9 +806,7 @@ def cmd_listen(argv: list[str], *, ctx: CommandContext | None = None) -> int:
 
     # Branch: SQL filter mode vs message-wait mode
     if combined_sql:
-        return _listen_with_filter(
-            combined_sql, instance_name, timeout, json_output, instance_data
-        )
+        return _listen_with_filter(combined_sql, instance_name, timeout, json_output, instance_data)
 
     # Standard message-wait mode below
     # Mark instance as listening when entering listen loop
@@ -923,9 +891,7 @@ def cmd_listen(argv: list[str], *, ctx: CommandContext | None = None) -> int:
                             json.dumps(
                                 {
                                     "from": msg["from"],
-                                    "text": msg[
-                                        "message"
-                                    ],  # get_unread_messages() uses 'message' key
+                                    "text": msg["message"],  # get_unread_messages() uses 'message' key
                                 }
                             )
                         )

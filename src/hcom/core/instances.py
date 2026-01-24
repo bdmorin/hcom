@@ -191,7 +191,7 @@ InstanceDataT = TypeVar("InstanceDataT", bound=dict[str, Any])
 
 # Configuration
 SKIP_HISTORY = True  # New instances start at current log position (skip old messages)
-UNKNOWN_HEARTBEAT_AGE = 999999  # Sentinel value for unknown heartbeat age (no last_stop or status_time)
+# UNKNOWN_HEARTBEAT_AGE imported from core.timeouts
 
 
 def parse_running_tasks(json_str: str | None) -> RunningTasks:
@@ -272,9 +272,7 @@ def load_instance_position(instance_name: str) -> InstanceData | dict[str, Any]:
     return data if data else {}
 
 
-def update_instance_position(
-    instance_name: str, update_fields: InstanceData | dict[str, Any]
-) -> None:
+def update_instance_position(instance_name: str, update_fields: InstanceData | dict[str, Any]) -> None:
     """Update instance position atomically (DB wrapper).
 
     If instance doesn't exist, UPDATE silently affects 0 rows.
@@ -303,9 +301,7 @@ def update_instance_position(
 
         update_instance(instance_name, update_copy)
     except Exception as e:
-        log_error(
-            "core", "db.error", e, op="update_instance_position", instance=instance_name
-        )
+        log_error("core", "db.error", e, op="update_instance_position", instance=instance_name)
         pass  # Silent to user, logged for debugging
 
 
@@ -442,10 +438,7 @@ def cleanup_stale_instances(
 
         # Exit contexts: 1min cleanup (definitively dead - killed, closed, timeout, etc)
         # These have explicit exit status set but cleanup failed (e.g., I/O error on terminal close)
-        if (
-            context in ("killed", "closed", "timeout", "interrupted", "session_switch")
-            and age_seconds > 60
-        ):
+        if context in ("killed", "closed", "timeout", "interrupted", "session_switch") and age_seconds > 60:
             stop_instance(name, initiated_by="system", reason="exit_cleanup")
             deleted += 1
             # Clean up one per cycle to avoid DB locks
@@ -540,9 +533,7 @@ def get_instance_status(pos_data: InstanceData | dict[str, Any]) -> InstanceStat
             pass  # Trust synced status for remote instances
         else:
             heartbeat_age = (
-                now - last_stop
-                if last_stop
-                else (now - status_time if status_time else UNKNOWN_HEARTBEAT_AGE)
+                now - last_stop if last_stop else (now - status_time if status_time else UNKNOWN_HEARTBEAT_AGE)
             )
             tcp_mode = pos_data.get("tcp_mode", False)
             # Remote instances use 40s threshold (sync interval).
@@ -674,9 +665,7 @@ def get_status_description(status: str, context: str = "") -> str:
     return "unknown"
 
 
-def get_status_icon(
-    pos_data: InstanceData | dict[str, Any], status: StatusType | str | None = None
-) -> str:
+def get_status_icon(pos_data: InstanceData | dict[str, Any], status: StatusType | str | None = None) -> str:
     """Get status icon for instance, considering tool type.
 
     Adhoc instances use neutral icon (◦) when inactive,
@@ -692,9 +681,7 @@ def get_status_icon(
     from ..shared import STATUS_ICONS, ADHOC_ICON
 
     # Resolve status from pos_data if not provided
-    resolved_status: str = status if status is not None else (
-        pos_data.get("status") or "inactive"
-    )
+    resolved_status: str = status if status is not None else (pos_data.get("status") or "inactive")
     tool = pos_data.get("tool", "claude")
 
     # Launching: flash between ◎ and ○ (2Hz)
@@ -834,9 +821,7 @@ def set_status(
                                     (batch_id,),
                                 ).fetchall()
 
-                                instances_list = ", ".join(
-                                    row["instance"] for row in ready_instances
-                                )
+                                instances_list = ", ".join(row["instance"] for row in ready_instances)
 
                                 send_system_message(
                                     "[hcom-launcher]",
@@ -1472,9 +1457,7 @@ def bind_session_to_process(
             migrate_notify_endpoints(placeholder_name, canonical)
 
             # Check if placeholder is a true placeholder (no session_id) or a real instance
-            is_true_placeholder = placeholder_data and not placeholder_data.get(
-                "session_id"
-            )
+            is_true_placeholder = placeholder_data and not placeholder_data.get("session_id")
             log_info(
                 "binding",
                 "bind_session_to_process.placeholder_handling",
@@ -1483,9 +1466,7 @@ def bind_session_to_process(
                 action="merge_and_delete" if is_true_placeholder else "mark_inactive",
             )
 
-            if (
-                is_true_placeholder and placeholder_data
-            ):  # placeholder_data checked for mypy
+            if is_true_placeholder and placeholder_data:  # placeholder_data checked for mypy
                 # Merge launcher-set fields from placeholder to canonical
                 if placeholder_data.get("tag"):
                     resume_updates["tag"] = placeholder_data["tag"]
@@ -1615,11 +1596,7 @@ def initialize_instance_in_position_file(
             # 2. AND session_id is not set (true placeholder, not a resumed instance)
             # This prevents accidentally skipping messages for resumed instances
             is_true_placeholder = not existing.get("session_id")
-            if (
-                SKIP_HISTORY
-                and existing.get("last_event_id", 0) == 0
-                and is_true_placeholder
-            ):
+            if SKIP_HISTORY and existing.get("last_event_id", 0) == 0 and is_true_placeholder:
                 current_max = get_last_event_id()
                 # Validate launch event ID isn't stale (higher than max = DB was reset)
                 launch_event_id_str = os.environ.get("HCOM_LAUNCH_EVENT_ID")
@@ -1792,9 +1769,7 @@ def wait_for_process_registration(
                     return instance_name, instance
                 last_status = "waiting_session_id"
                 if log_fn and i % 5 == 0:  # Log every 5 seconds
-                    log_fn(
-                        f"Instance {instance_name} pre-registered, waiting for session_id..."
-                    )
+                    log_fn(f"Instance {instance_name} pre-registered, waiting for session_id...")
             else:
                 last_status = "instance_not_found"
         else:

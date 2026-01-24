@@ -249,11 +249,7 @@ def setup_codex_hooks(include_permissions: bool = True) -> bool:
             if section_match:
                 # Insert before first section
                 pos = section_match.start()
-                content = (
-                    content[:pos]
-                    + f"# hcom integration\n{notify_line}\n\n"
-                    + content[pos:]
-                )
+                content = content[:pos] + f"# hcom integration\n{notify_line}\n\n" + content[pos:]
             else:
                 # No sections, append at end
                 content = content.rstrip() + f"\n\n# hcom integration\n{notify_line}\n"
@@ -261,9 +257,7 @@ def setup_codex_hooks(include_permissions: bool = True) -> bool:
         else:
             # Create new config
             config_path.parent.mkdir(parents=True, exist_ok=True)
-            atomic_write(
-                config_path, f"# Codex config\n\n# hcom integration\n{notify_line}\n"
-            )
+            atomic_write(config_path, f"# Codex config\n\n# hcom integration\n{notify_line}\n")
 
         # Handle execpolicy based on include_permissions flag
         if include_permissions:
@@ -322,9 +316,7 @@ def verify_codex_hooks_installed(check_permissions: bool = True) -> bool:
 
     Returns True if all checks pass.
     """
-    return _verify_codex_hooks_at(
-        get_codex_config_path(), check_permissions=check_permissions
-    )
+    return _verify_codex_hooks_at(get_codex_config_path(), check_permissions=check_permissions)
 
 
 def _remove_codex_hooks_from_path(config_path: Path) -> bool:

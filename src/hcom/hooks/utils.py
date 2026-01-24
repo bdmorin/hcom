@@ -148,6 +148,57 @@ def _try_bind_from_transcript(session_id: str, transcript_path: str) -> str | No
     return instance_name
 
 
+def inject_bootstrap_once(
+    instance_name: str,
+    instance_data: dict[str, Any],
+    tool: str = "claude",
+) -> str | None:
+    """Inject bootstrap text if not already announced.
+
+    Bootstrap text introduces the agent to hcom commands and capabilities.
+    This function is idempotent - it checks the name_announced flag and only
+    injects once per instance lifecycle.
+
+    Args:
+        instance_name: Instance identifier (e.g., "alice", "bob_general_1")
+        instance_data: Instance position data containing name_announced flag.
+                      Typically from load_instance_position(instance_name).
+        tool: Tool type for bootstrap customization. One of: "claude", "gemini", "codex".
+             Defaults to "claude".
+
+    Returns:
+        Bootstrap text string if injection is needed, None if already announced.
+
+    Side Effects:
+        Sets name_announced=True in instance position file if injection occurs.
+        This prevents duplicate bootstrap injection on subsequent hook calls.
+
+    Example:
+        >>> instance = load_instance_position("alice")
+        >>> if bootstrap := inject_bootstrap_once("alice", instance, tool="claude"):
+        ...     print(bootstrap)  # First call returns bootstrap text
+        >>> if bootstrap := inject_bootstrap_once("alice", instance, tool="claude"):
+        ...     print("unreachable")  # Second call returns None (already announced)
+
+    Design Notes:
+        - Consolidates bootstrap injection logic from 5 locations across parent.py
+          and gemini/hooks.py into a single helper.
+        - name_announced flag is instance-scoped, not session-scoped. It persists
+          across session rebinds but resets on instance restart.
+        - Codex doesn't currently use hook-based bootstrap (PTY-only), so this
+          helper is mainly for Claude and Gemini hooks.
+    """
+    from ..core.instances import update_instance_position
+
+    if instance_data.get("name_announced", False):
+        return None
+
+    bootstrap = build_hcom_bootstrap_text(instance_name, tool=tool)
+    update_instance_position(instance_name, {"name_announced": True})
+
+    return bootstrap
+
+
 def init_hook_context(
     hook_data: dict[str, Any], hook_type: str | None = None
 ) -> tuple[str | None, dict[str, Any], bool]:
@@ -198,8 +249,6 @@ def init_hook_context(
         updates["background"] = True
         updates["background_log_file"] = str(hcom_path(LOGS_DIR, bg_env))
 
-    is_matched_resume = bool(
-        instance_data and instance_data.get("session_id") == session_id
-    )
+    is_matched_resume = bool(instance_data and instance_data.get("session_id") == session_id)
 
     return instance_name, updates, is_matched_resume

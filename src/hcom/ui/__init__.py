@@ -97,9 +97,7 @@ def _get_config_defaults() -> dict[str, str]:
                 key, value = line.split("=", 1)
                 value = value.strip()
                 # Remove only outer layer of quotes
-                if (value.startswith('"') and value.endswith('"')) or (
-                    value.startswith("'") and value.endswith("'")
-                ):
+                if (value.startswith('"') and value.endswith('"')) or (value.startswith("'") and value.endswith("'")):
                     value = value[1:-1]
                 _CONFIG_DEFAULTS_CACHE[key.strip()] = value
     return _CONFIG_DEFAULTS_CACHE

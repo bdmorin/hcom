@@ -227,12 +227,8 @@ Use: hcom send "@judge- @pro- [your argument]" --thread {thread} --intent inform
     print(f"CON debater launched ({args.tool}, batch: {con_result['batch_id']})")
 
     # Extract actual instance names for SQL queries
-    pro_name = (
-        pro_result["handles"][0]["instance_name"] if pro_result.get("handles") else None
-    )
-    con_name = (
-        con_result["handles"][0]["instance_name"] if con_result.get("handles") else None
-    )
+    pro_name = pro_result["handles"][0]["instance_name"] if pro_result.get("handles") else None
+    con_name = con_result["handles"][0]["instance_name"] if con_result.get("handles") else None
 
     # Launch judge with actual debater names
     launch_judge(
@@ -337,7 +333,8 @@ Address all debaters together: {debaters_list}"""
         opening_instruction = f"""
 2. OPENING STATEMENTS
    Ask all debaters to state their position and opening argument:
-   hcom send "{debaters_list} State whether you are FOR or AGAINST: {args.topic}. Then give your opening argument (2-3 paragraphs). You can see each other's responses." --thread {thread} --intent request
+   hcom send "{debaters_list} State whether you are FOR or AGAINST: {args.topic}. \
+Then give your opening argument (2-3 paragraphs). You can see each other's responses." --thread {thread} --intent request
 
    Wait for all {len(all_workers)} responses:
    hcom events --wait {args.timeout} --sql "msg_thread='{thread}' AND msg_from IN ({workers_sql})"

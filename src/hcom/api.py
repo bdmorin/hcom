@@ -129,18 +129,18 @@ class Session:
         """
         from .core.ops import op_send
         from .core.helpers import validate_intent
-        from .core.messages import resolve_reply_to, get_thread_from_event
+        from .core.messages import resolve_reply_to, get_thread_from_event, MessageEnvelope
 
         if to and not message.lstrip().startswith(f"@{to}"):
             message = f"@{to} {message}"
 
-        envelope = {}
+        envelope: MessageEnvelope = {}
         if intent:
             try:
                 validate_intent(intent)
             except ValueError as e:
                 raise HcomError(str(e))
-            envelope["intent"] = intent
+            envelope["intent"] = intent  # type: ignore[typeddict-item]
 
         if reply_to:
             local_id, error = resolve_reply_to(reply_to)
@@ -790,7 +790,8 @@ def launch(
                 "\n".join(
                     [
                         *spec.errors,
-                        f"Tip: set {HCOM_SKIP_TOOL_ARGS_VALIDATION_ENV}=1 to bypass hcom validation and let claude handle args.",
+                        f"Tip: set {HCOM_SKIP_TOOL_ARGS_VALIDATION_ENV}=1 to bypass hcom "
+                        f"validation and let claude handle args.",
                     ]
                 )
             )

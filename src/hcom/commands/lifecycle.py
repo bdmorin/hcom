@@ -87,21 +87,29 @@ def _print_launch_preview(tool: str, count: int, background: bool, args: list[st
 
     # Tool-specific CLI help
     if tool == "claude":
-        cli_help = "-p (headless) | --model opus|sonnet|haiku | --agent <name-from-./claude/agents/> |\n--system-prompt | --resume <id> | --dangerously-skip-permissions"
+        cli_help = (
+            "positional | -p 'prompt' (headless) | --model opus|sonnet|haiku | --agent <name-from-./claude/agents/> | "
+            "--system-prompt | --resume <id> | --dangerously-skip-permissions"
+        )
         mode_note = (
-            "-p allows hcom + readonly permissions by default, to add: --tools Bash,Write,Edit,etc"
+            "\n  -p allows hcom + readonly permissions by default, to add: --tools Bash,Write,Edit,etc"
             if background
             else ""
         )
     elif tool == "gemini":
-        cli_help = "-i 'prompt' | --model | --yolo | --resume <id> | (system prompt via env var)"
+        cli_help = (
+            "-i 'prompt' (required for initial prompt) | --model | --yolo | --resume | (system prompt via env var)"
+        )
         mode_note = (
             "\n  Note: Gemini headless not supported in hcom, use claude headless or gemini interactive"
             if background
             else ""
         )
     elif tool == "codex":
-        cli_help = " 'prompt' | --model | --sandbox danger-full-access | resume <id> | (system prompt via env var) | -i 'image'"
+        cli_help = (
+            "'prompt' (positional) | --model | --sandbox (read-only|workspace-write|danger-full-access) "
+            "| resume (subcommand) | -i 'image' | (system prompt via env var)"
+        )
         mode_note = (
             "\n  Note: Codex headless not supported in hcom, use claude headless or codex interactive"
             if background
@@ -261,7 +269,9 @@ def cmd_launch(
         background = spec.is_background
 
         # Launch confirmation gate: inside AI tools, require HCOM_GO=1
-        if is_inside_ai_tool() and os.environ.get("HCOM_GO") != "1":
+        # Show preview if: has args OR count > 5
+        has_args = forwarded and len(forwarded) > 0
+        if is_inside_ai_tool() and os.environ.get("HCOM_GO") != "1" and (has_args or count > 5):
             _print_launch_preview("claude", count, background, forwarded)
             return 0
         claude_args = spec.rebuild_tokens()
@@ -306,7 +316,9 @@ def cmd_launch(
 
         # Show results
         if failed > 0:
-            print(f"Started the launch process for {launched}/{count} Claude agent{'s' if count != 1 else ''} ({failed} failed)")
+            print(
+                f"Started the launch process for {launched}/{count} Claude agent{'s' if count != 1 else ''} ({failed} failed)"
+            )
         else:
             print(f"Started the launch process for {launched} Claude agent{'s' if launched != 1 else ''}")
 
@@ -595,7 +607,7 @@ def cmd_stop(argv: list[str], *, ctx: CommandContext | None = None) -> int:
             if not position:
                 not_found.append(t)
             else:
-                instances_to_stop.append(position)
+                instances_to_stop.append(position)  # type: ignore[arg-type]
 
         if not_found:
             raise CLIError(f"Instance{'s' if len(not_found) > 1 else ''} not found: {', '.join(not_found)}")
@@ -1209,7 +1221,7 @@ def cmd_start(argv: list[str], *, ctx: CommandContext | None = None) -> int:
 
         # Extract numeric suffixes and find max
         max_n = 0
-        suffix_pattern = re.compile(rf"^{re.escape(parent_name)}_{re.escape(agent_type)}_(\d+)$")
+        suffix_pattern = re.compile(rf"^{re.escape(parent_name or '')}_{re.escape(agent_type or '')}_(\d+)$")  # type: ignore[type-var]
         for row in rows:
             match = suffix_pattern.match(row["name"])
             if match:
@@ -1224,11 +1236,13 @@ def cmd_start(argv: list[str], *, ctx: CommandContext | None = None) -> int:
         from ..core.db import get_last_event_id
 
         initial_event_id = get_last_event_id() if SKIP_HISTORY else 0
-        parent_tag = parent_data.get("tag") or None
+        parent_tag = parent_data.get("tag") if parent_data else None
 
         try:
             conn.execute(
-                """INSERT INTO instances (name, session_id, parent_session_id, parent_name, tag, agent_id, created_at, last_event_id, directory, last_stop, status)
+                """INSERT INTO instances
+                   (name, session_id, parent_session_id, parent_name, tag, agent_id,
+                    created_at, last_event_id, directory, last_stop, status)
                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     subagent_name,
@@ -1250,7 +1264,9 @@ def cmd_start(argv: list[str], *, ctx: CommandContext | None = None) -> int:
             subagent_name = f"{parent_name}_{agent_type}_{max_n + 2}"
             try:
                 conn.execute(
-                    """INSERT INTO instances (name, session_id, parent_session_id, parent_name, tag, agent_id, created_at, last_event_id, directory, last_stop, status)
+                    """INSERT INTO instances
+                       (name, session_id, parent_session_id, parent_name, tag, agent_id,
+                        created_at, last_event_id, directory, last_stop, status)
                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                     (
                         subagent_name,
@@ -1294,7 +1310,7 @@ def cmd_start(argv: list[str], *, ctx: CommandContext | None = None) -> int:
         # Print subagent bootstrap
         from ..core.bootstrap import get_subagent_bootstrap
 
-        result = get_subagent_bootstrap(subagent_name, parent_name, agent_id)
+        result = get_subagent_bootstrap(subagent_name, parent_name or "", agent_id)
         if result:
             print(result)
         return 0
@@ -1526,7 +1542,9 @@ def cmd_launch_gemini(
         )
 
     # Launch confirmation gate: inside AI tools, require HCOM_GO=1
-    if is_inside_ai_tool() and os.environ.get("HCOM_GO") != "1":
+    # Show preview if: has args OR count > 5
+    has_args = argv and len(argv) > 0
+    if is_inside_ai_tool() and os.environ.get("HCOM_GO") != "1" and (has_args or count > 5):
         _print_launch_preview("gemini", count, False, argv)  # Gemini always interactive
         return 0
 
@@ -1696,20 +1714,18 @@ def cmd_launch_codex(
     resume_thread_id = None
 
     # Launch confirmation gate: inside AI tools, require HCOM_GO=1
-    if is_inside_ai_tool() and os.environ.get("HCOM_GO") != "1":
+    # Show preview if: has args OR count > 5
+    has_args = argv and len(argv) > 0
+    if is_inside_ai_tool() and os.environ.get("HCOM_GO") != "1" and (has_args or count > 5):
         _print_launch_preview("codex", count, False, argv)  # Codex always interactive
         return 0
 
     # Handle resume/fork subcommand
     if spec.subcommand in ("resume", "fork"):
         if not spec.positional_tokens:
-            raise CLIError(
-                f"'codex {spec.subcommand}' requires explicit thread-id (interactive picker not supported)"
-            )
+            raise CLIError(f"'codex {spec.subcommand}' requires explicit thread-id (interactive picker not supported)")
         if spec.has_flag(["--last"]):
-            raise CLIError(
-                f"'codex {spec.subcommand} --last' not supported - use explicit thread-id"
-            )
+            raise CLIError(f"'codex {spec.subcommand} --last' not supported - use explicit thread-id")
         if spec.subcommand == "resume":
             resume_thread_id = spec.positional_tokens[0]
 
@@ -1826,7 +1842,7 @@ def _do_resume(name: str, prompt: str | None = None, *, run_here: bool | None = 
         raise CLIError(f"'{name}' has no session_id (cannot resume)")
 
     tool = instance_data.get("tool", "claude")
-    is_headless = instance_data.get("background", False)
+    is_headless = bool(instance_data.get("background", False))
     original_dir = instance_data.get("directory") or os.getcwd()
 
     # Default prompt instructs instance to reclaim identity

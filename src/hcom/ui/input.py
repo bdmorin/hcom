@@ -355,9 +355,7 @@ def text_input_move_right(buffer: str, cursor: int) -> int:
     return min(len(buffer), cursor + 1)
 
 
-def calculate_text_input_rows(
-    text: str, width: int, max_rows: int = MAX_INPUT_ROWS
-) -> int:
+def calculate_text_input_rows(text: str, width: int, max_rows: int = MAX_INPUT_ROWS) -> int:
     """Calculate rows needed to display wrapped text with literal newlines.
 
     Used for dynamic input area sizing.
@@ -456,9 +454,7 @@ def render_text_input(
         if not line:
             # Empty line (from consecutive newlines or trailing newline)
             line_prefix = prefix if line_idx == 0 else " " * len(prefix)
-            wrapped.append(
-                f"{prefix_color if line_idx == 0 else text_color}{line_prefix}{RESET}"
-            )
+            wrapped.append(f"{prefix_color if line_idx == 0 else text_color}{line_prefix}{RESET}")
         else:
             # Wrap long lines by visual width (handles wide chars and ANSI codes)
             char_offset = 0
@@ -470,9 +466,7 @@ def render_text_input(
                 is_prefix_line = line_idx == 0 and is_first_chunk
                 line_prefix = prefix if is_prefix_line else " " * len(prefix)
                 pcolor = prefix_color if is_prefix_line else text_color
-                wrapped.append(
-                    f"{pcolor}{line_prefix}{RESET}{text_color}{chunk}{RESET}"
-                )
+                wrapped.append(f"{pcolor}{line_prefix}{RESET}{text_color}{chunk}{RESET}")
                 char_offset += consumed
                 is_first_chunk = False
 

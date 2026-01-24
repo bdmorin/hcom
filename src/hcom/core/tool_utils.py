@@ -87,16 +87,10 @@ def build_codex_rules() -> list[str]:
 
     # Tool help commands (hcom claude/gemini/codex --help/-h)
     for tool in HCOM_TOOL_NAMES:
-        rules.append(
-            f'prefix_rule(pattern=["hcom", "{tool}", "--help"], decision="allow")'
-        )
+        rules.append(f'prefix_rule(pattern=["hcom", "{tool}", "--help"], decision="allow")')
         rules.append(f'prefix_rule(pattern=["hcom", "{tool}", "-h"], decision="allow")')
-        rules.append(
-            f'prefix_rule(pattern=["uvx", "hcom", "{tool}", "--help"], decision="allow")'
-        )
-        rules.append(
-            f'prefix_rule(pattern=["uvx", "hcom", "{tool}", "-h"], decision="allow")'
-        )
+        rules.append(f'prefix_rule(pattern=["uvx", "hcom", "{tool}", "--help"], decision="allow")')
+        rules.append(f'prefix_rule(pattern=["uvx", "hcom", "{tool}", "-h"], decision="allow")')
 
     return rules
 
@@ -135,14 +129,17 @@ def _detect_hcom_command_type() -> str:
     """Detect how to invoke hcom based on execution context
 
     Priority:
-    1. uvx - If running in uv-managed Python and uvx available
+    1. dev - If HCOM_DEV_ROOT set (isolated worktree dev mode)
+    2. uvx - If running in uv-managed Python and uvx available
            (works for both temporary uvx runs and permanent uv tool install)
-    2. short - If hcom binary in PATH
-    3. full - Fallback to full python invocation
+    3. short - If hcom binary in PATH
+    4. full - Fallback to full python invocation
     """
     import shutil
 
-    if "uv" in Path(sys.executable).resolve().parts and shutil.which("uvx"):
+    if os.environ.get("HCOM_DEV_ROOT"):
+        return "dev"
+    elif "uv" in Path(sys.executable).resolve().parts and shutil.which("uvx"):
         return "uvx"
     elif shutil.which("hcom"):
         return "short"
@@ -190,10 +187,17 @@ def build_hcom_command() -> str:
 
     Returns just the command (e.g., 'hcom', 'uvx hcom').
     HCOM_DIR is inherited from environment - no need to bake into command.
+
+    Dev mode (HCOM_DEV_ROOT): Returns 'python /path/to/src/hcom/cli.py' for
+    isolated worktree testing. Hooks and bootstrap both use local source.
     """
     cmd_type = _detect_hcom_command_type()
 
-    if cmd_type == "short":
+    if cmd_type == "dev":
+        # Dev mode: just return "hcom" - the re-exec in __main__.py
+        # will route to correct worktree based on HCOM_DEV_ROOT
+        return "hcom"
+    elif cmd_type == "short":
         return "hcom"
     elif cmd_type == "uvx":
         return "uvx hcom"
@@ -244,9 +248,7 @@ def build_claude_command(claude_args: list[str] | None = None) -> str:
     return " ".join(cmd_parts)
 
 
-def stop_instance(
-    instance_name: str, initiated_by: str = "unknown", reason: str = ""
-) -> None:
+def stop_instance(instance_name: str, initiated_by: str = "unknown", reason: str = "") -> None:
     """Stop instance: kill if headless, notify if PTY/hooks, log snapshot, delete.
 
     Args:
@@ -324,9 +326,7 @@ def stop_instance(
 
         escaped_name = instance_name.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
         conn = get_db()
-        conn.execute(
-            "DELETE FROM kv WHERE key LIKE ? ESCAPE '\\'", (f"events_sub:%\\_{escaped_name}",)
-        )
+        conn.execute("DELETE FROM kv WHERE key LIKE ? ESCAPE '\\'", (f"events_sub:%\\_{escaped_name}",))
     except Exception:
         pass
 
@@ -350,9 +350,7 @@ def stop_instance(
         log_error("core", "db.error", e, op="stop_instance")
 
 
-def create_orphaned_pty_identity(
-    session_id: str, process_id: str, tool: str = "claude"
-) -> str | None:
+def create_orphaned_pty_identity(session_id: str, process_id: str, tool: str = "claude") -> str | None:
     """Create fresh identity for orphaned hcom-launched PTY (after /clear or similar).
 
     When an hcom-launched instance runs /clear:
@@ -438,16 +436,12 @@ def _cleanup_session_bindings(session_id: str | None, initiated_by: str) -> None
     conn = get_db()
 
     # Delete all process bindings for this session
-    proc_rows = conn.execute(
-        "SELECT process_id FROM process_bindings WHERE session_id = ?", (session_id,)
-    ).fetchall()
+    proc_rows = conn.execute("SELECT process_id FROM process_bindings WHERE session_id = ?", (session_id,)).fetchall()
     for proc_row in proc_rows:
         delete_process_binding(proc_row["process_id"])
 
     # Stop subagents that have this instance as parent
-    subagents = conn.execute(
-        "SELECT name FROM instances WHERE parent_session_id = ?", (session_id,)
-    ).fetchall()
+    subagents = conn.execute("SELECT name FROM instances WHERE parent_session_id = ?", (session_id,)).fetchall()
     for sub in subagents:
         stop_instance(sub["name"], initiated_by=initiated_by, reason="parent_stopped")
 

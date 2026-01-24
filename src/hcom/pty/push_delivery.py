@@ -107,7 +107,7 @@ class DeliveryGate:
 
     require_idle: bool = False
     require_ready_prompt: bool = True
-    require_prompt_empty: bool = False  # Claude enables this
+    require_prompt_empty: bool = False  # Disabled for Claude (can't detect AI suggestions)
     require_output_stable_seconds: float = OUTPUT_STABLE_SECONDS
     block_on_user_activity: bool = True
     block_on_approval: bool = True
@@ -205,6 +205,7 @@ class PTYToolConfig:
     start_pending: bool = True
     use_termux_bypass: bool = False
     extra_env: dict[str, str] | None = None
+    user_activity_cooldown: float = 0.5  # Seconds after keystroke before safe to inject
 
 
 def _get_instance_status_context(instance_name: str) -> tuple[str | None, str | None]:
@@ -464,7 +465,7 @@ def run_notify_delivery_loop(
             if use_default_delivered:
                 status, context = _get_instance_status_context(instance_name)
                 _clear_gate_block_status(instance_name, status, context)
-            elif resolved_on_delivered:
+            elif resolved_on_delivered is not None:
                 resolved_on_delivered(instance_name)
         state = "pending" if has_pending() else "idle"
         if state == "idle":
@@ -724,7 +725,7 @@ def run_notify_delivery_loop(
                             current_status,
                             current_context,
                         )
-                    elif resolved_on_gate_blocked:
+                    elif resolved_on_gate_blocked is not None:
                         block_since = resolved_on_gate_blocked(instance_name, result.reason, block_since)
                     # Stability-based recovery: if status stuck "active" but output stable 10s,
                     # assume ESC cancelled or similar - flip to listening

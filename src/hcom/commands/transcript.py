@@ -326,12 +326,6 @@ def _cmd_transcript_timeline(argv: list[str]) -> int:
     return 0
 
 
-
-
-
-
-
-
 def _cmd_transcript_search(argv: list[str]) -> int:
     """Search transcripts: hcom transcript search "pattern" [--live] [--all] [--limit N] [--json] [--agent TYPE]
 
@@ -392,9 +386,7 @@ def _cmd_transcript_search(argv: list[str]) -> int:
         return 1
 
     # Use core search function
-    result = search_transcripts(
-        pattern, limit=limit, agent_filter=agent_filter, scope=scope
-    )
+    result = search_transcripts(pattern, limit=limit, agent_filter=agent_filter, scope=scope)
 
     if result.get("error"):
         print(f"Search error: {result['error']}", file=sys.stderr)
@@ -437,6 +429,3 @@ def _cmd_transcript_search(argv: list[str]) -> int:
                 print(f"    {snippet}\n")
 
     return 0
-
-
-

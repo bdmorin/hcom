@@ -385,6 +385,23 @@ def cmd_list(argv: list[str], *, ctx: CommandContext | None = None) -> int:
         print(format_error(error), file=sys.stderr)
         return 1
 
+    # --stopped shortcut: delegate to events command (always JSON output)
+    if "--stopped" in argv:
+        from .events import cmd_events
+
+        remaining = [a for a in argv if a not in ("--stopped", "--all") and not a.startswith("-")]
+        show_all = "--all" in argv
+        if remaining:
+            # hcom list --stopped NAME → events for specific instance
+            instance_name = remaining[0]
+            return cmd_events(
+                ["--sql", f"life_action='stopped' AND instance='{instance_name}'", "--last", "10000"], ctx=ctx
+            )
+        else:
+            # hcom list --stopped → recent stopped (--all removes limit)
+            limit = ["--last", "10000"] if show_all else ["--last", "20"]
+            return cmd_events(["--sql", "life_action='stopped'"] + limit, ctx=ctx)
+
     # Identity (instance-only): CLI supplies ctx (preferred). Direct calls may still pass --name.
     from_value = ctx.explicit_name if ctx else None
     if ctx is None:
@@ -449,7 +466,7 @@ def cmd_list(argv: list[str], *, ctx: CommandContext | None = None) -> int:
         # Build payload
         if is_self:
             # Self payload - may not have instance data yet
-            payload = {
+            payload: dict[str, Any] = {
                 "name": current_name,
                 "session_id": sender_identity.session_id if sender_identity else "",
             }
@@ -555,7 +572,7 @@ def cmd_list(argv: list[str], *, ctx: CommandContext | None = None) -> int:
                 except (json.JSONDecodeError, TypeError):
                     pass
 
-            payload: dict[str, Any] = {
+            payload: dict[str, Any] = {  # type: ignore[no-redef]
                 "name": full_name,
                 "status": status,
                 "status_context": data.get("status_context", ""),
@@ -673,16 +690,18 @@ def cmd_list(argv: list[str], *, ctx: CommandContext | None = None) -> int:
                 from ..core.instances import load_instance_position
 
                 parent_name = data.get("parent_name")
-                timeout = None
+                timeout: int | None = None
                 if parent_name:
                     parent_data = load_instance_position(parent_name)
                     if parent_data:
-                        timeout = parent_data.get("subagent_timeout")
+                        timeout_val = parent_data.get("subagent_timeout")
+                        if isinstance(timeout_val, int):
+                            timeout = timeout_val
                 if timeout is None:
                     timeout = get_config().subagent_timeout
-                remaining = timeout - age_seconds
-                if 0 < remaining < 10:
-                    timeout_marker = f" ⏱ {int(remaining)}s"
+                time_remaining = timeout - age_seconds
+                if 0 < time_remaining < 10:
+                    timeout_marker = f" ⏱ {int(time_remaining)}s"
 
             name_with_badges = f"{name}{badge_str}{unread_str}"
 

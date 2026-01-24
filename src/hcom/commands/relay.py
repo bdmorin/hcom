@@ -120,9 +120,7 @@ def _relay_status() -> int:
     # Ping relay to check if online
     relay_online = False
     relay_version = None
-    headers = (
-        {"Authorization": f"Bearer {config.relay_token}"} if config.relay_token else {}
-    )
+    headers = {"Authorization": f"Bearer {config.relay_token}"} if config.relay_token else {}
     try:
         url = config.relay.rstrip("/") + "/version"
         req = urllib.request.Request(url, headers=headers)
@@ -134,9 +132,7 @@ def _relay_status() -> int:
 
     # Version warning first (if outdated)
     if relay_version is not None and relay_version != REQUIRED_RELAY_VERSION:
-        print(
-            f"⚠ Relay server outdated (v{relay_version}). Run: hcom relay hf --update\n"
-        )
+        print(f"⚠ Relay server outdated (v{relay_version}). Run: hcom relay hf --update\n")
 
     # Server status
     if relay_online:
@@ -173,18 +169,12 @@ def _relay_status() -> int:
             remote_devices = json.loads(r.read())
 
         my_short_id = get_device_short_id()
-        active = [
-            d
-            for d in remote_devices
-            if d.get("age", 9999) < 300 and d.get("short_id") != my_short_id
-        ]
+        active = [d for d in remote_devices if d.get("age", 9999) < 300 and d.get("short_id") != my_short_id]
 
         if active:
             print("\nActive devices:")
             for d in active:
-                print(
-                    f"  {d['short_id']}: {d['instances']} agents ({format_age(d['age'])} ago)"
-                )
+                print(f"  {d['short_id']}: {d['instances']} agents ({format_age(d['age'])} ago)")
         else:
             print("\nNo other active devices")
     except Exception:
@@ -211,11 +201,7 @@ def _check_relay_version() -> tuple[bool, str | None]:
 
     try:
         url = config.relay.rstrip("/") + "/version"
-        headers = (
-            {"Authorization": f"Bearer {config.relay_token}"}
-            if config.relay_token
-            else {}
-        )
+        headers = {"Authorization": f"Bearer {config.relay_token}"} if config.relay_token else {}
         req = urllib.request.Request(url, headers=headers)
         with urllib.request.urlopen(req, timeout=5) as r:
             relay_version = json.loads(r.read()).get("v", 0)
@@ -369,12 +355,8 @@ def _relay_hf(argv: list[str]) -> int:
     # Handle --update: manual instructions (delete requires admin permission)
     if space_exists and do_update:
         print("Update manually:")
-        print(
-            f"  1. Edit: https://huggingface.co/spaces/{target_space}/edit/main/app.py"
-        )
-        print(
-            f"  2. Copy from: https://huggingface.co/spaces/{SOURCE_SPACE}/raw/main/app.py"
-        )
+        print(f"  1. Edit: https://huggingface.co/spaces/{target_space}/edit/main/app.py")
+        print(f"  2. Copy from: https://huggingface.co/spaces/{SOURCE_SPACE}/raw/main/app.py")
         return 0
 
     # Create Space if needed

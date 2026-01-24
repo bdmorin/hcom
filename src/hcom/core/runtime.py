@@ -170,9 +170,7 @@ def notify_all_instances(timeout: float = 0.05) -> None:
 
         for name, port in targets:
             try:
-                with socket.create_connection(
-                    ("127.0.0.1", port), timeout=timeout
-                ) as sock:
+                with socket.create_connection(("127.0.0.1", port), timeout=timeout) as sock:
                     sock.send(b"\n")
             except Exception:
                 # Best-effort prune for notify_endpoints rows.

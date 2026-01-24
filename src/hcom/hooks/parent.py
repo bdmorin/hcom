@@ -42,34 +42,9 @@ from ..core.config import get_config
 from ..core.db import get_db, get_events_since
 
 from .utils import build_hcom_bootstrap_text, notify_instance
+from .family import extract_tool_detail
 from ..core.log import log_error, log_info
 from ..core.tool_utils import stop_instance
-
-
-def _extract_tool_detail(tool_name: str, tool_input: dict[str, Any]) -> str:
-    """Extract human-readable detail from tool input for status display.
-
-    Extracts the most relevant field from each tool type:
-    - Bash: the command being executed
-    - Write/Edit: the file path being modified
-    - Task: the prompt/task description
-
-    Args:
-        tool_name: Name of the tool (Bash, Write, Edit, Task, etc.)
-        tool_input: Tool input dictionary from hook_data
-
-    Returns:
-        Relevant detail string, or empty string if tool not recognized.
-    """
-    match tool_name:
-        case "Bash":
-            return tool_input.get("command", "")
-        case "Write" | "Edit":
-            return tool_input.get("file_path", "")
-        case "Task":
-            return tool_input.get("prompt", "")
-        case _:
-            return ""
 
 
 def get_real_session_id(hook_data: dict[str, Any], env_file: str | None) -> str:
@@ -323,7 +298,7 @@ def start_task(session_id: str, hook_data: dict[str, Any]) -> dict[str, Any] | N
     # Set status (with task prompt as detail) - row exists = participating
     instance_data = load_instance_position(instance_name)
     if instance_data:
-        detail = _extract_tool_detail("Task", hook_data.get("tool_input", {}))
+        detail = extract_tool_detail("claude", "Task", hook_data.get("tool_input", {}))
         set_status(instance_name, "active", "tool:Task", detail=detail)
 
     # Append hcom connection instructions to the Task prompt
@@ -510,7 +485,7 @@ def pretooluse(hook_data: dict[str, Any], instance_name: str, tool_name: str) ->
     Called only for enabled instances with validated existence.
     File collision detection handled via event subscriptions (hcom events collision).
     """
-    detail = _extract_tool_detail(tool_name, hook_data.get("tool_input", {}))
+    detail = extract_tool_detail("claude", tool_name, hook_data.get("tool_input", {}))
 
     # Skip status update for Claude's internal memory operations
     # These Edit calls on session-memory/ files happen while Claude appears idle
@@ -644,11 +619,11 @@ def _inject_bootstrap_if_needed(instance_name: str, instance_data: dict[str, Any
 
     Returns hook output dict or None.
     """
-    if instance_data.get("name_announced", False):
-        return None
+    from .utils import inject_bootstrap_once
 
-    msg = build_hcom_bootstrap_text(instance_name)
-    update_instance_position(instance_name, {"name_announced": True})
+    bootstrap = inject_bootstrap_once(instance_name, instance_data, tool="claude")
+    if not bootstrap:
+        return None
 
     # Track bootstrap count for first-time user hints
     from ..core.paths import increment_flag_counter
@@ -659,7 +634,7 @@ def _inject_bootstrap_if_needed(instance_name: str, instance_data: dict[str, Any
         "systemMessage": "[HCOM info shown to instance]",
         "hookSpecificOutput": {
             "hookEventName": "PostToolUse",
-            "additionalContext": msg,
+            "additionalContext": bootstrap,
         },
     }
 
@@ -757,20 +732,22 @@ def userpromptsubmit(
 
     # Bootstrap fallback (paranoid safety, likely never used - SessionStart handles this)
     if not name_announced and os.environ.get("HCOM_LAUNCHED") == "1":
-        msg = build_hcom_bootstrap_text(instance_name)
-        output: dict[str, Any] = {
-            "hookSpecificOutput": {
-                "hookEventName": "UserPromptSubmit",
-                "additionalContext": msg,
-            }
-        }
-        print(json.dumps(output), file=sys.stdout)
-        update_instance_position(instance_name, {"name_announced": True})
-        from ..core.paths import increment_flag_counter
+        from .utils import inject_bootstrap_once
 
-        increment_flag_counter("instance_count")
-        set_status(instance_name, "active", "prompt")
-        return
+        bootstrap = inject_bootstrap_once(instance_name, instance_data, tool="claude")
+        if bootstrap:
+            output: dict[str, Any] = {
+                "hookSpecificOutput": {
+                    "hookEventName": "UserPromptSubmit",
+                    "additionalContext": bootstrap,
+                }
+            }
+            print(json.dumps(output), file=sys.stdout)
+            from ..core.paths import increment_flag_counter
+
+            increment_flag_counter("instance_count")
+            set_status(instance_name, "active", "prompt")
+            return
 
     # PTY mode: deliver messages (like Gemini's BeforeAgent)
     # Poll thread injects trigger "[hcom]", this hook delivers actual messages

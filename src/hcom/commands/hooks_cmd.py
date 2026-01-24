@@ -89,9 +89,7 @@ def cmd_hooks_add(argv: list[str]) -> int:
     elif argv[0] in HOOK_TOOLS:
         tools = [argv[0]]
     else:
-        raise CLIError(
-            f"Unknown tool: {argv[0]}\nValid options: claude, gemini, codex, all"
-        )
+        raise CLIError(f"Unknown tool: {argv[0]}\nValid options: claude, gemini, codex, all")
 
     # Install hooks
     results = {}
@@ -161,9 +159,7 @@ def cmd_hooks_remove(argv: list[str]) -> int:
     elif argv[0] in HOOK_TOOLS:
         tools = [argv[0]]
     else:
-        raise CLIError(
-            f"Unknown tool: {argv[0]}\nValid options: claude, gemini, codex, all"
-        )
+        raise CLIError(f"Unknown tool: {argv[0]}\nValid options: claude, gemini, codex, all")
 
     # Remove hooks
     results = {}
@@ -236,9 +232,7 @@ After adding, restart the tool to activate hooks.""")
     elif subcommand in ("remove", "uninstall"):
         return cmd_hooks_remove(sub_argv)
     else:
-        raise CLIError(
-            f"Unknown hooks subcommand: {subcommand}\nRun 'hcom hooks --help' for usage"
-        )
+        raise CLIError(f"Unknown hooks subcommand: {subcommand}\nRun 'hcom hooks --help' for usage")
 
 
 __all__ = ["cmd_hooks"]

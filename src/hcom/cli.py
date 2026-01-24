@@ -69,9 +69,7 @@ if _invoked_as in _SHIM_TOOLS:
         _norm_shim = os.path.realpath(_shim_dir).rstrip("/")
         _path_parts = os.environ.get("PATH", "").split(":")
         # Exclude any path that resolves to shim dir
-        _clean_path = ":".join(
-            p for p in _path_parts if os.path.realpath(p).rstrip("/") != _norm_shim
-        )
+        _clean_path = ":".join(p for p in _path_parts if os.path.realpath(p).rstrip("/") != _norm_shim)
         _old_path = os.environ.get("PATH", "")
         os.environ["PATH"] = _clean_path
         _real = shutil.which(tool)
@@ -84,9 +82,7 @@ if _invoked_as in _SHIM_TOOLS:
         if _real:
             os.execv(_real, [_real] + sys.argv[1:])
         else:
-            print(
-                f"Error: Real {_invoked_as} binary not found in PATH", file=sys.stderr
-            )
+            print(f"Error: Real {_invoked_as} binary not found in PATH", file=sys.stderr)
             sys.exit(1)
 
     def _should_passthrough() -> bool:
@@ -368,7 +364,6 @@ from .core.paths import (
     FLAGS_DIR,
 )
 from .hooks import (
-    handle_hook,
     get_claude_settings_path,
     load_claude_settings,
     setup_claude_hooks,
@@ -416,9 +411,7 @@ def cmd_run(argv: list[str], *, ctx: CommandContext | None = None) -> int:
     return run_script(argv)
 
 
-def _build_ctx_for_command(
-    cmd: str | None, *, explicit_name: str | None
-) -> CommandContext:
+def _build_ctx_for_command(cmd: str | None, *, explicit_name: str | None) -> CommandContext:
     """Build a CommandContext for this invocation (best-effort identity resolution).
 
     `start` is special: it may be invoked with `--name <agent_id>` before the
@@ -461,14 +454,10 @@ COMMANDS = (
 )
 
 # Commands that should NOT trigger status update (handled internally or lifecycle)
-_STATUS_SKIP_COMMANDS = frozenset(
-    {"listen", "start", "stop", "kill", "reset", "status"}
-)
+_STATUS_SKIP_COMMANDS = frozenset({"listen", "start", "stop", "kill", "reset", "status"})
 
 
-def _set_hookless_command_status(
-    cmd_name: str, *, ctx: CommandContext | None = None
-) -> None:
+def _set_hookless_command_status(cmd_name: str, *, ctx: CommandContext | None = None) -> None:
     """Set status for instances without PreToolUse hooks before command runs.
 
     Claude/Gemini main instances have PreToolUse hooks that set active:tool:*.
@@ -519,9 +508,7 @@ def _set_hookless_command_status(
         pass  # Best effort - don't break commands
 
 
-def _run_command(
-    name: str, argv: list[str], *, ctx: CommandContext | None = None
-) -> int:
+def _run_command(name: str, argv: list[str], *, ctx: CommandContext | None = None) -> int:
     """Run command with --help support."""
     # Check for --help anywhere in argv (not just position 0, since --name may precede it)
     # Exception: 'run' passes --help through to scripts
@@ -540,9 +527,7 @@ def _run_command(
     return result
 
 
-def _maybe_deliver_pending_messages(
-    argv: list[str] | None = None, *, ctx: CommandContext | None = None
-) -> None:
+def _maybe_deliver_pending_messages(argv: list[str] | None = None, *, ctx: CommandContext | None = None) -> None:
     """For hookless instances (codex/adhoc): append unread messages after command output.
 
     Codex and adhoc instances have no delivery hooks, so messages are delivered
@@ -599,9 +584,7 @@ def _maybe_deliver_pending_messages(
         msg_ts = messages[-1].get("timestamp", "")
         tool = identity.instance_data.get("tool")
         if tool == "codex":
-            set_status(
-                instance_name, "active", f"deliver:{messages[0]['from']}", msg_ts=msg_ts
-            )
+            set_status(instance_name, "active", f"deliver:{messages[0]['from']}", msg_ts=msg_ts)
         else:
             set_status(
                 instance_name,
@@ -675,9 +658,7 @@ def get_update_info() -> tuple[str | None, str | None]:
         try:
             import urllib.request
 
-            with urllib.request.urlopen(
-                "https://pypi.org/pypi/hcom/json", timeout=2
-            ) as f:
+            with urllib.request.urlopen("https://pypi.org/pypi/hcom/json", timeout=2) as f:
                 latest = json.load(f)["info"]["version"]
         except Exception:
             pass  # Network error - cache empty result
@@ -790,9 +771,7 @@ def ensure_hooks_current() -> bool:
 
     # Check if hooks exist and are current
     needs_update = False
-    if not verify_claude_hooks_installed(
-        settings_path, check_permissions=include_permissions
-    ):
+    if not verify_claude_hooks_installed(settings_path, check_permissions=include_permissions):
         needs_update = True
     else:
         try:
@@ -838,15 +817,9 @@ def main(argv: list[str] | None = None) -> int | None:
     # Apply UTF-8 encoding for Windows and WSL (Git Bash, MSYS use cp1252 by default)
     if IS_WINDOWS or is_wsl():
         try:
-            if (
-                not isinstance(sys.stdout, io.TextIOWrapper)
-                or sys.stdout.encoding != "utf-8"
-            ):
+            if not isinstance(sys.stdout, io.TextIOWrapper) or sys.stdout.encoding != "utf-8":
                 sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8")
-            if (
-                not isinstance(sys.stderr, io.TextIOWrapper)
-                or sys.stderr.encoding != "utf-8"
-            ):
+            if not isinstance(sys.stderr, io.TextIOWrapper) or sys.stderr.encoding != "utf-8":
                 sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding="utf-8")
         except (AttributeError, OSError):
             pass  # Fallback if stream redirection fails
@@ -856,43 +829,9 @@ def main(argv: list[str] | None = None) -> int | None:
     else:
         argv = argv[1:] if len(argv) > 0 and argv[0].endswith("hcom.py") else argv
 
-    # Hook handlers only (called BY hooks, not users)
-    if argv and argv[0] in (
-        "poll",
-        "notify",
-        "pre",
-        "post",
-        "sessionstart",
-        "userpromptsubmit",
-        "sessionend",
-        "subagent-start",
-        "subagent-stop",
-    ):
-        handle_hook(argv[0])
-        return 0
-
-    # Gemini hook handlers (called BY Gemini hooks, not users)
-    gemini_hooks = (
-        "gemini-sessionstart",
-        "gemini-beforeagent",
-        "gemini-afteragent",
-        "gemini-beforetool",
-        "gemini-aftertool",
-        "gemini-notification",
-        "gemini-sessionend",
-    )
-    if argv and argv[0] in gemini_hooks:
-        from .tools.gemini.hooks import handle_gemini_hook
-
-        handle_gemini_hook(argv[0])
-        return 0
-
-    # Codex hook handlers (called BY Codex hooks, not users)
-    if argv and argv[0] == "codex-notify":
-        from .tools.codex.hooks import handle_codex_hook
-
-        handle_codex_hook(argv[0])
-        return 0
+    # NOTE: Hook commands (poll, notify, pre, post, sessionstart, etc.) are handled
+    # by _route_hook_early() at module load time (line 227) which calls sys.exit(0).
+    # They never reach main(). No hook handling needed here.
 
     # Ensure directories exist first (required for version check cache)
     if not ensure_hcom_directories():
@@ -922,17 +861,13 @@ def main(argv: list[str] | None = None) -> int | None:
             i += 1
         if unexpected_flag:
             print(
-                format_error(
-                    f"Unknown flag '{unexpected_flag}'", "Run 'hcom --help' for usage"
-                ),
+                format_error(f"Unknown flag '{unexpected_flag}'", "Run 'hcom --help' for usage"),
                 file=sys.stderr,
             )
             return 1
 
     # Help/version should never fail due to identity parsing/resolution.
-    help_requested = bool(argv) and (
-        "--help" in argv or "-h" in argv or cmd in ("help", "--help", "-h")
-    )
+    help_requested = bool(argv) and ("--help" in argv or "-h" in argv or cmd in ("help", "--help", "-h"))
     version_requested = cmd in ("--version", "-v")
 
     explicit_name: str | None = None
@@ -951,16 +886,9 @@ def main(argv: list[str] | None = None) -> int | None:
     is_launch_cmd = cmd and (cmd.isdigit() or cmd in ("gemini", "codex", "claude"))
 
     # Gate: require identity unless allowlisted, bypass flag, or explicit identity provided
-    if (
-        cmd
-        and not is_launch_cmd
-        and cmd not in IDENTITY_ALLOWLIST
-        and cmd not in IDENTITY_BYPASS_FLAGS
-    ):
+    if cmd and not is_launch_cmd and cmd not in IDENTITY_ALLOWLIST and cmd not in IDENTITY_BYPASS_FLAGS:
         # Check if send external sender flags present (send command uses these)
-        has_from = (
-            cmd == "send" and (("-b" in argv) or ("--from" in argv)) if argv else False
-        )
+        has_from = cmd == "send" and (("-b" in argv) or ("--from" in argv)) if argv else False
         if not explicit_name and not has_from:
             # No explicit identity provided - check if registered instance exists
             try:
@@ -970,15 +898,14 @@ def main(argv: list[str] | None = None) -> int | None:
 
                     identity = resolve_identity()
                 # Must be a registered, enabled instance
-                if not (
-                    identity.kind == "instance" and identity.instance_data
-                ):  # Row exists = participating
+                if not (identity.kind == "instance" and identity.instance_data):  # Row exists = participating
                     from .core.tool_utils import build_hcom_command
 
                     hcom_cmd = build_hcom_command()
                     print(
                         format_error(
-                            f"hcom identity not found, you need to run '{hcom_cmd} start' first, then use '{hcom_cmd} {argv[0]}'"
+                            f"hcom identity not found, you need to run '{hcom_cmd} start' first, "
+                            f"then use '{hcom_cmd} {argv[0]}'"
                         ),
                         file=sys.stderr,
                     )
@@ -1005,7 +932,8 @@ def main(argv: list[str] | None = None) -> int | None:
                 hcom_cmd = build_hcom_command()
                 print(
                     format_error(
-                        f"hcom identity not found, you need to run '{hcom_cmd} start' first, then use '{hcom_cmd} {argv[0]}'"
+                        f"hcom identity not found, you need to run '{hcom_cmd} start' first, "
+                        f"then use '{hcom_cmd} {argv[0]}'"
                     ),
                     file=sys.stderr,
                 )
@@ -1048,9 +976,7 @@ def main(argv: list[str] | None = None) -> int | None:
             if identity.name and in_subagent_context(identity.name):
                 # Cleanup stale subagents before blocking (mtime check catches session-ended cases)
                 instance_data = load_instance_position(identity.name)
-                transcript_path = (
-                    instance_data.get("transcript_path", "") if instance_data else ""
-                )
+                transcript_path = instance_data.get("transcript_path", "") if instance_data else ""
                 if transcript_path and identity.session_id:
                     cleanup_dead_subagents(identity.session_id, transcript_path)
                 # Re-check after cleanup
@@ -1091,7 +1017,7 @@ def main(argv: list[str] | None = None) -> int | None:
             if sys.stdin.isatty() and sys.stdout.isatty() and not is_inside_ai_tool():
                 # Check for updates and prompt before TUI launch
                 latest, update_cmd = get_update_info()
-                if latest:
+                if latest and update_cmd:
                     if _prompt_and_install_update(latest, update_cmd):
                         return 0  # Updated - user should restart
 
@@ -1123,11 +1049,7 @@ def main(argv: list[str] | None = None) -> int | None:
             # Check for gemini/codex after the number
             cmd_args = _get_command_args(argv, cmd)
             next_cmd = _find_command(cmd_args)
-            launcher_name = (
-                ctx.identity.name
-                if (ctx and ctx.identity and ctx.identity.kind == "instance")
-                else None
-            )
+            launcher_name = ctx.identity.name if (ctx and ctx.identity and ctx.identity.kind == "instance") else None
 
             if next_cmd == "gemini" and "gemini" in RELEASED_TOOLS:
                 if "--help" in argv or "-h" in argv:
@@ -1138,9 +1060,7 @@ def main(argv: list[str] | None = None) -> int | None:
                     return 0
                 from .commands.lifecycle import cmd_launch_gemini
 
-                result = cmd_launch_gemini(
-                    _strip_identity_flags(argv), launcher_name=launcher_name, ctx=ctx
-                )
+                result = cmd_launch_gemini(_strip_identity_flags(argv), launcher_name=launcher_name, ctx=ctx)
                 _maybe_deliver_pending_messages(ctx=ctx)
                 return result
             elif next_cmd == "codex" and "codex" in RELEASED_TOOLS:
@@ -1152,9 +1072,7 @@ def main(argv: list[str] | None = None) -> int | None:
                     return 0
                 from .commands.lifecycle import cmd_launch_codex
 
-                result = cmd_launch_codex(
-                    _strip_identity_flags(argv), launcher_name=launcher_name, ctx=ctx
-                )
+                result = cmd_launch_codex(_strip_identity_flags(argv), launcher_name=launcher_name, ctx=ctx)
                 _maybe_deliver_pending_messages(ctx=ctx)
                 return result
             else:
@@ -1165,9 +1083,7 @@ def main(argv: list[str] | None = None) -> int | None:
                     print(get_command_help("claude"))
                     _maybe_deliver_pending_messages(ctx=ctx)
                     return 0
-                result = cmd_launch(
-                    _strip_identity_flags(argv), launcher_name=launcher_name, ctx=ctx
-                )
+                result = cmd_launch(_strip_identity_flags(argv), launcher_name=launcher_name, ctx=ctx)
                 _maybe_deliver_pending_messages(ctx=ctx)
                 return result
         elif cmd == "claude":
@@ -1178,14 +1094,8 @@ def main(argv: list[str] | None = None) -> int | None:
                 print(get_command_help("claude"))
                 _maybe_deliver_pending_messages(ctx=ctx)
                 return 0
-            launcher_name = (
-                ctx.identity.name
-                if (ctx and ctx.identity and ctx.identity.kind == "instance")
-                else None
-            )
-            result = cmd_launch(
-                _strip_identity_flags(argv), launcher_name=launcher_name, ctx=ctx
-            )
+            launcher_name = ctx.identity.name if (ctx and ctx.identity and ctx.identity.kind == "instance") else None
+            result = cmd_launch(_strip_identity_flags(argv), launcher_name=launcher_name, ctx=ctx)
             _maybe_deliver_pending_messages(ctx=ctx)
             return result
         else:

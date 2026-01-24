@@ -6,12 +6,11 @@ Raises HcomError on failure, returns meaningful data on success.
 
 from __future__ import annotations
 
+from .messages import MessageEnvelope
 from ..shared import HcomError, SenderIdentity
 
 
-def op_send(
-    identity: SenderIdentity, message: str, envelope: dict[str, str] | None = None
-) -> list[str]:
+def op_send(identity: SenderIdentity, message: str, envelope: MessageEnvelope | None = None) -> list[str]:
     """Send message.
 
     Args:
@@ -30,9 +29,7 @@ def op_send(
     return send_message(identity, message, envelope=envelope)
 
 
-def op_stop(
-    instance_name: str, initiated_by: str | None = None, reason: str = "api"
-) -> None:
+def op_stop(instance_name: str, initiated_by: str | None = None, reason: str = "api") -> None:
     """Stop an instance (deletes row).
 
     Args:
@@ -51,16 +48,12 @@ def op_stop(
         raise HcomError(f"Instance '{instance_name}' not found")
 
     if position.get("origin_device_id"):
-        raise HcomError(
-            f"Cannot stop remote instance '{instance_name}' via ops - use relay"
-        )
+        raise HcomError(f"Cannot stop remote instance '{instance_name}' via ops - use relay")
 
-    stop_instance(instance_name, initiated_by=initiated_by, reason=reason)
+    stop_instance(instance_name, initiated_by=initiated_by or "api", reason=reason)
 
 
-def op_start(
-    instance_name: str, initiated_by: str | None = None, reason: str = "api"
-) -> None:
+def op_start(instance_name: str, initiated_by: str | None = None, reason: str = "api") -> None:
     """Start an instance.
 
     With row-exists=participating model, stopped instances are deleted and
@@ -83,9 +76,7 @@ def op_start(
         )
 
     if position.get("origin_device_id"):
-        raise HcomError(
-            f"Cannot start remote instance '{instance_name}' via ops - use relay"
-        )
+        raise HcomError(f"Cannot start remote instance '{instance_name}' via ops - use relay")
 
     # Row exists = already participating, nothing to do
 
@@ -165,17 +156,13 @@ def auto_subscribe_defaults(instance_name: str, tool: str) -> None:
         # Escape _ and % in instance name (they're LIKE wildcards)
         escaped_name = instance_name.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
         conn = get_db()
-        conn.execute(
-            "DELETE FROM kv WHERE key LIKE ? ESCAPE '\\'", (f"events_sub:%\\_{escaped_name}",)
-        )
+        conn.execute("DELETE FROM kv WHERE key LIKE ? ESCAPE '\\'", (f"events_sub:%\\_{escaped_name}",))
 
         config = get_config()
         if not config.auto_subscribe:
             return
 
-        presets = [
-            p.strip() for p in config.auto_subscribe.split(",") if p.strip()
-        ]
+        presets = [p.strip() for p in config.auto_subscribe.split(",") if p.strip()]
 
         # Map old preset names to new composable filter flags
         preset_to_flags = {

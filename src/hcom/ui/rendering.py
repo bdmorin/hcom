@@ -50,7 +50,7 @@ def suppress_output():
 
 
 # Import ANSI codes directly to avoid circular import with shared
-from .colors import RESET, FG_GRAY, FG_WHITE, BG_CHARCOAL
+from .colors import RESET, FG_GRAY, FG_WHITE, BG_CHARCOAL  # noqa: E402
 
 # Regex to match ANSI escape sequences (CSI sequences)
 # Matches: ESC [ <params> <intermediate> <final>
@@ -211,11 +211,7 @@ def smart_truncate_name(name: str, width: int) -> str:
     prefix_len = (available + 1) // 2  # Round up for prefix
     suffix_len = available - prefix_len
 
-    return (
-        name[:prefix_len] + "…" + name[-suffix_len:]
-        if suffix_len > 0
-        else name[:prefix_len] + "…"
-    )
+    return name[:prefix_len] + "…" + name[-suffix_len:] if suffix_len > 0 else name[:prefix_len] + "…"
 
 
 def truncate_path(path: str, max_len: int) -> str:

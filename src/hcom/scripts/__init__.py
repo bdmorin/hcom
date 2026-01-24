@@ -379,9 +379,7 @@ def _generate_api_docs() -> str:
     ]:
         attr = getattr(Session, name, None)
         if attr:
-            doc = getattr(attr, "__doc__", None) or (
-                attr.fget.__doc__ if hasattr(attr, "fget") else None
-            )
+            doc = getattr(attr, "__doc__", None) or (attr.fget.__doc__ if hasattr(attr, "fget") else None)
             if doc:
                 lines.append(f"### Session.{name}\n")
                 lines.append(doc.strip())

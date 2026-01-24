@@ -101,7 +101,7 @@ def resolve_from_name(name: str) -> SenderIdentity:
         return SenderIdentity(
             kind="instance",
             name=name,
-            instance_data=data,
+            instance_data=data,  # type: ignore[arg-type]
             session_id=data.get("session_id"),
         )
 
@@ -115,7 +115,7 @@ def resolve_from_name(name: str) -> SenderIdentity:
             return SenderIdentity(
                 kind="instance",
                 name=instance_name,
-                instance_data=instance_data,
+                instance_data=instance_data,  # type: ignore[arg-type]
                 session_id=instance_data.get("session_id"),
             )
 
@@ -183,7 +183,7 @@ def resolve_identity(
         return SenderIdentity(
             kind="instance",
             name=bound_name,
-            instance_data=bound_data,
+            instance_data=bound_data,  # type: ignore[arg-type]
             session_id=bound_data.get("session_id"),
         )
 

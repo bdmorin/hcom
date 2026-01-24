@@ -208,9 +208,7 @@ def format_recipients(delivered_to: list[str], max_show: int = 30) -> str:
 # ==================== Scope Computation ====================
 
 
-def compute_scope(
-    message: str, enabled_instances: list[dict[str, Any] | str]
-) -> tuple[ScopeResult | None, str | None]:
+def compute_scope(message: str, enabled_instances: list[dict[str, Any] | str]) -> tuple[ScopeResult | None, str | None]:
     """Compute message scope and routing data.
 
     Args:
@@ -251,6 +249,16 @@ def compute_scope(
 
     # Check for @mentions
     if "@" in message:
+        # First check for invalid system notification mention attempts like @[hcom-events]
+        # These don't match MENTION_PATTERN but would broadcast to everyone
+        system_bracket_pattern = re.compile(r"@\[hcom-[a-z]+\]")
+        system_bracket_attempts = system_bracket_pattern.findall(message)
+        if system_bracket_attempts:
+            return (
+                None,
+                f"System notifications cannot be mentioned: {', '.join(system_bracket_attempts)}\nSystem notifications (names in []) are not agents and cannot receive messages.",
+            )
+
         mentions = MENTION_PATTERN.findall(message)
         if mentions:
             # Validate all mentions match ENABLED instances only
@@ -263,11 +271,7 @@ def compute_scope(
                 # If mention has :, allow matching remote instances
                 if ":" in mention:
                     # Mention includes device suffix - match any instance with prefix
-                    matches = [
-                        full_to_base[fn]
-                        for fn in full_names
-                        if fn.lower().startswith(mention.lower())
-                    ]
+                    matches = [full_to_base[fn] for fn in full_names if fn.lower().startswith(mention.lower())]
                 else:
                     # Mention is bare name - only match local instances (no : in name)
                     # Don't match across underscore boundary (reserved for subagent hierarchy)
@@ -299,7 +303,10 @@ def compute_scope(
                     )
 
                 display = format_recipients(full_names)
-                error = f"@mentions to non-existent or stopped agents (or you used '@' char for stuff that wasn't agent name): {', '.join(f'@{m}' for m in unmatched)}\nAvailable: {display}"
+                error = (
+                    f"@mentions to non-existent or stopped agents (or you used '@' char for stuff that wasn't agent name): "
+                    f"{', '.join(f'@{m}' for m in unmatched)}\nAvailable: {display}"
+                )
                 return None, error
 
             # Deduplicate matched instances (store base names for DB lookup)
@@ -310,9 +317,7 @@ def compute_scope(
     return ("broadcast", {}), None
 
 
-def _should_deliver(
-    scope: MessageScope, extra: ScopeExtra, receiver_name: str, sender_name: str
-) -> bool:
+def _should_deliver(scope: MessageScope, extra: ScopeExtra, receiver_name: str, sender_name: str) -> bool:
     """Check if message should be delivered to receiver based on scope.
 
     Args:
@@ -393,9 +398,7 @@ def resolve_reply_to(reply_to: str) -> tuple[int | None, str | None]:
             return None, f"Invalid reply_to format: {reply_to}"
 
         # Verify event exists and is a message (not status/life events)
-        row = conn.execute(
-            "SELECT id FROM events WHERE id = ? AND type = 'message'", (local_id,)
-        ).fetchone()
+        row = conn.execute("SELECT id FROM events WHERE id = ? AND type = 'message'", (local_id,)).fetchone()
         if row:
             return local_id, None
         return None, f"Message #{reply_to} not found"
@@ -465,9 +468,7 @@ def unescape_bash(text: str) -> str:
     return text
 
 
-def send_message(
-    identity: SenderIdentity, message: str, envelope: MessageEnvelope | None = None
-) -> list[str]:
+def send_message(identity: SenderIdentity, message: str, envelope: MessageEnvelope | None = None) -> list[str]:
     """Send a message to the database and notify all instances.
 
     Args:
@@ -493,9 +494,7 @@ def send_message(
     # Get participating instances (row exists = participating)
     # Message delivery works for all instances; session binding gates hook injection
     participating_rows = conn.execute("SELECT name, tag FROM instances").fetchall()
-    participating_instances = [
-        {"name": row["name"], "tag": row["tag"]} for row in participating_rows
-    ]
+    participating_instances = [{"name": row["name"], "tag": row["tag"]} for row in participating_rows]
 
     # For @mention validation: participating instances + CLI identity (bigboss as plain string)
     mentionable = participating_instances + [SENDER]
@@ -511,9 +510,7 @@ def send_message(
     # Compute delivered_to: base names of participating instances in scope
     # Use base name for delivery check since that's what's stored in mentions
     delivered_to = [
-        inst["name"]
-        for inst in participating_instances
-        if _should_deliver(scope, extra, inst["name"], identity.name)
+        inst["name"] for inst in participating_instances if _should_deliver(scope, extra, inst["name"], identity.name)
     ]
 
     # Build event data
@@ -543,10 +540,13 @@ def send_message(
                 data["reply_to_local"] = local_id
 
                 # Ack-on-ack loop prevention: don't allow replying to an 'ack' with another 'ack'
+                # Ack-on-inform prevention: informational messages don't need acknowledgment
                 if intent == "ack":
                     parent_intent = get_intent_from_event(local_id)
                     if parent_intent == "ack":
                         raise HcomError("Ack-on-ack loop detected. Message blocked.")
+                    if parent_intent == "inform":
+                        raise HcomError("Cannot ack an inform - informational messages don't need acknowledgment.")
 
         if thread := envelope.get("thread"):
             data["thread"] = thread
@@ -605,9 +605,7 @@ def send_system_message(sender_name: str, message: str) -> list[str]:
     return send_message(identity, message)
 
 
-def get_unread_messages(
-    instance_name: str, update_position: bool = False
-) -> tuple[list[dict[str, Any]], int]:
+def get_unread_messages(instance_name: str, update_position: bool = False) -> tuple[list[dict[str, Any]], int]:
     """Get unread messages for instance with scope-based filtering.
 
     Args:
@@ -696,9 +694,7 @@ def get_unread_messages(
 # ==================== Message Filtering & Routing ====================
 
 
-def should_deliver_message(
-    event_data: dict[str, Any], receiver_name: str, sender_name: str
-) -> bool:
+def should_deliver_message(event_data: dict[str, Any], receiver_name: str, sender_name: str) -> bool:
     """Check if message should be delivered based on scope.
 
     Args:
@@ -765,9 +761,7 @@ def get_subagent_messages(
     conn = get_db()
     subagent_names = [
         row["name"]
-        for row in conn.execute(
-            "SELECT name FROM instances WHERE parent_name = ?", (parent_name,)
-        ).fetchall()
+        for row in conn.execute("SELECT name FROM instances WHERE parent_name = ?", (parent_name,)).fetchall()
     ]
 
     # Initialize per-subagent counts
@@ -804,9 +798,7 @@ def get_subagent_messages(
             for subagent_name in subagent_names:
                 if subagent_name != sender_name:
                     try:
-                        if should_deliver_message(
-                            event_data, subagent_name, sender_name
-                        ):
+                        if should_deliver_message(event_data, subagent_name, sender_name):
                             per_subagent_counts[subagent_name] += 1
                     except ValueError as e:
                         print(
@@ -1011,9 +1003,7 @@ def get_read_receipts(
     conn = get_db()
 
     # Determine storage name: external senders use ext_ prefix, instances use real name
-    storage_name = (
-        f"ext_{identity.name}" if identity.kind == "external" else identity.name
-    )
+    storage_name = f"ext_{identity.name}" if identity.kind == "external" else identity.name
 
     # Query by storage name
     query = """
@@ -1053,9 +1043,7 @@ def get_read_receipts(
 
     # For remote instances, get their max msg_ts from status events
     remote_msg_ts = {}
-    remote_instances = [
-        row["name"] for row in active_instances if row["origin_device_id"]
-    ]
+    remote_instances = [row["name"] for row in active_instances if row["origin_device_id"]]
     if remote_instances:
         for inst_name in remote_instances:
             row = conn.execute(
@@ -1111,10 +1099,7 @@ def get_read_receipts(
 
             # Remote instance: compare msg_ts (timestamp-based)
             if inst_data and inst_data.get("origin_device_id"):
-                if (
-                    inst_name in remote_msg_ts
-                    and remote_msg_ts[inst_name] >= msg_timestamp
-                ):
+                if inst_name in remote_msg_ts and remote_msg_ts[inst_name] >= msg_timestamp:
                     read_by.append(inst_name)
                 continue
 
@@ -1153,7 +1138,7 @@ def get_read_receipts(
                 }
             )
 
-    return receipts
+    return receipts  # type: ignore[return-value]
 
 
 def get_unread_counts_batch(instances: dict[str, dict[str, Any]]) -> dict[str, int]:

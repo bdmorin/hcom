@@ -189,7 +189,7 @@ HCOM_DIR=$PWD/.hcom                # for sandbox or project local
 ```
 # hcom CLI Reference
 
-hcom (hook-comms) v0.6.12 - multi-agent communication
+hcom (hook-comms) v0.6.13 - multi-agent communication
 
 Usage:
   hcom                                  TUI dashboard
@@ -266,8 +266,8 @@ Subscribe:
 
 
 Examples:
-    events --agent peso --status listening
-    events --cmd git --agent peso 
+    events --agent peso --status listening 
+    events --cmd git --agent peso  
     events --file '*.py' --last 100 
     events sub --idle peso         
     events sub --cmd 'npm test' --once 
@@ -301,16 +301,29 @@ Usage:
     --json                         Output as JSON
     --sh                           Shell exports: eval "$(hcom list self --sh)"
 
+  hcom list --stopped [name]      Stopped instances (from events)
+    --all                          All stopped (default: last 20)
+
 ## send
 
 Usage:
-  hcom send "msg"                 Broadcast message to all your best buddies
+  hcom send "msg"                 Broadcast message
   hcom send "@name msg"           Send to specific agent/group
   hcom send --stdin               Read message from stdin
     --name <name>                  Identity (agent name or UUID)
     --from <name>                  External sender identity, alias: -b
-    --bundle JSON                  Create bundle and attach bundle_id to message
-    --bundle-file F                Create bundle from JSON file and attach
+
+
+Bundle flags (inline creation):
+    --title <text>                 Create and attach bundle inline
+    --description <text>           Bundle description (required with --title)
+    --events <ids>                 Event IDs/ranges: 1,2,5-10 (required)
+    --files <paths>                Comma-separated file paths (required)
+    --transcript <ranges>          Transcript ranges with detail (required)
+      Format: range:detail (e.g., 3-14:normal,6:full,22-30:detailed)
+    --extends <id>                 Parent bundle (optional)
+  See 'hcom bundle --help' for bundle details
+
 
 Envelope (optional):
     --intent <type>                request|inform|ack|error
@@ -320,23 +333,53 @@ Envelope (optional):
 ## bundle
 
 Usage:
-  hcom bundle                     List recent bundles
+  hcom bundle                     List recent bundles (alias: bundle list)
   hcom bundle list                List recent bundles
     --last N                       Limit count (default: 20)
     --json                         Output JSON
 
+  hcom bundle cat <id>            Expand and display full bundle content
+  Shows: metadata, files (metadata only), transcript (respects detail level), events
+
+  hcom bundle prepare             Show recent context and suggest bundle template
+    --for <agent>                  Prepare for specific agent (default: self)
+    --last-transcript N            Transcript entries to suggest (default: 20)
+    --last-events N                Events to scan per category (default: 30)
+    --json                         Output JSON
+  Shows suggested transcript ranges, relevant events, and files
+  Outputs ready-to-use bundle create command
+  TIP: Skip 'bundle create' by using bundle flags directly in 'hcom send'
+
   hcom bundle show <id>           Show bundle by id/prefix
     --json                         Output JSON
 
-  hcom bundle create "title"      Create bundle
-    --description <text>           Bundle description
-    --events 1,2                   Comma-separated event IDs
-    --files a.py,b.py              Comma-separated file paths
-    --transcript 4-15,18-22        Transcript ranges (comma-separated)
+  hcom bundle create "title"      Create bundle (positional or --title)
+    --title <text>                 Bundle title (alternative to positional)
+    --description <text>           Bundle description (required)
+    --events 1,2,5-10              Event IDs/ranges, comma-separated (required)
+    --files a.py,b.py              Comma-separated file paths (required)
+    --transcript RANGES            Transcript with detail levels (required)
+      Format: range:detail (e.g., 3-14:normal,6:full,22-30:detailed)
+      normal = truncated | full = --full flag | detailed = --detailed flag
     --extends <id>                 Parent bundle
     --bundle JSON                  Create from JSON payload
     --bundle-file F                Create from JSON file
     --json                         Output JSON
+
+
+JSON format:
+  {
+    "title": "Bundle Title",
+    "description": "What happened, decisions, state, next steps",
+    "refs": {
+      "events": ["123", "124-130"],  // IDs or ranges
+      "files": ["src/auth.py", "tests/test_auth.py"],
+      "transcript": ["10-15:normal", "20:full", "30-35:detailed"]
+    },
+    "extends": "bundle:abc123"  // optional
+  }
+
+  Note: All refs fields (events, files, transcript) are required
 
   hcom bundle chain <id>          Show bundle lineage
     --json                         Output JSON
@@ -376,6 +419,13 @@ Usage:
     --timeout N                    Timeout in seconds (default: 86400)
     --json                         Output messages as JSON
     --sql "filter"                 Wait for event matching SQL (uses temp subscription)
+
+
+Filter flags:
+  Supports all filter flags from 'events' command
+  (--agent, --type, --status, --file, --cmd, --from, etc.)
+  Run 'hcom events --help' for full list
+  Filters combine with --sql using AND logic
 
 
 SQL filter mode:
@@ -450,6 +500,8 @@ Global settings:
 Precedence: HCOM defaults < config.env < shell env vars
   Each resolves independently
 
+  HCOM_DIR - per project/sandbox (must be set in shell, see 'hcom reset --help')
+
 ## relay
 
 Usage:
@@ -480,6 +532,8 @@ Usage:
     --limit N                      Max results (default: 20)
     --agent TYPE                   Filter: claude, gemini, or codex
     --json                         JSON output
+
+  Tip: Reference transcript ranges in messages (e.g., "see my transcript 7-10")
 
 ## archive
 
@@ -529,7 +583,13 @@ Environment:
     HCOM_HINTS                     Appended to messages received
     HCOM_SUBAGENT_TIMEOUT          Seconds claude subagents are kept alive after finishing task
 
+
+Resume:
+  Get session_id: 'hcom list --stopped' or 'hcom archive'
+    hcom claude --resume <session_id> 'reclaim identity' Resume stopped agent
+
   Run "claude --help" for Claude CLI options
+  Run "hcom config --help" for config details
 
 ## gemini
 
@@ -538,7 +598,7 @@ Usage:
 
     hcom gemini                    Opens new terminal
     hcom N gemini (N>1)            Opens new terminal windows
-    hcom N gemini "do task x"      initial regular prompt
+    hcom N gemini -i "do task x"   initial prompt (-i flag required)
     hcom N gemini --yolo           flags forwarded to gemini
     HCOM_TAG=api hcom 2 gemini     Group tag (creates api-*)
 
@@ -550,7 +610,13 @@ Environment:
     HCOM_HINTS                     Appended to all messages received
     HCOM_GEMINI_SYSTEM_PROMPT      Use this for system prompt
 
+
+Resume:
+  Get session_id: 'hcom list --stopped' or 'hcom archive'
+    hcom gemini --resume <session_id> -i 'reclaim identity' Resume stopped session
+
   Run "gemini --help" for Gemini CLI options
+  Run "hcom config --help" for config details
 
 ## codex
 
@@ -559,7 +625,7 @@ Usage:
 
     hcom codex                     Opens new terminal
     hcom N codex (N>1)             Opens new terminal windows
-    hcom N codex "do task x"       initial regular prompt
+    hcom N codex "do task x"       initial prompt (positional)
     hcom codex --sandbox danger-full-access flags forwarded to codex
     HCOM_TAG=api hcom 2 codex      Group tag (creates api-*)
 
@@ -571,7 +637,13 @@ Environment:
     HCOM_HINTS                     Appended to messages received
     HCOM_CODEX_SYSTEM_PROMPT       Use this for system prompt
 
+
+Resume:
+  Get session_id: 'hcom list --stopped' or 'hcom archive'
+    hcom codex resume <session_id> 'reclaim identity' Resume stopped session
+
   Run "codex --help" for Codex CLI options
+  Run "hcom config --help" for config details
 
 ## status
 

@@ -46,9 +46,7 @@ def _cmd_events_launch(argv: list[str], instance_name: str | None = None) -> int
 
     # Wait up to 30s for all instances to be ready
     start_time = time.time()
-    while (
-        status_data["ready"] < status_data["expected"] and time.time() - start_time < 30
-    ):
+    while status_data["ready"] < status_data["expected"] and time.time() - start_time < 30:
         time.sleep(0.5)
         if batch_id:
             status_data = get_launch_batch(batch_id)
@@ -86,11 +84,10 @@ def _cmd_events_launch(argv: list[str], instance_name: str | None = None) -> int
     if is_timeout:
         result["timed_out"] = True
         # Identify which batch(es) failed
-        batch_info = result.get("batch_id") or (
-            result.get("batches", ["?"])[0] if result.get("batches") else "?"
-        )
+        batch_info = result.get("batch_id") or (result.get("batches", ["?"])[0] if result.get("batches") else "?")
         result["hint"] = (
-            f"Launch failed: {status_data['ready']}/{status_data['expected']} ready after 30s (batch: {batch_info}). Check ~/.hcom/.tmp/logs/background_*.log or hcom list -v"
+            f"Launch failed: {status_data['ready']}/{status_data['expected']} ready after 30s "
+            f"(batch: {batch_info}). Check ~/.hcom/.tmp/logs/background_*.log or hcom list -v"
         )
     print(json.dumps(result))
 
@@ -246,9 +243,7 @@ def cmd_events(argv: list[str], *, ctx: CommandContext | None = None) -> int:
         # Check for matching events in last 10s (race condition window)
         from datetime import timezone
 
-        lookback_timestamp = datetime.fromtimestamp(
-            time.time() - 10, tz=timezone.utc
-        ).isoformat()
+        lookback_timestamp = datetime.fromtimestamp(time.time() - 10, tz=timezone.utc).isoformat()
         lookback_query = f"SELECT * FROM events_v WHERE timestamp > ?{filter_query} ORDER BY id DESC LIMIT 1"
 
         try:
@@ -338,9 +333,7 @@ def cmd_events(argv: list[str], *, ctx: CommandContext | None = None) -> int:
                     except Exception:
                         check_instance = None
                 if check_instance:
-                    messages, _ = get_unread_messages(
-                        check_instance, update_position=False
-                    )
+                    messages, _ = get_unread_messages(check_instance, update_position=False)
                     if messages:
                         # Notify without marking read; delivery happens via hooks or listen
                         print(build_listen_instruction(check_instance))
@@ -358,9 +351,7 @@ def cmd_events(argv: list[str], *, ctx: CommandContext | None = None) -> int:
                     # TCP select for instant local wake, or short sleep as fallback
                     if notify_server:
                         wait_time = min(remaining, 5.0)  # Check relay again every 5s
-                        readable, _, _ = select.select(
-                            [notify_server], [], [], wait_time
-                        )
+                        readable, _, _ = select.select([notify_server], [], [], wait_time)
                         if readable:
                             # Drain pending notifications
                             while True:
@@ -384,9 +375,7 @@ def cmd_events(argv: list[str], *, ctx: CommandContext | None = None) -> int:
                     try:
                         from ..core.db import delete_notify_endpoint
 
-                        delete_notify_endpoint(
-                            instance_name, kind="events_wait", port=notify_port
-                        )
+                        delete_notify_endpoint(instance_name, kind="events_wait", port=notify_port)
                     except Exception:
                         pass
 
@@ -549,7 +538,7 @@ def _events_sub(argv: list[str], caller_name: str | None = None, silent: bool = 
 
         # COLLISION SELF-RELEVANCE: Add caller-specific filtering for collision subscriptions
         # Only notify about collisions involving the caller (either as event instance or recent editor)
-        if 'collision' in filters:
+        if "collision" in filters:
             from ..core.filters import FILE_WRITE_CONTEXTS, _escape_sql
 
             caller_escaped = _escape_sql(caller)
@@ -599,9 +588,7 @@ def _events_sub(argv: list[str], caller_name: str | None = None, silent: bool = 
             print(f"Subscription {sub_id} created")
             # Show what it matches
             try:
-                test_count = conn.execute(
-                    f"SELECT COUNT(*) FROM events_v WHERE ({sql})"
-                ).fetchone()[0]
+                test_count = conn.execute(f"SELECT COUNT(*) FROM events_v WHERE ({sql})").fetchone()[0]
                 if test_count > 0:
                     print(f"  historical matches: {test_count} events")
             except Exception:
@@ -611,9 +598,7 @@ def _events_sub(argv: list[str], caller_name: str | None = None, silent: bool = 
 
     # No args = list subscriptions
     if not sql_parts:
-        rows = conn.execute(
-            "SELECT key, value FROM kv WHERE key LIKE 'events_sub:%'"
-        ).fetchall()
+        rows = conn.execute("SELECT key, value FROM kv WHERE key LIKE 'events_sub:%'").fetchall()
 
         if not rows:
             print("No active subscriptions")
@@ -643,9 +628,7 @@ def _events_sub(argv: list[str], caller_name: str | None = None, silent: bool = 
             else:
                 # Old SQL-based subscription
                 sql_display = sub.get("sql", "")
-                filter_display = (
-                    sql_display[:35] + "..." if len(sql_display) > 35 else sql_display
-                )
+                filter_display = sql_display[:35] + "..." if len(sql_display) > 35 else sql_display
 
             print(f"{sub['id']:<10} {sub['caller']:<12} {mode:<10} {filter_display}")
 
@@ -691,17 +674,13 @@ def _events_sub(argv: list[str], caller_name: str | None = None, silent: bool = 
                 caller = resolve_identity().name
             except Exception:
                 print(
-                    format_error(
-                        "Cannot create subscription without identity. Run 'hcom start' first or use --name."
-                    ),
+                    format_error("Cannot create subscription without identity. Run 'hcom start' first or use --name."),
                     file=sys.stderr,
                 )
                 return 1
 
     # Test against recent events to show what would match
-    test_count = conn.execute(
-        f"SELECT COUNT(*) FROM events_v WHERE ({sql})"
-    ).fetchone()[0]
+    test_count = conn.execute(f"SELECT COUNT(*) FROM events_v WHERE ({sql})").fetchone()[0]
 
     # Generate ID
     sub_id = f"sub-{sha256(f'{caller}{sql}{now}'.encode()).hexdigest()[:4]}"
@@ -731,9 +710,7 @@ def _events_sub(argv: list[str], caller_name: str | None = None, silent: bool = 
             f"SELECT timestamp, type, instance, data FROM events_v WHERE ({sql}) ORDER BY id DESC LIMIT 1"
         ).fetchone()
         if example:
-            print(
-                f"  latest match: [{example['type']}] {example['instance']} @ {example['timestamp'][:19]}"
-            )
+            print(f"  latest match: [{example['type']}] {example['instance']} @ {example['timestamp'][:19]}")
     else:
         print("  historical matches: 0 (filter will apply to future events only)")
         import re
@@ -744,14 +721,10 @@ def _events_sub(argv: list[str], caller_name: str | None = None, silent: bool = 
         for field in array_fields:
             # Match patterns like: field='value' or field = 'value' (but not LIKE)
             if re.search(rf"\b{field}\s*=\s*['\"]", sql, re.IGNORECASE):
-                print(
-                    f"  Warning: {field} is a JSON array - use LIKE '%name%' not ='name'"
-                )
+                print(f"  Warning: {field} is a JSON array - use LIKE '%name%' not ='name'")
 
         # Warn about json_extract paths that don't exist in recent events
-        paths = re.findall(
-            r"json_extract\s*\(\s*data\s*,\s*['\"](\$\.[^'\"]+)['\"]", sql
-        )
+        paths = re.findall(r"json_extract\s*\(\s*data\s*,\s*['\"](\$\.[^'\"]+)['\"]", sql)
         if paths:
             # Check which paths exist in recent events
             missing = []

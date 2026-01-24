@@ -81,12 +81,8 @@ CLAUDE_HCOM_HOOK_PATTERNS = [
     # Claude-specific legacy patterns
     re.compile(r"\bHCOM_ACTIVE.*hcom\.py"),  # LEGACY: Unix HCOM_ACTIVE conditional
     re.compile(r'IF\s+"%HCOM_ACTIVE%"'),  # LEGACY: Windows HCOM_ACTIVE conditional
-    re.compile(
-        rf'hcom\.py["\']?\s+({_CLAUDE_HOOK_ARGS_PATTERN})\b'
-    ),  # LEGACY: hcom.py with optional quote
-    re.compile(
-        rf'["\'][^"\']*hcom\.py["\']?\s+({_CLAUDE_HOOK_ARGS_PATTERN})\b(?=\s|$)'
-    ),  # LEGACY: Quoted path
+    re.compile(rf'hcom\.py["\']?\s+({_CLAUDE_HOOK_ARGS_PATTERN})\b'),  # LEGACY: hcom.py with optional quote
+    re.compile(rf'["\'][^"\']*hcom\.py["\']?\s+({_CLAUDE_HOOK_ARGS_PATTERN})\b(?=\s|$)'),  # LEGACY: Quoted path
     re.compile(r"sh\s+-c.*hcom"),  # LEGACY: Shell wrapper
 ]
 
@@ -104,9 +100,7 @@ def get_claude_settings_path() -> Path:
     return get_project_root() / ".claude" / "settings.json"
 
 
-def load_claude_settings(
-    settings_path: Path, default: Any = None
-) -> dict[str, Any] | None:
+def load_claude_settings(settings_path: Path, default: Any = None) -> dict[str, Any] | None:
     """Load and parse Claude settings JSON file with retry logic."""
     return read_file_with_retry(settings_path, lambda f: json.load(f), default=default)
 
@@ -145,9 +139,7 @@ def _remove_claude_hcom_hooks(settings: dict[str, Any]) -> bool:
         for matcher in settings["hooks"][event]:
             # Fail fast on malformed settings - Claude won't run with broken settings anyway
             if not isinstance(matcher, dict):
-                raise ValueError(
-                    f"Malformed settings: matcher in {event} is not a dict: {type(matcher).__name__}"
-                )
+                raise ValueError(f"Malformed settings: matcher in {event} is not a dict: {type(matcher).__name__}")
 
             # Validate hooks field if present
             if "hooks" in matcher and not isinstance(matcher["hooks"], list):
@@ -163,10 +155,7 @@ def _remove_claude_hcom_hooks(settings: dict[str, Any]) -> bool:
             non_hcom_hooks = [
                 hook
                 for hook in original_hooks
-                if not any(
-                    pattern.search(hook.get("command", ""))
-                    for pattern in CLAUDE_HCOM_HOOK_PATTERNS
-                )
+                if not any(pattern.search(hook.get("command", "")) for pattern in CLAUDE_HCOM_HOOK_PATTERNS)
             ]
 
             # Track if any hooks were removed
@@ -198,14 +187,10 @@ def _remove_claude_hcom_hooks(settings: dict[str, Any]) -> bool:
 
     # Remove hcom permission patterns
     if "permissions" in settings and isinstance(settings["permissions"], dict):
-        if "allow" in settings["permissions"] and isinstance(
-            settings["permissions"]["allow"], list
-        ):
+        if "allow" in settings["permissions"] and isinstance(settings["permissions"]["allow"], list):
             original_len = len(settings["permissions"]["allow"])
             settings["permissions"]["allow"] = [
-                p
-                for p in settings["permissions"]["allow"]
-                if p not in CLAUDE_HCOM_PERMISSIONS
+                p for p in settings["permissions"]["allow"] if p not in CLAUDE_HCOM_PERMISSIONS
             ]
             if len(settings["permissions"]["allow"]) < original_len:
                 removed_any = True
@@ -285,14 +270,10 @@ def setup_claude_hooks(include_permissions: bool = True) -> bool:
     # Build hook commands from CLAUDE_HOOK_CONFIGS
     for hook_type, matcher, cmd_suffix, timeout in CLAUDE_HOOK_CONFIGS:
         # Initialize or normalize hook_type to list (handle malformed values)
-        if hook_type not in settings["hooks"] or not isinstance(
-            settings["hooks"][hook_type], list
-        ):
+        if hook_type not in settings["hooks"] or not isinstance(settings["hooks"][hook_type], list):
             settings["hooks"][hook_type] = []
 
-        hook_dict: dict[str, Any] = {
-            "hooks": [{"type": "command", "command": f"{hook_cmd_base} {cmd_suffix}"}]
-        }
+        hook_dict: dict[str, Any] = {"hooks": [{"type": "command", "command": f"{hook_cmd_base} {cmd_suffix}"}]}
 
         # Only include matcher field if non-empty (PreToolUse/PostToolUse use matchers)
         if matcher:
@@ -324,9 +305,7 @@ def setup_claude_hooks(include_permissions: bool = True) -> bool:
         # Remove hcom permissions if disabled
         if "permissions" in settings and "allow" in settings["permissions"]:
             settings["permissions"]["allow"] = [
-                p
-                for p in settings["permissions"]["allow"]
-                if p not in CLAUDE_HCOM_PERMISSIONS
+                p for p in settings["permissions"]["allow"] if p not in CLAUDE_HCOM_PERMISSIONS
             ]
             if not settings["permissions"]["allow"]:
                 del settings["permissions"]["allow"]
@@ -340,17 +319,13 @@ def setup_claude_hooks(include_permissions: bool = True) -> bool:
         raise Exception(f"Cannot write settings: {e}")
 
     # Quick verification
-    if not verify_claude_hooks_installed(
-        settings_path, check_permissions=include_permissions
-    ):
+    if not verify_claude_hooks_installed(settings_path, check_permissions=include_permissions):
         raise Exception("Hook installation failed verification")
 
     return True
 
 
-def _verify_claude_hooks_at(
-    settings_path: Path, check_permissions: bool = True
-) -> bool:
+def _verify_claude_hooks_at(settings_path: Path, check_permissions: bool = True) -> bool:
     """Verify hcom hooks at a specific settings path. Returns True if all checks pass."""
     try:
         settings = load_claude_settings(settings_path, default=None)
@@ -375,9 +350,7 @@ def _verify_claude_hooks_at(
                 for hook in matcher_dict.get("hooks", []):
                     command = hook.get("command", "")
                     # Check for HCOM and the correct subcommand
-                    if (
-                        "${HCOM}" in command or "hcom" in command.lower()
-                    ) and cmd_suffix in command:
+                    if ("${HCOM}" in command or "hcom" in command.lower()) and cmd_suffix in command:
                         # Found HCOM hook - verify all properties
                         if hcom_hook_found:
                             # Duplicate HCOM hook
@@ -416,9 +389,7 @@ def _verify_claude_hooks_at(
         return False
 
 
-def verify_claude_hooks_installed(
-    settings_path: Path | None = None, check_permissions: bool = True
-) -> bool:
+def verify_claude_hooks_installed(settings_path: Path | None = None, check_permissions: bool = True) -> bool:
     """Verify that hcom hooks are correctly installed in Claude settings.
 
     Checks:

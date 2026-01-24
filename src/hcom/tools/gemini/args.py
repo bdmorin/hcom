@@ -57,13 +57,15 @@ _SUBCOMMAND_ALIASES: Final[Mapping[str, str]] = {
 }
 
 # All known subcommands (from gemini --help)
-_SUBCOMMANDS: Final[frozenset[str]] = frozenset({
-    "mcp",
-    "extensions",
-    "extension",  # extension is alias
-    "hooks",
-    "hook",  # hook is alias
-})
+_SUBCOMMANDS: Final[frozenset[str]] = frozenset(
+    {
+        "mcp",
+        "extensions",
+        "extension",  # extension is alias
+        "hooks",
+        "hook",  # hook is alias
+    }
+)
 
 # Flag aliases: map short forms to canonical long forms
 _FLAG_ALIASES: Final[Mapping[str, str]] = {
@@ -82,82 +84,92 @@ _FLAG_ALIASES: Final[Mapping[str, str]] = {
 }
 
 # Boolean flags (no value required)
-_BOOLEAN_FLAGS: Final[frozenset[str]] = frozenset({
-    # Global
-    "-d",
-    "--debug",
-    "-s",
-    "--sandbox",
-    "-y",
-    "--yolo",
-    "-l",
-    "--list-extensions",
-    "--list-sessions",
-    "--screen-reader",
-    "-v",
-    "--version",
-    "-h",
-    "--help",
-    "--experimental-acp",
-})
+_BOOLEAN_FLAGS: Final[frozenset[str]] = frozenset(
+    {
+        # Global
+        "-d",
+        "--debug",
+        "-s",
+        "--sandbox",
+        "-y",
+        "--yolo",
+        "-l",
+        "--list-extensions",
+        "--list-sessions",
+        "--screen-reader",
+        "-v",
+        "--version",
+        "-h",
+        "--help",
+        "--experimental-acp",
+    }
+)
 
 # Flags that require a following value
-_VALUE_FLAGS: Final[frozenset[str]] = frozenset({
-    # Global (short and long forms)
-    "-m",
-    "--model",
-    "-p",
-    "--prompt",
-    "-i",
-    "--prompt-interactive",
-    "--approval-mode",
-    "--allowed-mcp-server-names",
-    "--allowed-tools",
-    "-e",
-    "--extensions",
-    "--delete-session",
-    "--include-directories",
-    "-o",
-    "--output-format",
-})
+_VALUE_FLAGS: Final[frozenset[str]] = frozenset(
+    {
+        # Global (short and long forms)
+        "-m",
+        "--model",
+        "-p",
+        "--prompt",
+        "-i",
+        "--prompt-interactive",
+        "--approval-mode",
+        "--allowed-mcp-server-names",
+        "--allowed-tools",
+        "-e",
+        "--extensions",
+        "--delete-session",
+        "--include-directories",
+        "-o",
+        "--output-format",
+    }
+)
 # Note: --resume/-r moved to _OPTIONAL_VALUE_FLAGS
 
 # Flags with = syntax prefixes
-_VALUE_FLAG_PREFIXES: Final[frozenset[str]] = frozenset({
-    "-m=",
-    "--model=",
-    "-p=",
-    "--prompt=",
-    "-i=",
-    "--prompt-interactive=",
-    "--approval-mode=",
-    "--allowed-mcp-server-names=",
-    "--allowed-tools=",
-    "-e=",
-    "--extensions=",
-    "-r=",
-    "--resume=",
-    "--delete-session=",
-    "--include-directories=",
-    "-o=",
-    "--output-format=",
-})
+_VALUE_FLAG_PREFIXES: Final[frozenset[str]] = frozenset(
+    {
+        "-m=",
+        "--model=",
+        "-p=",
+        "--prompt=",
+        "-i=",
+        "--prompt-interactive=",
+        "--approval-mode=",
+        "--allowed-mcp-server-names=",
+        "--allowed-tools=",
+        "-e=",
+        "--extensions=",
+        "-r=",
+        "--resume=",
+        "--delete-session=",
+        "--include-directories=",
+        "-o=",
+        "--output-format=",
+    }
+)
 
 # Repeatable flags (can appear multiple times)
-_REPEATABLE_FLAGS: Final[frozenset[str]] = frozenset({
-    "-e",
-    "--extensions",
-    "--include-directories",
-    "--allowed-mcp-server-names",
-    "--allowed-tools",
-})
+_REPEATABLE_FLAGS: Final[frozenset[str]] = frozenset(
+    {
+        "-e",
+        "--extensions",
+        "--include-directories",
+        "--allowed-mcp-server-names",
+        "--allowed-tools",
+    }
+)
 
 # Optional value flags (can be used with or without a value)
 # Per gemini docs: --resume [session_id] defaults to "latest" if omitted
-_OPTIONAL_VALUE_FLAGS: Final[frozenset[str]] = frozenset({
-    "--resume",
-    "-r",
-})
+_OPTIONAL_VALUE_FLAGS: Final[frozenset[str]] = frozenset(
+    {
+        "--resume",
+        "-r",
+    }
+)
 
 _KNOWN_GEMINI_FLAGS: Final[list[str]] = sorted(
     {
@@ -335,17 +347,13 @@ def resolve_gemini_args(
         try:
             tokens = shlex.split(env_value)
         except ValueError as err:
-            return _parse_tokens(
-                [], "env", initial_errors=[f"invalid Gemini args: {err}"]
-            )
+            return _parse_tokens([], "env", initial_errors=[f"invalid Gemini args: {err}"])
         return _parse_tokens(tokens, "env")
 
     return _parse_tokens([], "none")
 
 
-def merge_gemini_args(
-    env_spec: GeminiArgsSpec, cli_spec: GeminiArgsSpec
-) -> GeminiArgsSpec:
+def merge_gemini_args(env_spec: GeminiArgsSpec, cli_spec: GeminiArgsSpec) -> GeminiArgsSpec:
     """Merge env and CLI specs with smart precedence rules.
 
     Rules:
@@ -358,9 +366,7 @@ def merge_gemini_args(
         Merged GeminiArgsSpec with CLI taking precedence
     """
     # Determine subcommand (CLI wins if specified)
-    final_subcommand = (
-        cli_spec.subcommand if cli_spec.subcommand else env_spec.subcommand
-    )
+    final_subcommand = cli_spec.subcommand if cli_spec.subcommand else env_spec.subcommand
 
     # Handle positionals: CLI replaces env (if present)
     if cli_spec.positional_tokens:
@@ -452,18 +458,12 @@ def validate_conflicts(spec: GeminiArgsSpec) -> list[str]:
 
     # --prompt with positional prompt is invalid (already caught above, but keep for completeness)
     if has_prompt_flag and spec.positional_tokens:
-        warnings.append(
-            "ERROR: --prompt cannot be used with a positional query argument"
-        )
+        warnings.append("ERROR: --prompt cannot be used with a positional query argument")
 
     # --prompt with --prompt-interactive is invalid
-    has_prompt_interactive = spec.has_flag(
-        ["-i", "--prompt-interactive"], ("-i=", "--prompt-interactive=")
-    )
+    has_prompt_interactive = spec.has_flag(["-i", "--prompt-interactive"], ("-i=", "--prompt-interactive="))
     if has_prompt_flag and has_prompt_interactive:
-        warnings.append(
-            "ERROR: --prompt and --prompt-interactive cannot be used together"
-        )
+        warnings.append("ERROR: --prompt and --prompt-interactive cannot be used together")
 
     # Validate --approval-mode enum values
     approval_value = spec.get_flag_value("--approval-mode")
@@ -472,20 +472,12 @@ def validate_conflicts(spec: GeminiArgsSpec) -> list[str]:
         and isinstance(approval_value, str)
         and approval_value.lower() not in ("default", "auto_edit", "yolo")
     ):
-        warnings.append(
-            f"ERROR: invalid --approval-mode value '{approval_value}' (must be: default, auto_edit, yolo)"
-        )
+        warnings.append(f"ERROR: invalid --approval-mode value '{approval_value}' (must be: default, auto_edit, yolo)")
 
     # Validate --output-format enum values
     output_value = spec.get_flag_value("--output-format")
-    if (
-        output_value
-        and isinstance(output_value, str)
-        and output_value.lower() not in ("text", "json", "stream-json")
-    ):
-        warnings.append(
-            f"ERROR: invalid --output-format value '{output_value}' (must be: text, json, stream-json)"
-        )
+    if output_value and isinstance(output_value, str) and output_value.lower() not in ("text", "json", "stream-json"):
+        warnings.append(f"ERROR: invalid --output-format value '{output_value}' (must be: text, json, stream-json)")
 
     return warnings
 
@@ -608,9 +600,7 @@ def _parse_tokens(
             if i + 1 < len(tokens):
                 next_token = tokens[i + 1]
                 next_lower = next_token.lower()
-                if not _looks_like_flag(next_lower) and _looks_like_session_id(
-                    next_token
-                ):
+                if not _looks_like_flag(next_lower) and _looks_like_session_id(next_token):
                     # Has a session ID value, consume it
                     flag_values[token_lower] = next_token
                     clean.append(next_token)
@@ -677,24 +667,18 @@ def _parse_tokens(
         idx = len(clean)
         clean.append(token)
         if token_lower.startswith("--") or (
-            token_lower.startswith("-")
-            and len(token_lower) == 2
-            and token_lower[1].isalpha()
+            token_lower.startswith("-") and len(token_lower) == 2 and token_lower[1].isalpha()
         ):
             if not _looks_like_flag(token_lower):
                 base = token.split("=", 1)[0]
-                suggested = difflib.get_close_matches(
-                    base, _KNOWN_GEMINI_FLAGS, n=1, cutoff=0.6
-                )
+                suggested = difflib.get_close_matches(base, _KNOWN_GEMINI_FLAGS, n=1, cutoff=0.6)
                 if suggested:
                     errors.append(
                         f"unknown option '{token}' (did you mean {suggested[0]}?). "
                         "If this was prompt text, pass '--' before it."
                     )
                 else:
-                    errors.append(
-                        f"unknown option '{token}'. If this was prompt text, pass '--' before it."
-                    )
+                    errors.append(f"unknown option '{token}'. If this was prompt text, pass '--' before it.")
                 i += 1
                 continue
 

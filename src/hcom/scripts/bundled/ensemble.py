@@ -448,9 +448,7 @@ Examples:
             system_prompt=system_prompt,
             cwd=workspace,
         )
-        print(
-            f"  Launched coder{i} ({style['name']} style, {args.tool}) → {my_folder}/"
-        )
+        print(f"  Launched coder{i} ({style['name']} style, {args.tool}) → {my_folder}/")
 
     # Launch judge
     if not args.no_judge:

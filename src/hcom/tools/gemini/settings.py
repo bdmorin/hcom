@@ -178,9 +178,7 @@ def get_gemini_settings_path() -> Path:
     return get_project_root() / ".gemini" / "settings.json"
 
 
-def load_gemini_settings(
-    settings_path: Path | None = None, default: Any = None
-) -> dict[str, Any] | None:
+def load_gemini_settings(settings_path: Path | None = None, default: Any = None) -> dict[str, Any] | None:
     """Load and parse Gemini settings JSON file with retry logic."""
     if settings_path is None:
         settings_path = get_gemini_settings_path()
@@ -193,10 +191,7 @@ def _is_hcom_hook(hook: dict) -> bool:
     """Check if a hook dict is an hcom hook."""
     command = hook.get("command", "")
     name = hook.get("name", "")
-    return any(
-        pattern.search(command) or pattern.search(name)
-        for pattern in GEMINI_HCOM_HOOK_PATTERNS
-    )
+    return any(pattern.search(command) or pattern.search(name) for pattern in GEMINI_HCOM_HOOK_PATTERNS)
 
 
 def _remove_hcom_hooks_from_gemini_settings(settings: dict[str, Any]) -> None:
@@ -230,11 +225,7 @@ def _remove_hcom_hooks_from_gemini_settings(settings: dict[str, Any]) -> None:
             matcher_copy = copy.deepcopy(matcher)
 
             # Filter out only hcom hooks
-            non_hcom_hooks = [
-                hook
-                for hook in matcher_copy.get("hooks", [])
-                if not _is_hcom_hook(hook)
-            ]
+            non_hcom_hooks = [hook for hook in matcher_copy.get("hooks", []) if not _is_hcom_hook(hook)]
 
             if non_hcom_hooks:
                 # Has user hooks - keep matcher with filtered hooks
@@ -261,9 +252,7 @@ def _remove_hcom_hooks_from_gemini_settings(settings: dict[str, Any]) -> None:
     if "tools" in settings and isinstance(settings["tools"], dict):
         allowed = settings["tools"].get("allowed")
         if isinstance(allowed, list):
-            settings["tools"]["allowed"] = [
-                p for p in allowed if p not in GEMINI_HCOM_PERMISSIONS
-            ]
+            settings["tools"]["allowed"] = [p for p in allowed if p not in GEMINI_HCOM_PERMISSIONS]
             if not settings["tools"]["allowed"]:
                 del settings["tools"]["allowed"]
 
@@ -325,11 +314,7 @@ def setup_gemini_hooks(include_permissions: bool = True) -> bool:
     else:
         # Remove hcom permissions if disabled
         if "allowed" in settings["tools"]:
-            settings["tools"]["allowed"] = [
-                p
-                for p in settings["tools"]["allowed"]
-                if p not in GEMINI_HCOM_PERMISSIONS
-            ]
+            settings["tools"]["allowed"] = [p for p in settings["tools"]["allowed"] if p not in GEMINI_HCOM_PERMISSIONS]
             if not settings["tools"]["allowed"]:
                 del settings["tools"]["allowed"]
 
@@ -378,9 +363,7 @@ def setup_gemini_hooks(include_permissions: bool = True) -> bool:
     return verify_gemini_hooks_installed(check_permissions=include_permissions)
 
 
-def _verify_gemini_hooks_at(
-    settings_path: Path, check_permissions: bool = True
-) -> bool:
+def _verify_gemini_hooks_at(settings_path: Path, check_permissions: bool = True) -> bool:
     """Verify hcom hooks at a specific settings path. Returns True if all checks pass."""
     try:
         settings = load_gemini_settings(settings_path, default=None)
@@ -487,9 +470,7 @@ def verify_gemini_hooks_installed(check_permissions: bool = True) -> bool:
 
     Returns True if all checks pass.
     """
-    return _verify_gemini_hooks_at(
-        get_gemini_settings_path(), check_permissions=check_permissions
-    )
+    return _verify_gemini_hooks_at(get_gemini_settings_path(), check_permissions=check_permissions)
 
 
 def _remove_gemini_hooks_from_path(settings_path: Path) -> bool:

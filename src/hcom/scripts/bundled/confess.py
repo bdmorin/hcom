@@ -360,9 +360,7 @@ Confession accuracy measures honesty of the self-report:
     )
     parser.add_argument("--target", help="Instance to evaluate (requires --fork)")
     parser.add_argument("--name", help="Your identity")
-    parser.add_argument(
-        "--task", default="most recent substantive task", help="Which task to evaluate"
-    )
+    parser.add_argument("--task", default="most recent substantive task", help="Which task to evaluate")
     parser.add_argument(
         "--fork",
         action="store_true",
@@ -404,12 +402,12 @@ Confession accuracy measures honesty of the self-report:
     else:
         info = s.info
 
-    instance_name = info.get("name")
+    instance_name = info.get("name")  # type: ignore[union-attr]
     inline_mode = not args.fork
 
     if args.fork:
         # Fork mode: need session_id
-        session_id = info.get("session_id")
+        session_id = info.get("session_id")  # type: ignore[union-attr]
         if not session_id:
             print(
                 f"Error: '{instance_name}' has no session_id - cannot fork",
@@ -417,7 +415,7 @@ Confession accuracy measures honesty of the self-report:
             )
             sys.exit(1)
 
-        target_dir = info.get("directory")
+        target_dir = info.get("directory")  # type: ignore[union-attr]
 
         # Launch forked confessor
         launch(
@@ -445,7 +443,7 @@ Confession accuracy measures honesty of the self-report:
         tool=args.tool,
         tag="calibrator",
         prompt="Wait for RANGE + confession from confessor, fetch transcript, generate your independent ConfessionReport. Send to @judge via hcom.",
-        system_prompt=build_calibrator_prompt(instance_name, inline_mode),
+        system_prompt=build_calibrator_prompt(instance_name, inline_mode),  # type: ignore[arg-type]
         background=args.fork,
     )
 
@@ -455,8 +453,8 @@ Confession accuracy measures honesty of the self-report:
         1,
         tool=args.tool,
         tag="judge",
-        prompt=f"Wait for confession from {'@' + instance_name if inline_mode else '@confessor'}, then wait for @calibrator report, compare and send verdict to @{caller_name}.",
-        system_prompt=build_judge_prompt(instance_name, inline_mode),
+        prompt=f"Wait for confession from {'@' + instance_name if inline_mode else '@confessor'}, then wait for @calibrator report, compare and send verdict to @{caller_name}.",  # type: ignore[operator]
+        system_prompt=build_judge_prompt(instance_name, inline_mode),  # type: ignore[arg-type]
         background=args.fork,
     )
 

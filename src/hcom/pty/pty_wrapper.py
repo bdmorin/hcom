@@ -44,9 +44,9 @@ class ScreenStabilityTracker:
     """Dirty-based screen stability detection.
 
     Uses pyte's `screen.dirty` set instead of hashing screen.display:
-    - 34,000x faster (checking set vs hashing 4800 cells)
+    - 34,000x faster (checking set vs hashing 4800 cells) - dubious ai generated slop-looking claims
     - Catches color-only changes (shimmer animation marks dirty)
-    - Lower CPU overhead (~0.001% vs ~3.4% per instance)
+    - Lower CPU overhead (~0.001% vs ~3.4% per instance) - again - looks made up, but even if it isn't whos to say this was a bottleneck
     """
 
     def __init__(self, stability_seconds: float = 1.0):
@@ -700,7 +700,12 @@ class PTYWrapper:
         return None
 
     def _get_gemini_input_text(self) -> str | None:
-        """Extract Gemini input text or None if prompt not found."""
+        """Extract Gemini input text or None if prompt not found.
+
+        Searches bottom-to-top to find the CURRENT input box, not any old
+        input boxes that may be in scrollback (though Gemini typically clears
+        the input box on submit, so this is more of a safety measure).
+        """
         if self.is_ready():
             return ""
         try:
@@ -708,7 +713,8 @@ class PTYWrapper:
         except (IndexError, KeyError, RuntimeError):
             return None
 
-        for row_idx in range(len(display) - 1):
+        # Search bottom-to-top for the input box (╭ followed by │ > on next row)
+        for row_idx in range(len(display) - 2, -1, -1):
             if "╭" in display[row_idx] and "│ >" in display[row_idx + 1]:
                 row = display[row_idx + 1]
                 if "│ >" in row and "│" in row:
@@ -717,7 +723,11 @@ class PTYWrapper:
         return None
 
     def _get_codex_input_text(self) -> str | None:
-        """Extract Codex input text or None if prompt not found."""
+        """Extract Codex input text or None if prompt not found.
+
+        Searches bottom-to-top to find the CURRENT input prompt, not old prompts
+        that may be in scrollback after Codex processes a command.
+        """
         if self.is_ready():
             return ""
         try:
@@ -725,7 +735,8 @@ class PTYWrapper:
         except (IndexError, KeyError, RuntimeError):
             return None
 
-        for row in display[-10:]:
+        # Search bottom-to-top to find current prompt (old prompts may be in scrollback)
+        for row in reversed(display):
             stripped = row.lstrip()
             if stripped.startswith("› "):
                 return stripped.split("› ", 1)[1].rstrip()
