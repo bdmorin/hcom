@@ -1,14 +1,12 @@
 {
   "name": "hcom",
   "version": "1.0.0",
-  "description": "Multi-agent communication for AI CLI tools",
+  "description": "Real-time messaging and context sharing for AI coding agents (Claude Code, Gemini CLI, Codex)",
   "author": {
-    "name": "aannoo",
-    "url": "https://github.com/aannoo"
+    "name": "aannoo"
   },
   "homepage": "https://github.com/aannoo/hcom",
   "repository": "https://github.com/aannoo/hcom",
   "license": "MIT",
-  "keywords": ["hcom", "multi-agent", "communication", "claude", "gemini", "codex"],
-  "skills": "../../skills/"
+  "keywords": ["hcom", "multi-agent", "communication", "claude", "gemini", "codex"]
 }

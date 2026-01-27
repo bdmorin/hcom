@@ -1,16 +1,21 @@
 {
+  "$schema": "https://anthropic.com/claude-code/marketplace.schema.json",
   "name": "hcom",
-  "owner": {
-    "name": "aannoo",
-    "url": "https://github.com/aannoo"
-  },
+  "version": "1.0.0",
   "description": "Multi-agent communication for AI CLI tools (Claude Code, Gemini CLI, Codex)",
-  "homepage": "https://github.com/aannoo/hcom",
+  "metadata": {
+    "description": "Multi-agent communication for AI CLI tools (Claude Code, Gemini CLI, Codex)"
+  },
+  "owner": {
+    "name": "aannoo"
+  },
   "plugins": [
     {
       "name": "hcom",
       "source": "./plugin/hcom",
-      "description": "Real-time messaging and context sharing for AI coding agents with hooks integration"
+      "description": "Real-time messaging and context sharing for AI coding agents (Claude Code, Gemini CLI, Codex)",
+      "category": "productivity",
+      "homepage": "https://github.com/aannoo/hcom"
     }
   ]
 }
