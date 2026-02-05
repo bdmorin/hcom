@@ -102,7 +102,7 @@ class Session:
         Args:
             message: Message text. Use @name or @prefix- for targeting.
             to: Target name (auto-prepends @name if not in message).
-            intent: One of 'request', 'inform', 'ack', 'error'.
+            intent: One of 'request', 'inform', 'ack'.
             reply_to: Event ID to reply to (required for intent='ack').
             thread: Thread name for grouping related messages.
             bundle: Bundle dict to create and attach. If provided, creates bundle event
@@ -178,6 +178,13 @@ class Session:
 
             # Create bundle event
             bundle_id = create_bundle_event(bundle, instance=bundle_instance, created_by=identity.name)
+            try:
+                from .relay import notify_relay, push
+
+                if not notify_relay():
+                    push()
+            except Exception:
+                pass
             envelope["bundle_id"] = bundle_id
 
             # Append bundle summary to message
@@ -222,7 +229,7 @@ class Session:
                 text (str): Message text content.
                 mentions (list[str]): Instance names mentioned in message.
                 delivered_to (list[str]): Instance names message was delivered to.
-                intent (str, optional): Message intent ('request', 'inform', 'ack', 'error').
+                intent (str, optional): Message intent ('request', 'inform', 'ack').
                 thread (str, optional): Thread name for grouping messages.
                 reply_to (int, optional): Event ID this message replies to.
         """
@@ -691,6 +698,152 @@ def instances(name: str | None = None) -> list[dict] | dict:
 
 
 def launch(
+    count: int | list[dict] = 1,
+    *,
+    tool: str = "claude",
+    tag: str | None = None,
+    prompt: str | None = None,
+    system_prompt: str | None = None,
+    background: bool = False,
+    claude_args: str | None = None,
+    resume: str | None = None,
+    fork: bool = False,
+    tool_args: str | None = None,
+    cwd: str | None = None,
+    wait: bool = True,
+    timeout: int = 30,
+    batch_id: str | None = None,
+    name: str | None = None,
+) -> dict:
+    """Launch AI tool instances.
+
+    Two calling modes:
+
+    Single launch:
+        hcom.launch(3, tag="worker", prompt="do task")
+        hcom.launch(1, tool="gemini", prompt="review code")
+
+    Group launch (heterogeneous agents, shared batch):
+        hcom.launch([
+            {"tag": "confessor", "prompt": "...", "background": True},
+            {"tool": "gemini", "tag": "calibrator", "prompt": "..."},
+            {"tool": "gemini", "tag": "judge", "prompt": "..."},
+        ])
+
+    Args:
+        count: Number of instances (int) or list of spec dicts.
+        tool: One of 'claude', 'gemini', 'codex' (single mode).
+        tag: Group tag (single mode).
+        prompt: Initial prompt (single mode).
+        system_prompt: System prompt override (single mode).
+        background: If True, run headless (single mode).
+        claude_args: Additional Claude CLI args (single mode).
+        resume: Session ID to resume from (single mode).
+        fork: If True with resume, fork instead of continue (single mode).
+        tool_args: Additional tool-specific args (single mode).
+        cwd: Working directory (single mode).
+        wait: If True (default), block until all instances are ready or timeout.
+        timeout: Max seconds to wait when wait=True.
+        batch_id: Share a batch ID across multiple launch() calls for wait-for-all.
+        name: Explicit instance name (single mode). Used for resume to reuse
+            the stopped instance's name. Requires count=1 and name must not
+            be in use by an active instance.
+
+    Spec dict keys (group mode):
+        count (int): Number of instances, default 1.
+        tool (str): 'claude', 'gemini', or 'codex', default 'claude'.
+        tag, prompt, system_prompt, background, claude_args,
+        resume, fork, tool_args, cwd: Same as single mode args.
+
+    Returns:
+        Single mode: Dict with tool, batch_id, launched, failed, background,
+            log_files, handles, errors, launch_status (if wait=True).
+        Group mode: Dict with batch_id, results (list of per-spec dicts),
+            total_launched, total_failed, launch_status (if wait=True).
+
+    Raises:
+        HcomError: On invalid tool, hook setup failure, or launch failure.
+    """
+    if isinstance(count, list):
+        return _launch_group(count, wait=wait, timeout=timeout)
+
+    return _launch_single(
+        count,
+        tool=tool,
+        tag=tag,
+        prompt=prompt,
+        system_prompt=system_prompt,
+        background=background,
+        claude_args=claude_args,
+        resume=resume,
+        fork=fork,
+        tool_args=tool_args,
+        cwd=cwd,
+        wait=wait,
+        timeout=timeout,
+        name=name,
+        batch_id=batch_id,
+    )
+
+
+def _launch_group(
+    specs: list[dict],
+    *,
+    wait: bool = True,
+    timeout: int = 30,
+) -> dict:
+    """Launch heterogeneous agents from a list of spec dicts with a shared batch."""
+    import uuid
+
+    if not specs:
+        raise HcomError("Empty specs list")
+
+    _VALID_SPEC_KEYS = {
+        "count", "tool", "tag", "prompt", "system_prompt", "background",
+        "claude_args", "resume", "fork", "tool_args", "cwd",
+    }
+
+    shared_batch = str(uuid.uuid4()).split("-")[0]
+    results = []
+    total_launched = 0
+    total_failed = 0
+
+    for i, spec in enumerate(specs):
+        if not isinstance(spec, dict):
+            raise HcomError(f"Spec at index {i} must be a dict, got {type(spec).__name__}")
+        bad_keys = set(spec) - _VALID_SPEC_KEYS
+        if bad_keys:
+            raise HcomError(f"Spec at index {i} has invalid keys: {bad_keys}")
+        spec = dict(spec)  # copy to avoid mutation
+        count = spec.pop("count", 1)
+        # Never wait per-spec — we wait once at the end
+        result = _launch_single(
+            count,
+            wait=False,
+            batch_id=shared_batch,
+            **spec,
+        )
+        results.append(result)
+        total_launched += result.get("launched", 0)
+        total_failed += result.get("failed", 0)
+
+    out: dict[str, Any] = {
+        "batch_id": shared_batch,
+        "results": results,
+        "total_launched": total_launched,
+        "total_failed": total_failed,
+    }
+
+    if wait:
+        _ensure_init()
+        from .core.launch_status import wait_for_launch as _wait
+
+        out["launch_status"] = _wait(batch_id=shared_batch, timeout=timeout)
+
+    return out
+
+
+def _launch_single(
     count: int = 1,
     *,
     tool: str = "claude",
@@ -703,44 +856,12 @@ def launch(
     fork: bool = False,
     tool_args: str | None = None,
     cwd: str | None = None,
+    wait: bool = True,
+    timeout: int = 30,
+    batch_id: str | None = None,
+    name: str | None = None,
 ) -> dict:
-    """Launch AI tool instances.
-
-    Args:
-        count: Number of instances to launch.
-        tool: One of 'claude', 'gemini', 'codex'.
-        tag: Group tag (instances named tag-0, tag-1, ...).
-        prompt: Initial prompt for all instances.
-        system_prompt: System prompt override.
-        background: If True, run headless (Claude only).
-        claude_args: Additional Claude CLI args as string.
-        resume: Session ID to resume from.
-        fork: If True with resume, fork instead of continue.
-        tool_args: Additional tool-specific args as string.
-        cwd: Working directory for instances.
-
-    Returns:
-        Dict with keys:
-            tool (str): Normalized tool name ('claude', 'gemini', 'codex').
-            batch_id (str): UUID identifying this launch batch.
-            launched (int): Number of instances successfully launched.
-            failed (int): Number of instances that failed to launch.
-            background (bool): Whether instances were launched in background mode.
-            log_files (list[str]): Paths to background log files (empty for interactive).
-            handles (list[dict]): Info about launched instances, each with
-                {"tool": str, "instance_name": str}.
-            errors (list[dict]): Info about failed launches, each with
-                {"tool": str, "error": str}. Hook setup failures raise HcomError
-                instead of returning errors.
-
-    Raises:
-        HcomError: On invalid tool, hook setup failure, or launch failure.
-
-    Examples:
-        hcom.launch(3, tag="worker", prompt="do task")
-        hcom.launch(1, tool="gemini", prompt="review code")
-        hcom.launch(1, resume="abc123", fork=True)
-    """
+    """Launch instances of a single tool. Internal — called by launch()."""
     from .core.config import get_config
     from .launcher import launch as unified_launch
     import shlex
@@ -804,7 +925,7 @@ def launch(
 
         use_pty = (tool == "claude-pty") or (not spec.is_background and not IS_WINDOWS)
 
-        return unified_launch(
+        result = unified_launch(
             tool,
             count,
             spec.rebuild_tokens(),
@@ -813,7 +934,16 @@ def launch(
             pty=use_pty,
             launcher="api",
             cwd=cwd,
+            batch_id=batch_id,
+            name=name,
         )
+        if wait and result.get("batch_id"):
+            from .core.launch_status import wait_for_launch
+
+            result["launch_status"] = wait_for_launch(
+                batch_id=result["batch_id"], timeout=timeout
+            )
+        return result
 
     if tool not in ("gemini", "codex"):
         raise HcomError(f"Unknown tool: {tool}")
@@ -859,7 +989,7 @@ def launch(
             codex_spec = codex_spec.update(prompt=prompt)
         args_list = codex_spec.rebuild_tokens()
 
-    return unified_launch(
+    result = unified_launch(
         tool,
         count,
         args_list,
@@ -868,7 +998,37 @@ def launch(
         background=background,
         launcher="api",
         cwd=cwd,
+        batch_id=batch_id,
+        name=name,
     )
+    if wait and result.get("batch_id"):
+        from .core.launch_status import wait_for_launch
+
+        result["launch_status"] = wait_for_launch(
+            batch_id=result["batch_id"], timeout=timeout
+        )
+    return result
+
+
+def wait_for_launch(
+    batch_id: str | None = None,
+    timeout: int = 30,
+) -> dict:
+    """Wait for a launch batch to be ready.
+
+    Prefer using launch(specs_list, wait=True) for group launches.
+    This function remains for cases where you need manual batch_id coordination.
+
+    Args:
+        batch_id: Batch ID from launch(batch_id=X, wait=False) calls.
+        timeout: Max seconds to wait.
+
+    Returns:
+        Dict with status ("ready"|"timeout"|"error"|"no_launches"), expected, ready, instances.
+    """
+    _ensure_init()
+    from .core.launch_status import wait_for_launch as _wait
+    return _wait(batch_id=batch_id, timeout=timeout)
 
 
 def bundle(
@@ -1038,7 +1198,15 @@ def bundle(
         else:
             inst = identity.name
 
-        return create_bundle_event(bundle_data, instance=inst, created_by=identity.name)
+        bundle_id = create_bundle_event(bundle_data, instance=inst, created_by=identity.name)
+        try:
+            from .relay import notify_relay, push
+
+            if not notify_relay():
+                push()
+        except Exception:
+            pass
+        return bundle_id
 
     if action == "chain":
         if not bundle_id:

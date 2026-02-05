@@ -8,19 +8,15 @@ import subprocess
 from typing import Any
 
 
-# Env vars to capture (if set)
+# Env vars to capture (if set) — only vars that help disambiguate
+# which terminal, pane, or environment an instance is running in.
 CONTEXT_ENV_VARS = [
-    # Terminal identification
-    "TERM",
+    # Terminal program + pane/window IDs
     "TERM_PROGRAM",
-    "TERM_PROGRAM_VERSION",
     "TERM_SESSION_ID",
-    "COLORTERM",
-    "VTE_VERSION",
     "WINDOWID",
     # iTerm2
     "ITERM_SESSION_ID",
-    "ITERM_PROFILE",
     # Kitty
     "KITTY_WINDOW_ID",
     "KITTY_PID",
@@ -29,81 +25,37 @@ CONTEXT_ENV_VARS = [
     "ALACRITTY_WINDOW_ID",
     # WezTerm
     "WEZTERM_PANE",
-    "WEZTERM_CONFIG_DIR",
     # GNOME/KDE
     "GNOME_TERMINAL_SCREEN",
-    "KONSOLE_DBUS_SESSION",
     "KONSOLE_DBUS_WINDOW",
-    "KONSOLE_PROFILE_NAME",
     # Other Linux terminals
     "TERMINATOR_UUID",
     "TILIX_ID",
     "GUAKE_TAB_UUID",
     # Windows Terminal
     "WT_SESSION",
-    "WT_PROFILE_ID",
     # ConEmu
     "ConEmuHWND",
-    "ConEmuPID",
-    "ConEmuDrawHWND",
-    "ConEmuServerPID",
-    "ConEmuANSI",
-    "ConEmuBuild",
-    "CMDER_ROOT",
     # Multiplexers
-    "TMUX",
     "TMUX_PANE",
-    "TMUX_TMPDIR",
     "STY",
-    "WINDOW",
-    "ZELLIJ",
     "ZELLIJ_SESSION_NAME",
     "ZELLIJ_PANE_ID",
-    "BYOBU_WINDOWS",
-    # SSH
-    "SSH_CLIENT",
+    # SSH (connection identity, not auth)
     "SSH_TTY",
     "SSH_CONNECTION",
-    "SSH_AUTH_SOCK",
-    # WSL/Container
+    # WSL
     "WSL_DISTRO_NAME",
-    "WSL_INTEROP",
     # IDE terminals
-    "VSCODE_GIT_IPC_HANDLE",
-    "VSCODE_INJECTION",
     "VSCODE_PID",
-    "VSCODE_CWD",
     "CURSOR_AGENT",
     "INSIDE_EMACS",
-    "VIM",
-    "VIMRUNTIME",
     "NVIM_LISTEN_ADDRESS",
-    "TERMINAL_EMULATOR",
-    # Cloud IDEs
-    "CODESPACES",
+    # Cloud IDEs (one per platform)
     "CODESPACE_NAME",
-    "CLOUD_SHELL",
-    "GOOGLE_CLOUD_PROJECT",
-    "DEVSHELL_PROJECT_ID",
-    "REPL_ID",
-    "REPL_SLUG",
-    "REPL_OWNER",
     "GITPOD_WORKSPACE_ID",
-    "GITPOD_WORKSPACE_URL",
-    "PROJECT_DOMAIN",
-    "PROJECT_ID",
-    # System
-    "USER",
-    "HOSTNAME",
-    "SHELL",
-    "LANG",
-    "LC_ALL",
-    "TZ",
-    # Cloud/Container
-    "AWS_PROFILE",
-    "AWS_REGION",
-    "DOCKER_HOST",
-    "KUBERNETES_SERVICE_HOST",
+    "CLOUD_SHELL",
+    "REPL_ID",
 ]
 
 
@@ -144,6 +96,28 @@ def capture_context() -> dict[str, Any]:
         if val:
             env[var] = val
     ctx["env"] = env
+
+    # Terminal info for close-on-kill
+    from .thread_context import get_launched_preset
+    terminal_preset = get_launched_preset() or ""
+    if not terminal_preset:
+        from ..terminal import detect_terminal_from_env
+        terminal_preset = detect_terminal_from_env() or ""
+    if terminal_preset:
+        ctx["terminal_preset"] = terminal_preset
+        from ..core.settings import get_merged_preset
+        preset = get_merged_preset(terminal_preset)
+        if preset:
+            pane_id_env = preset.get("pane_id_env")
+            if pane_id_env:
+                pane_id = os.environ.get(pane_id_env, "")
+                if pane_id:
+                    ctx["pane_id"] = pane_id
+    # Process ID for kitty close-by-env matching
+    from .thread_context import get_process_id
+    hcom_process_id = get_process_id() or ""
+    if hcom_process_id:
+        ctx["process_id"] = hcom_process_id
 
     return ctx
 

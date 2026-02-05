@@ -54,7 +54,6 @@ Field values are stored in different places:
 
 from __future__ import annotations
 from typing import List, TYPE_CHECKING, Any, cast, Dict
-import os
 import re
 import shlex
 import time
@@ -78,6 +77,7 @@ from ..ui import (
     calculate_text_input_rows,
     text_input_insert,
     text_input_backspace,
+    text_input_delete,
     text_input_move_left,
     text_input_move_right,
 )
@@ -113,7 +113,7 @@ from ..ui import (
     FG_CUSTOM_ENV,
 )
 from ..core.config import reload_config
-from ..shared import resolve_claude_args
+from ..tools.claude.args import resolve_claude_args
 from ..tools.codex.args import resolve_codex_args
 from ..tools.gemini.args import resolve_gemini_args
 from ..launcher import launch as unified_launch
@@ -299,7 +299,9 @@ class LaunchScreen:
             selected_field_start_line = len(lines)
             lines.append(f"  {BG_ORANGE}{FG_BLACK}{BOLD} \u25b6 Launch \u23ce {RESET}")
             # Show cwd when launch button is selected
-            cwd = os.getcwd()
+            from hcom.core.thread_context import get_cwd
+
+            cwd = str(get_cwd())
             max_cwd_width = width - 10  # Leave margin
             if len(cwd) > max_cwd_width:
                 cwd = "\u2026" + cwd[-(max_cwd_width - 1) :]
@@ -978,6 +980,33 @@ class LaunchScreen:
         new_value, new_cursor = text_input_backspace(field_value, cursor_pos)
         self.update_field(field_key, new_value, new_cursor)
 
+    def _handle_delete(self):
+        """Handle DELETE - delete char at cursor"""
+        field_info = self.get_current_field_info()
+        if not field_info:
+            return
+        field_key, field_value, cursor_pos = field_info
+        if field_key == "HCOM_CODEX_SANDBOX_MODE":
+            return
+        new_value, new_cursor = text_input_delete(field_value, cursor_pos)
+        self.update_field(field_key, new_value, new_cursor)
+
+    def _handle_home(self):
+        """Handle HOME/Ctrl+A - move cursor to start"""
+        field_info = self.get_current_field_info()
+        if not field_info:
+            return
+        field_key, _, _ = field_info
+        self._update_cursor(field_key, 0)
+
+    def _handle_end(self):
+        """Handle END/Ctrl+E - move cursor to end"""
+        field_info = self.get_current_field_info()
+        if not field_info:
+            return
+        field_key, field_value, _ = field_info
+        self._update_cursor(field_key, len(field_value))
+
     def _handle_esc(self):
         """Handle ESC - clear field or collapse section"""
         lf = self.state.launch.current_field
@@ -1141,6 +1170,12 @@ class LaunchScreen:
             return self._handle_enter()
         elif key == "BACKSPACE":
             return self._handle_backspace()
+        elif key == "DELETE":
+            return self._handle_delete()
+        elif key in ("HOME", "CTRL_A"):
+            return self._handle_home()
+        elif key in ("END", "CTRL_E"):
+            return self._handle_end()
         elif key == "ESC":
             return self._handle_esc()
         elif key == "CTRL_R":

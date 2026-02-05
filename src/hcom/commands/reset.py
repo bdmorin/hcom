@@ -1,6 +1,5 @@
 """Reset commands for HCOM"""
 
-import os
 import sys
 import time
 import shutil
@@ -8,6 +7,7 @@ from datetime import datetime
 from .utils import format_error, get_help_text
 from ..core.paths import hcom_path, LAUNCH_DIR, LOGS_DIR, ARCHIVE_DIR
 from ..shared import shorten_path, CommandContext, is_inside_ai_tool
+from ..core.thread_context import get_hcom_go
 
 
 def get_archive_timestamp() -> str:
@@ -94,7 +94,7 @@ def remove_global_hooks() -> bool:
 
     # Remove Claude hooks
     try:
-        from ..hooks.settings import remove_claude_hooks
+        from ..tools.claude.settings import remove_claude_hooks
 
         if not remove_claude_hooks():
             success = False
@@ -262,7 +262,7 @@ def cmd_reset(argv: list[str], *, ctx: CommandContext | None = None) -> int:
         return 1
 
     # Confirmation gate: inside AI tools, require HCOM_GO=1
-    if is_inside_ai_tool() and os.environ.get("HCOM_GO") != "1":
+    if is_inside_ai_tool() and not get_hcom_go():
         _print_reset_preview(target)
         return 0
 
@@ -277,6 +277,10 @@ def cmd_reset(argv: list[str], *, ctx: CommandContext | None = None) -> int:
     # Stop all instances before clearing database (prevents zombie processes)
     exit_codes.append(cmd_stop(["all"]))
 
+    # Stop daemon if running
+    from .lifecycle import _daemon_stop
+    _daemon_stop()
+
     # Clear database
     exit_codes.append(clear())
 
@@ -287,18 +291,18 @@ def cmd_reset(argv: list[str], *, ctx: CommandContext | None = None) -> int:
 
     # Push reset event to relay server
     try:
-        from ..relay import notify_relay_tui, push
+        from ..relay import notify_relay, push
 
-        if not notify_relay_tui():
+        if not notify_relay():
             push(force=True)
     except Exception:
         pass  # Best effort
 
     # Pull fresh state from other devices
     try:
-        from ..relay import is_relay_handled_by_tui, pull
+        from ..relay import is_relay_handled_by_daemon, pull
 
-        if not is_relay_handled_by_tui():
+        if not is_relay_handled_by_daemon():
             pull()
     except Exception as e:
         print(f"Warning: Failed to pull remote state: {e}", file=sys.stderr)

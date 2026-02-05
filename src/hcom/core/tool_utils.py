@@ -34,6 +34,8 @@ SAFE_HCOM_COMMANDS = [
     "archive",
     "bundle",
     "status",
+    "daemon",
+    "term",
     "--version",
     "-v",
     "--new-terminal",
@@ -43,16 +45,50 @@ SAFE_HCOM_COMMANDS = [
 HCOM_TOOL_NAMES = ["claude", "gemini", "codex"]
 
 
+def _get_hcom_prefix() -> str:
+    """Get hcom command prefix based on detected invocation method.
+
+    Returns 'uvx hcom' if running under uvx, 'hcom' otherwise.
+    """
+    cmd_type = _detect_hcom_command_type()
+    return "uvx hcom" if cmd_type == "uvx" else "hcom"
+
+
+def _build_all_claude_permission_patterns() -> set[str]:
+    """Generate ALL possible Claude permission patterns (both hcom and uvx hcom).
+
+    Used for removal - must match patterns regardless of how they were installed.
+    """
+    patterns = set()
+    for prefix in ("hcom", "uvx hcom"):
+        for cmd in SAFE_HCOM_COMMANDS:
+            suffix = "" if cmd.startswith("-") else ":*"
+            patterns.add(f"Bash({prefix} {cmd}{suffix})")
+    return patterns
+
+
+def _build_all_gemini_permission_patterns() -> set[str]:
+    """Generate ALL possible Gemini permission patterns (both hcom and uvx hcom).
+
+    Used for removal - must match patterns regardless of how they were installed.
+    """
+    patterns = set()
+    for prefix in ("hcom", "uvx hcom"):
+        for cmd in SAFE_HCOM_COMMANDS:
+            patterns.add(f"run_shell_command({prefix} {cmd})")
+    return patterns
+
+
 def build_gemini_permissions() -> list[str]:
     """Generate Gemini permission patterns from safe commands.
 
     Returns patterns for tools.allowed in settings.json.
-    Includes both 'hcom' and 'uvx hcom' variants.
+    Uses detected invocation method (hcom or uvx hcom).
     """
+    prefix = _get_hcom_prefix()
     permissions = []
     for cmd in SAFE_HCOM_COMMANDS:
-        permissions.append(f"run_shell_command(hcom {cmd})")
-        permissions.append(f"run_shell_command(uvx hcom {cmd})")
+        permissions.append(f"run_shell_command({prefix} {cmd})")
     return permissions
 
 
@@ -61,14 +97,14 @@ def build_claude_permissions() -> list[str]:
 
     Returns patterns for permissions.allow in settings.json.
     Uses Bash() format with :* wildcard for commands that take args.
-    Includes both 'hcom' and 'uvx hcom' variants.
+    Uses detected invocation method (hcom or uvx hcom).
     """
+    prefix = _get_hcom_prefix()
     permissions = []
     for cmd in SAFE_HCOM_COMMANDS:
         # Commands starting with - are flags (no args), others use :* wildcard
         suffix = "" if cmd.startswith("-") else ":*"
-        permissions.append(f"Bash(hcom {cmd}{suffix})")
-        permissions.append(f"Bash(uvx hcom {cmd}{suffix})")
+        permissions.append(f"Bash({prefix} {cmd}{suffix})")
     return permissions
 
 
@@ -76,21 +112,28 @@ def build_codex_rules() -> list[str]:
     """Generate Codex execpolicy rules from safe commands.
 
     Returns prefix_rule lines for hcom.rules file.
-    Includes both 'hcom' and 'uvx hcom' variants.
+    Uses detected invocation method (hcom or uvx hcom).
     """
+    prefix = _get_hcom_prefix()
+    use_uvx = prefix == "uvx hcom"
+
     rules = [
         "# hcom integration - auto-approve safe commands",
     ]
     for cmd in SAFE_HCOM_COMMANDS:
-        rules.append(f'prefix_rule(pattern=["hcom", "{cmd}"], decision="allow")')
-        rules.append(f'prefix_rule(pattern=["uvx", "hcom", "{cmd}"], decision="allow")')
+        if use_uvx:
+            rules.append(f'prefix_rule(pattern=["uvx", "hcom", "{cmd}"], decision="allow")')
+        else:
+            rules.append(f'prefix_rule(pattern=["hcom", "{cmd}"], decision="allow")')
 
     # Tool help commands (hcom claude/gemini/codex --help/-h)
     for tool in HCOM_TOOL_NAMES:
-        rules.append(f'prefix_rule(pattern=["hcom", "{tool}", "--help"], decision="allow")')
-        rules.append(f'prefix_rule(pattern=["hcom", "{tool}", "-h"], decision="allow")')
-        rules.append(f'prefix_rule(pattern=["uvx", "hcom", "{tool}", "--help"], decision="allow")')
-        rules.append(f'prefix_rule(pattern=["uvx", "hcom", "{tool}", "-h"], decision="allow")')
+        if use_uvx:
+            rules.append(f'prefix_rule(pattern=["uvx", "hcom", "{tool}", "--help"], decision="allow")')
+            rules.append(f'prefix_rule(pattern=["uvx", "hcom", "{tool}", "-h"], decision="allow")')
+        else:
+            rules.append(f'prefix_rule(pattern=["hcom", "{tool}", "--help"], decision="allow")')
+            rules.append(f'prefix_rule(pattern=["hcom", "{tool}", "-h"], decision="allow")')
 
     return rules
 
@@ -136,8 +179,9 @@ def _detect_hcom_command_type() -> str:
     4. full - Fallback to full python invocation
     """
     import shutil
+    from .binary import is_dev_mode
 
-    if os.environ.get("HCOM_DEV_ROOT"):
+    if is_dev_mode():
         return "dev"
     elif "uv" in Path(sys.executable).resolve().parts and shutil.which("uvx"):
         return "uvx"
@@ -261,7 +305,6 @@ def stop_instance(instance_name: str, initiated_by: str = "unknown", reason: str
     Subagents are recursively stopped when parent stops.
     """
     from .db import get_instance, delete_instance, log_event
-    from .runtime import notify_instance
 
     instance_data = get_instance(instance_name)
     if not instance_data:
@@ -290,10 +333,58 @@ def stop_instance(instance_name: str, initiated_by: str = "unknown", reason: str
         except (ProcessLookupError, PermissionError):
             pass
 
-    # Notify PTY/hooks instances via TCP (wake polling loop)
+    # Track non-headless PTY processes that remain running after stop
+    from .log import log_info, log_warn
+    if pid and not is_headless:
+        try:
+            os.kill(pid, 0)  # Check alive
+            from .pidtrack import record_pid
+
+            # Extract terminal info from launch_context for close-on-kill
+            proc_id = ""
+            terminal_preset = ""
+            pane_id = ""
+            try:
+                import json as _json
+                lc = instance_data.get("launch_context", "")
+                if lc:
+                    lc_data = _json.loads(lc)
+                    terminal_preset = lc_data.get("terminal_preset", "")
+                    pane_id = lc_data.get("pane_id", "")
+                    proc_id = lc_data.get("process_id", "")
+            except Exception:
+                pass
+            # Fallback: process_bindings table (if process_id not in launch_context)
+            if not proc_id:
+                try:
+                    from .db import get_db as _get_db
+                    row = _get_db().execute(
+                        "SELECT process_id FROM process_bindings WHERE instance_name = ?",
+                        (instance_name,),
+                    ).fetchone()
+                    if row:
+                        proc_id = row["process_id"]
+                except Exception:
+                    pass
+            record_pid(pid, instance_data.get("tool", "claude"), instance_name,
+                       instance_data.get("directory", ""), process_id=proc_id,
+                       terminal_preset=terminal_preset, pane_id=pane_id)
+            log_info("stop", "pidtrack_recorded", pid=pid, instance=instance_name,
+                     preset=terminal_preset, pane_id=pane_id)
+        except (ProcessLookupError, PermissionError):
+            pass  # Dead or not signallable — can't kill later, no point tracking
+        except Exception as e:
+            log_warn("stop", "pidtrack_error", pid=pid, instance=instance_name, error=str(e))
+
+    # Capture notify ports BEFORE cleanup (they get deleted)
     tool = instance_data.get("tool", "claude")
-    if tool == "claude":
-        notify_instance(instance_name)
+    notify_ports: list[int] = []
+    try:
+        from .db import list_notify_ports
+
+        notify_ports = list_notify_ports(instance_name)
+    except Exception:
+        pass
 
     # Prepare snapshot before delete (for forensics/transcript access)
     snapshot = {
@@ -319,20 +410,35 @@ def stop_instance(instance_name: str, initiated_by: str = "unknown", reason: str
     session_id = instance_data.get("session_id")
     _cleanup_session_bindings(session_id, initiated_by)
 
-    # Cleanup event subscriptions for this instance
-    # Escape _ and % in instance name (they're LIKE wildcards)
+    # Cleanup notify endpoints and process bindings for this instance
     try:
         from .db import get_db
 
-        escaped_name = instance_name.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
         conn = get_db()
-        conn.execute("DELETE FROM kv WHERE key LIKE ? ESCAPE '\\'", (f"events_sub:%\\_{escaped_name}",))
-    except Exception:
-        pass
+        conn.execute("DELETE FROM notify_endpoints WHERE instance = ?", (instance_name,))
+        conn.execute("DELETE FROM process_bindings WHERE instance_name = ?", (instance_name,))
+    except Exception as _e:
+        from .log import log_warn
+        log_warn("stop", "cleanup.bindings_error", instance=instance_name, error=str(_e))
+
+    # Cleanup event subscriptions for this instance
+    try:
+        from .ops import cleanup_instance_subscriptions
+
+        cleanup_instance_subscriptions(instance_name)
+    except Exception as _e:
+        from .log import log_warn as _log_warn
+        _log_warn("stop", "cleanup.subscriptions_error", instance=instance_name, error=str(_e))
 
     # Delete first, then log - prevents duplicate stopped events on race conditions
     if not delete_instance(instance_name):
         return
+
+    # Notify AFTER delete - so listeners wake and see row is gone
+    if notify_ports:
+        from .runtime import _send_notify_to_ports
+
+        _send_notify_to_ports(notify_ports)
 
     # Log stopped event only after successful delete
     try:
@@ -341,9 +447,10 @@ def stop_instance(instance_name: str, initiated_by: str = "unknown", reason: str
             instance_name,
             {"action": "stopped", "by": initiated_by, "reason": reason, "snapshot": snapshot},
         )
-        from ..relay import push
+        from ..relay import notify_relay, push
 
-        push()
+        if not notify_relay():
+            push()
     except Exception as e:
         from .log import log_error
 
@@ -462,4 +569,6 @@ __all__ = [
     "create_orphaned_pty_identity",
     "_detect_hcom_command_type",
     "_build_quoted_invocation",
+    "_build_all_claude_permission_patterns",
+    "_build_all_gemini_permission_patterns",
 ]

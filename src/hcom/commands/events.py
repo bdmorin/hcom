@@ -4,13 +4,63 @@ import sys
 import json
 import time
 from datetime import datetime
-from .utils import format_error
+from .utils import format_error, parse_flag_bool, parse_last_flag, CLIError
 from ..shared import CommandContext
+
+
+def streamline_event(event: dict, filters: dict | None = None) -> dict:
+    """Remove bloat fields from event, keep useful data.
+
+    Achieves ~35% token reduction while maintaining all useful information.
+    Dropped fields are redundant or rarely used by agents.
+
+    If filters are provided, fields used in filtering are preserved fully
+    (not truncated/stripped) since the user explicitly queried them.
+    """
+    filters = filters or {}
+    data = event.get("data", {}).copy()
+
+    # Drop universal bloat fields
+    data.pop("sender_kind", None)      # Always "instance" for agent-to-agent
+    data.pop("scope", None)            # Always "mentions" (inferred from routing)
+    data.pop("delivered_to", None)     # Agents don't use this (internal routing)
+    # Keep mentions if filtered by --mention
+    if "mention" not in filters:
+        data.pop("mentions", None)
+
+    # Drop type-specific bloat
+    if event["type"] == "message":
+        data.pop("reply_to", None)     # Duplicate of reply_to_local
+
+    elif event["type"] == "status":
+        # --cmd or --file filter on detail - keep full if filtered, else truncate
+        if "cmd" in filters or "file" in filters:
+            pass  # Keep detail as-is
+        elif "detail" in data and data["detail"] and len(data["detail"]) > 60:
+            data["detail"] = data["detail"][:60] + "..."
+        data.pop("position", None)     # Internal watermark (not for agents)
+
+    elif event["type"] == "life":
+        data.pop("snapshot", None)     # Huge nested object (use --full if needed)
+
+    # Truncate timestamp microseconds (second precision is sufficient)
+    timestamp = event.get("ts", "")
+    if len(timestamp) > 19:
+        timestamp = timestamp[:19]
+
+    return {
+        "id": event["id"],
+        "ts": timestamp,
+        "type": event["type"],
+        "instance": event["instance"],
+        "data": data,
+    }
 
 
 def _cmd_events_launch(argv: list[str], instance_name: str | None = None) -> int:
     """Wait for launches ready, output JSON. Internal - called by launch output."""
-    from ..core.db import get_launch_status, get_launch_batch, init_db
+    from ..core.db import init_db
+    from ..core.launch_status import wait_for_launch
     from .utils import resolve_identity, validate_flags
 
     # Validate flags
@@ -33,71 +83,16 @@ def _cmd_events_launch(argv: list[str], instance_name: str | None = None) -> int
         except Exception:
             pass
 
-    # Get status - specific batch or aggregated
-    if batch_id:
-        status_data = get_launch_batch(batch_id)
-    else:
-        status_data = get_launch_status(launcher)
-
-    if not status_data:
-        msg = "You haven't launched any instances" if launcher else "No launches found"
-        print(json.dumps({"status": "no_launches", "message": msg}))
-        return 0
-
-    # Wait up to 30s for all instances to be ready
-    start_time = time.time()
-    while status_data["ready"] < status_data["expected"] and time.time() - start_time < 30:
-        time.sleep(0.5)
-        if batch_id:
-            status_data = get_launch_batch(batch_id)
-        else:
-            status_data = get_launch_status(launcher)
-        if not status_data:
-            # DB reset or batch pruned mid-wait
-            print(
-                json.dumps(
-                    {
-                        "status": "error",
-                        "message": "Launch data disappeared (DB reset or pruned)",
-                    }
-                )
-            )
-            return 1
-
-    # Output JSON
-    is_timeout = status_data["ready"] < status_data["expected"]
-    status = "timeout" if is_timeout else "ready"
-    result = {
-        "status": status,
-        "expected": status_data["expected"],
-        "ready": status_data["ready"],
-        "instances": status_data["instances"],
-        "launcher": status_data["launcher"],
-        "timestamp": status_data["timestamp"],
-    }
-    # Include batches list if aggregated
-    if "batches" in status_data:
-        result["batches"] = status_data["batches"]
-    else:
-        result["batch_id"] = status_data.get("batch_id")
-
-    if is_timeout:
-        result["timed_out"] = True
-        # Identify which batch(es) failed
-        batch_info = result.get("batch_id") or (result.get("batches", ["?"])[0] if result.get("batches") else "?")
-        result["hint"] = (
-            f"Launch failed: {status_data['ready']}/{status_data['expected']} ready after 30s "
-            f"(batch: {batch_info}). Check ~/.hcom/.tmp/logs/background_*.log or hcom list -v"
-        )
+    result = wait_for_launch(launcher=launcher, batch_id=batch_id)
     print(json.dumps(result))
 
-    return 0 if status == "ready" else 1
+    return 0 if result.get("status") == "ready" else 1
 
 
 def cmd_events(argv: list[str], *, ctx: CommandContext | None = None) -> int:
     """Query events from SQLite: hcom events [launch|sub|unsub] [--last N] [--wait SEC] [--sql EXPR] [--name NAME]"""
     from ..core.db import get_db, init_db, get_last_event_id
-    from .utils import parse_name_flag, validate_flags
+    from .utils import parse_name_flag, validate_flags, parse_flag_value
     from ..core.identity import resolve_identity
     from ..core.filters import (
         expand_shortcuts,
@@ -143,13 +138,50 @@ def cmd_events(argv: list[str], *, ctx: CommandContext | None = None) -> int:
     if argv_parsed and argv_parsed[0] == "unsub":
         return _events_unsub(argv_parsed[1:], caller_name=caller_name)
 
-    # Validate flags before parsing (use argv_parsed which has --name removed)
+    # Validate flags early (use argv_parsed which has --name removed)
     if error := validate_flags("events", argv_parsed):
         print(format_error(error), file=sys.stderr)
         return 1
 
     # Use already-parsed values from above
     argv = argv_parsed
+
+    # Parse boolean flags first (removes from argv)
+    search_all, argv = parse_flag_bool(argv, "--all")
+    full_output, argv = parse_flag_bool(argv, "--full")
+
+    # Parse --last flag
+    try:
+        last_n, argv = parse_last_flag(argv, default=20)
+    except CLIError as e:
+        print(format_error(str(e)), file=sys.stderr)
+        return 1
+
+    # Parse --sql flag
+    try:
+        sql_where, argv = parse_flag_value(argv, "--sql")
+        if sql_where:
+            # Fix shell escaping: bash/zsh escape ! as \! in double quotes (history expansion)
+            sql_where = sql_where.replace("\\!", "!")
+    except CLIError as e:
+        print(format_error(str(e)), file=sys.stderr)
+        return 1
+
+    # Parse --wait flag (optional value, defaults to 60s)
+    wait_timeout = None
+    if "--wait" in argv:
+        idx = argv.index("--wait")
+        argv = argv[:idx] + argv[idx + 1:]
+        # Check if next arg is a value (not a flag)
+        if idx < len(argv) and not argv[idx].startswith("-"):
+            try:
+                wait_timeout = int(argv[idx])
+                argv = argv[:idx] + argv[idx + 1:]
+            except ValueError:
+                print(format_error(f"--wait must be an integer, got '{argv[idx]}'"), file=sys.stderr)
+                return 1
+        else:
+            wait_timeout = 60  # Default: 60 seconds
 
     # PHASE 1: Expand shortcuts FIRST (--idle, --blocked)
     argv = expand_shortcuts(argv)
@@ -161,55 +193,12 @@ def cmd_events(argv: list[str], *, ctx: CommandContext | None = None) -> int:
         print(format_error(str(e)), file=sys.stderr)
         return 1
 
-    # Parse arguments
-    last_n = 20  # Default: last 20 events
-    wait_timeout = None
-    sql_where = None
-    search_all = False  # --all: include archives
-
-    i = 0
-    while i < len(argv):
-        if argv[i] == "--last" and i + 1 < len(argv):
-            try:
-                last_n = int(argv[i + 1])
-            except ValueError:
-                print(
-                    f"Error: --last must be an integer, got '{argv[i + 1]}'",
-                    file=sys.stderr,
-                )
-                return 1
-            i += 2
-        elif argv[i] == "--wait":
-            if i + 1 < len(argv) and not argv[i + 1].startswith("--"):
-                try:
-                    wait_timeout = int(argv[i + 1])
-                except ValueError:
-                    print(
-                        f"Error: --wait must be an integer, got '{argv[i + 1]}'",
-                        file=sys.stderr,
-                    )
-                    return 1
-                i += 2
-            else:
-                wait_timeout = 60  # Default: 60 seconds
-                i += 1
-        elif argv[i] == "--sql" and i + 1 < len(argv):
-            # Fix shell escaping: bash/zsh escape ! as \! in double quotes (history expansion)
-            # SQLite doesn't use backslash escaping, so strip these artifacts
-            sql_where = argv[i + 1].replace("\\!", "!")
-            i += 2
-        elif argv[i] == "--all":
-            search_all = True
-            i += 1
-        else:
-            i += 1
-
     # Pull remote events for fresh data (skip if --wait mode, which has its own polling)
     if wait_timeout is None:
         try:
-            from ..relay import is_relay_handled_by_tui, pull
+            from ..relay import is_relay_handled_by_daemon, pull
 
-            if not is_relay_handled_by_tui():
+            if not is_relay_handled_by_daemon():
                 pull()
         except Exception:
             pass
@@ -262,7 +251,8 @@ def cmd_events(argv: list[str], *, ctx: CommandContext | None = None) -> int:
                     "data": json.loads(lookback_row["data"]),
                 }
                 # Found recent matching event, return immediately
-                print(json.dumps(event))
+                output = event if full_output else streamline_event(event, filters)
+                print(json.dumps(output))
                 return 0
             except (json.JSONDecodeError, TypeError):
                 pass  # Ignore corrupt event, continue to wait loop
@@ -305,7 +295,8 @@ def cmd_events(argv: list[str], *, ctx: CommandContext | None = None) -> int:
                             }
 
                             # Event matches all conditions, print and exit
-                            print(json.dumps(event))
+                            output = event if full_output else streamline_event(event, filters)
+                            print(json.dumps(output))
                             return 0
 
                         except (json.JSONDecodeError, TypeError) as e:
@@ -435,9 +426,14 @@ def cmd_events(argv: list[str], *, ctx: CommandContext | None = None) -> int:
     if len(all_events) > last_n:
         all_events = all_events[-last_n:]
 
-    # Output (JSON by default for backwards compatibility)
+    # Output events (streamlined by default, --full for all fields)
     for event in all_events:
-        print(json.dumps(event))
+        if full_output:
+            # Full event data (debugging, complex parsing)
+            print(json.dumps(event))
+        else:
+            # Streamlined (default: ~35% token reduction)
+            print(json.dumps(streamline_event(event, filters)))
 
     return 0
 
@@ -621,12 +617,10 @@ def _events_sub(argv: list[str], caller_name: str | None = None, silent: bool = 
 
             # Handle both filter-based (new) and SQL-based (old) subscriptions
             if "filters" in sub:
-                # New filter-based subscription
                 filter_display = json.dumps(sub["filters"])
                 if len(filter_display) > 35:
                     filter_display = filter_display[:35] + "..."
             else:
-                # Old SQL-based subscription
                 sql_display = sub.get("sql", "")
                 filter_display = sql_display[:35] + "..." if len(sql_display) > 35 else sql_display
 

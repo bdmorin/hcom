@@ -1,7 +1,7 @@
-"""Claude Code argument parsing for hcom.
+"""Claude Code tool integration for hcom.
 
-This module provides CLI argument parsing and validation for Claude Code.
-Hook handlers are in the top-level hooks/ package (historical location).
+This module provides CLI argument parsing, hook handlers, settings management,
+and subagent coordination for Claude Code.
 
 Exports:
     ClaudeArgsSpec: Immutable dataclass representing parsed Claude CLI arguments.

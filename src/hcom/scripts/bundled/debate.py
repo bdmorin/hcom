@@ -202,6 +202,7 @@ Use: hcom send "@judge- @con- [your argument]" --thread {thread} --intent inform
         prompt=pro_prompt,
         background=not args.interactive,
         system_prompt=PRO_SYSTEM_PROMPT,
+        wait=True,
     )
     print(f"PRO debater launched ({args.tool}, batch: {pro_result['batch_id']})")
 
@@ -223,6 +224,7 @@ Use: hcom send "@judge- @pro- [your argument]" --thread {thread} --intent inform
         prompt=con_prompt,
         background=not args.interactive,
         system_prompt=CON_SYSTEM_PROMPT,
+        wait=True,
     )
     print(f"CON debater launched ({args.tool}, batch: {con_result['batch_id']})")
 

@@ -1,19 +1,18 @@
 [build-system]
-requires = ["setuptools>=61.0", "wheel"]
-build-backend = "setuptools.build_meta"
+requires = ["maturin>=1.9,<2.0"]
+build-backend = "maturin"
 
 [project]
 name = "hcom"
-dynamic = ["version"]
+version = "0.6.14"
 description = "Realtime messaging and context sharing for AI coding agents (Claude Code, Gemini CLI, Codex)"
 readme = "README.md"
-requires-python = ">=3.10"
+requires-python = ">=3.11"
 license = "MIT"
 authors = [{name = "aannoo"}]
 keywords = ["claude", "claude-code", "gemini", "codex", "hooks", "agents", "cli", "multi-agent", "orchestration", "terminal"]
 dependencies = [
-    "ptyprocess>=0.7.0",
-    "pyte>=0.8.2",
+    "wcwidth",
 ]
 classifiers = [
     "Development Status :: 4 - Beta",
@@ -31,23 +30,19 @@ classifiers = [
     "Topic :: Terminals",
 ]
 
-[project.scripts]
-hcom = "hcom.__main__:main"
-
 [project.urls]
 Homepage = "https://github.com/aannoo/hcom"
 Repository = "https://github.com/aannoo/hcom"
 Issues = "https://github.com/aannoo/hcom/issues"
 Documentation = "https://github.com/aannoo/hcom#readme"
 
-[tool.setuptools.packages.find]
-where = ["src"]
-
-[tool.setuptools.package-data]
-"hcom.scripts.bundled" = ["*.py"]
-
-[tool.setuptools.dynamic]
-version = {attr = "hcom.shared.__version__"}
+[tool.maturin]
+bindings = "bin"
+manifest-path = "src/native/Cargo.toml"
+python-source = "src"
+python-packages = ["hcom"]
+strip = true
+exclude = ["*.egg-info"]
 
 [tool.ruff]
 line-length = 180
@@ -60,3 +55,4 @@ ignore = ["W291", "W293"]  # Trailing whitespace (bootstrap.py has intentional f
 # Intentional lazy imports for fast CLI startup
 "src/hcom/cli.py" = ["E402"]
 "src/hcom/tools/gemini/settings.py" = ["E402"]
+"src/hcom/tools/claude/dispatcher.py" = ["E402"]

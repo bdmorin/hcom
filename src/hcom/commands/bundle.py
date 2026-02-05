@@ -7,7 +7,7 @@ import sys
 from datetime import datetime, timezone
 from typing import Any
 
-from .utils import format_error, validate_flags, parse_flag_value
+from .utils import format_error, validate_flags, parse_flag_value, parse_flag_bool, parse_last_flag, CLIError
 from ..shared import CommandContext, format_age, parse_iso_timestamp
 from ..core.bundles import parse_csv_list, get_bundle_instance_name
 from ..core.detail_levels import is_full_output_detail
@@ -208,7 +208,7 @@ def _parse_prepare_flags(argv: list[str]) -> tuple[str | None, int, int, bool]:
             except ValueError:
                 raise ValueError("--last-events must be an integer (e.g., --last-events 10)")
             i += 2
-        elif argv[i] in ("--compact", "-c"):
+        elif argv[i] == "--compact":
             compact = True
             i += 1
         else:
@@ -277,6 +277,34 @@ def _print_prepare_output(
 
     print(f"[Bundle Context: {agent_name}]\n")
 
+    if not compact:
+        print(SEP)
+        print("HOW TO USE THIS CONTEXT:")
+        print()
+        print("Use 'hcom send' with these bundle flags to create and send directly")
+        print("Transcript detail: normal (truncated) | full (complete text) | detailed (complete text with tools)")
+        print()
+        print("Use this bundle context as a template for your specific bundle")
+        print("- Pick relevant events/files/transcript ranges from the bundle context")
+        print("- Use the hcom events and hcom transcript commands to find all everything relevant to include")
+        print(
+            "- Specify the correct transcript detail for each transcript range "
+            "(ie full when all relevant, normal only when the above is sufficient)"
+        )
+        print(
+            "- For description: give comprehensive detail and prescision. explain what is in this bundle, "
+            "summerise specific transcript ranges and events. give deep insight so another agent can understand "
+            "everything you know about this. what happened, decisions, current state, issues, plans, etc."
+        )
+        print()
+        print("A good bundle includes everything relevant and nothing irrelevant.")
+        print()
+        print(f"View: hcom transcript {agent_name} [--range N-N] [--full|--detailed]")
+        print(f"View: hcom events {agent_name} [--last N]")
+        print()
+        print("Use hcom bundle prepare --compact to hide this how to section")
+        print()
+
     # Transcript
     print(SEP)
     print("TRANSCRIPT")
@@ -337,33 +365,6 @@ def _print_prepare_output(
     print("CREATE:")
     print(template_command)
 
-    if not compact:
-        print()
-        print("Use 'hcom send' with these bundle flags to create and send directly")
-        print("Transcript detail: normal (truncated) | full (complete text) | detailed (complete text with tools)")
-        print()
-        print(SEP)
-        print("HOW TO USE THIS CONTEXT:")
-        print()
-        print("Use this bundle context as a template for your specific bundle")
-        print("- Pick relevant events/files/transcript ranges from the bundle context")
-        print("- Use the hcom events and hcom transcript commands to find all everything relevant to include")
-        print(
-            "- Specify the correct transcript detail for each transcript range "
-            "(ie full when all relevant, normal only when the above is sufficient)"
-        )
-        print(
-            "- For description: give comprehensive detail and prescision. explain what is in this bundle, "
-            "summerise specific transcript ranges and events. give deep insight so another agent can understand "
-            "everything you know about this. what happened, decisions, current state, issues, plans, etc."
-        )
-        print()
-        print("A good bundle includes everything relevant and nothing irrelevant.")
-        print()
-        print(f"View: hcom transcript {agent_name} [--range N-N] [--full|--detailed]")
-        print(f"View: hcom events {agent_name} [--last N]")
-        print()
-        print("Use hcom bundle prepare --compact/-c to hide this how to section")
 
 
 def _bundle_prepare(argv: list[str], *, ctx: CommandContext | None = None, json_out: bool = False, conn: Any) -> int:
@@ -726,11 +727,8 @@ def cmd_bundle(argv: list[str], *, ctx: CommandContext | None = None) -> int:
         print(format_error(error), file=sys.stderr)
         return 1
 
-    # Common flags
-    json_out = False
-    if "--json" in argv:
-        argv = [a for a in argv if a != "--json"]
-        json_out = True
+    # Common flags (removes from argv)
+    json_out, argv = parse_flag_bool(argv, "--json")
 
     conn = get_db()
 
@@ -743,18 +741,11 @@ def cmd_bundle(argv: list[str], *, ctx: CommandContext | None = None) -> int:
         return _bundle_cat(argv, conn=conn)
 
     if subcmd == "list":
-        last = 20
-        if "--last" in argv:
-            idx = argv.index("--last")
-            if idx + 1 >= len(argv) or argv[idx + 1].startswith("-"):
-                print(format_error("--last requires a value"), file=sys.stderr)
-                return 1
-            try:
-                last = int(argv[idx + 1])
-            except ValueError:
-                print(format_error("--last must be an integer"), file=sys.stderr)
-                return 1
-            argv = argv[:idx] + argv[idx + 2 :]
+        try:
+            last, argv = parse_last_flag(argv, default=20)
+        except CLIError as e:
+            print(format_error(str(e)), file=sys.stderr)
+            return 1
 
         rows = conn.execute(
             """
@@ -994,6 +985,13 @@ def cmd_bundle(argv: list[str], *, ctx: CommandContext | None = None) -> int:
     bundle_instance = get_bundle_instance_name(identity)
 
     bundle_id = create_bundle_event(bundle, instance=bundle_instance, created_by=identity.name)
+    try:
+        from ..relay import notify_relay, push
+
+        if not notify_relay():
+            push()
+    except Exception:
+        pass
     result = {"bundle_id": bundle_id}
     if json_out:
         print(json.dumps(result))

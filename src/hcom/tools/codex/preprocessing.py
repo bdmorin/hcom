@@ -99,7 +99,9 @@ def add_codex_developer_instructions(codex_args: list[str], instance_name: str) 
         return list(codex_args)
 
     # Build bootstrap for this instance
-    bootstrap = get_bootstrap(instance_name, tool="codex")
+    # Pass is_launched=True because the Codex process WILL have HCOM_LAUNCHED=1
+    # even if the current launcher process doesn't
+    bootstrap = get_bootstrap(instance_name, tool="codex", is_launched=True)
 
     # Check if developer_instructions already exists in -c flags
     existing_dev_instructions: str | None = None

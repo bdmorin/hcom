@@ -448,12 +448,17 @@ def run_script(argv: list[str]) -> int:
         print(script["path"].read_text())
         return 0
 
-    # Run the script
+    # Run the script.
+    # Pipe stdout/stderr so output goes through sys.stdout/sys.stderr (which may be
+    # thread-local CaptureBuffers in daemon mode) instead of inheriting real fds.
     path = script["path"]
-    if path.suffix == ".py":
-        return subprocess.run([sys.executable, str(path)] + args).returncode
-    else:
-        return subprocess.run(["bash", str(path)] + args).returncode
+    cmd = [sys.executable, str(path)] + args if path.suffix == ".py" else ["bash", str(path)] + args
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    if result.stdout:
+        print(result.stdout, end="")
+    if result.stderr:
+        print(result.stderr, end="", file=sys.stderr)
+    return result.returncode
 
 
 # Bundled script agent counts

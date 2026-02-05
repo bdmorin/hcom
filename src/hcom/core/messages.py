@@ -23,7 +23,7 @@ from .helpers import validate_scope, is_mentioned
 
 # Message scope types
 MessageScope = Literal["broadcast", "mentions"]
-MessageIntent = Literal["request", "inform", "ack", "error"]
+MessageIntent = Literal["request", "inform", "ack"]
 
 
 class MessageEnvelope(TypedDict, total=False):
@@ -208,27 +208,34 @@ def format_recipients(delivered_to: list[str], max_show: int = 30) -> str:
 # ==================== Scope Computation ====================
 
 
-def compute_scope(message: str, enabled_instances: list[dict[str, Any] | str]) -> tuple[ScopeResult | None, str | None]:
+def compute_scope(
+    message: str,
+    enabled_instances: list[dict[str, Any] | str],
+    explicit_targets: list[str] | None = None,
+) -> tuple[ScopeResult | None, str | None]:
     """Compute message scope and routing data.
 
     Args:
         message: Message text
         enabled_instances: List of enabled instance dicts (with 'name' and 'tag' fields)
+        explicit_targets: Optional list of explicit target names (from CLI @args).
+                         If provided, these are used for routing instead of parsing
+                         @mentions from message text.
 
     Returns:
         ((scope, extra_data), None) on success
         (None, error_message) on validation failure
 
     Scope types:
-        - 'broadcast': No @mentions → everyone
-        - 'mentions': Has @targets → explicit targets only
+        - 'broadcast': No targets → everyone
+        - 'mentions': Has targets → explicit targets only
 
-    STRICT FAILURE: @mentions to non-existent or disabled instances return error
+    STRICT FAILURE: Targets that don't match enabled instances return error
 
-    @mention matching uses full display name ({tag}-{name} or {name}):
-        - @api-luna matches instance with tag='api', name='luna'
-        - @api- matches all instances with tag='api' (prefix match)
-        - @luna matches instance with name='luna' (no tag or base name match)
+    Target matching uses full display name ({tag}-{name} or {name}):
+        - api-luna matches instance with tag='api', name='luna'
+        - api- matches all instances with tag='api' (prefix match)
+        - luna matches instance with name='luna' (no tag or base name match)
     """
     from .instances import get_full_name
 
@@ -247,7 +254,52 @@ def compute_scope(message: str, enabled_instances: list[dict[str, Any] | str]) -
             full_to_base[full] = base
             full_names.append(full)
 
-    # Check for @mentions
+    # If explicit targets specified (via -- separator), use them instead of parsing @mentions
+    # Note: empty list means broadcast was explicitly requested (no @targets before --)
+    # None means fall back to @mention parsing in message text (old syntax)
+    if explicit_targets is not None:
+        if explicit_targets:
+            # Has explicit targets - route to them
+            matched_base_names = []
+            unmatched = []
+
+            for target in explicit_targets:
+                # Same matching logic as @mentions
+                if ":" in target:
+                    # Remote target - match any instance with prefix
+                    matches = [full_to_base[fn] for fn in full_names if fn.lower().startswith(target.lower())]
+                else:
+                    # Local target - only match local instances (no : in name)
+                    # Don't match across underscore boundary (reserved for subagent hierarchy)
+                    matches = [
+                        full_to_base[fn]
+                        for fn in full_names
+                        if ":" not in fn
+                        and fn.lower().startswith(target.lower())
+                        and (len(fn) == len(target) or fn[len(target)] != "_")
+                    ]
+                if matches:
+                    matched_base_names.extend(matches)
+                else:
+                    unmatched.append(target)
+
+            if unmatched:
+                display = format_recipients(full_names)
+                error = (
+                    f"Unknown targets: {', '.join(f'@{t}' for t in unmatched)}\n"
+                    f"Available: {display}\n"
+                    f"Tip: @api- matches tag group | @luna matches prefix | underscore blocks (@luna won't match luna_sub)"
+                )
+                return None, error
+
+            unique_instances = list(dict.fromkeys(matched_base_names))
+            if unique_instances:
+                return ("mentions", {"mentions": unique_instances}), None
+
+        # Empty explicit_targets or no matches = broadcast
+        return ("broadcast", {}), None
+
+    # No explicit targets (None) - check for @mentions in message text (backward compat)
     if "@" in message:
         # First check for invalid system notification mention attempts like @[hcom-events]
         # These don't match MENTION_PATTERN but would broadcast to everyone
@@ -468,13 +520,21 @@ def unescape_bash(text: str) -> str:
     return text
 
 
-def send_message(identity: SenderIdentity, message: str, envelope: MessageEnvelope | None = None) -> list[str]:
+def send_message(
+    identity: SenderIdentity,
+    message: str,
+    envelope: MessageEnvelope | None = None,
+    explicit_targets: list[str] | None = None,
+) -> list[str]:
     """Send a message to the database and notify all instances.
 
     Args:
         identity: Sender identity (kind + name + instance_data)
         message: Message text
         envelope: Optional envelope fields {intent, reply_to, thread}
+        explicit_targets: Optional list of explicit target names (from CLI @args).
+                         If provided, these are used for routing instead of parsing
+                         @mentions from message text.
 
     Returns:
         delivered_to list (base names of enabled instances that will receive)
@@ -496,11 +556,11 @@ def send_message(identity: SenderIdentity, message: str, envelope: MessageEnvelo
     participating_rows = conn.execute("SELECT name, tag FROM instances").fetchall()
     participating_instances = [{"name": row["name"], "tag": row["tag"]} for row in participating_rows]
 
-    # For @mention validation: participating instances + CLI identity (bigboss as plain string)
+    # For target validation: participating instances + CLI identity (bigboss as plain string)
     mentionable = participating_instances + [SENDER]
 
-    # Compute scope and routing data (validates @mentions against full names)
-    scope_result, error = compute_scope(message, mentionable)
+    # Compute scope and routing data (validates targets against full names)
+    scope_result, error = compute_scope(message, mentionable, explicit_targets)
     if error:
         raise HcomError(error)
     assert scope_result is not None  # Guaranteed by compute_scope on success
@@ -570,12 +630,12 @@ def send_message(identity: SenderIdentity, message: str, envelope: MessageEnvelo
     except Exception as e:
         raise HcomError(f"Failed to write message to database: {e}")
 
-    # Push to relay server (notify TUI if running, else inline push)
+    # Push to relay server (notify daemon if running, else inline push)
     try:
-        from ..relay import notify_relay_tui, push
+        from ..relay import notify_relay, push
 
-        if not notify_relay_tui():
-            # TUI not running - do inline push
+        if not notify_relay():
+            # Daemon not running - do inline push
             push(force=True)
     except Exception:
         pass  # Best effort
@@ -619,7 +679,7 @@ def get_unread_messages(instance_name: str, update_position: bool = False) -> tu
             message (str): Message text content.
             delivered_to (list[str]): List of instance names message was delivered to.
             event_id (int): Database event ID.
-            intent (str, optional): Message intent ('request', 'inform', 'ack', 'error').
+            intent (str, optional): Message intent ('request', 'inform', 'ack').
             thread (str, optional): Thread name for grouping related messages.
             _relay (dict, optional): Relay metadata for cross-device messages.
     """
@@ -879,8 +939,8 @@ def _build_message_prefix(msg: dict[str, Any]) -> str:
 def format_hook_messages(messages: list[dict[str, Any]], instance_name: str) -> str:
     """Format messages for hook feedback.
 
-    Single message uses verbose format: "sender → you + N others"
-    Multiple messages use compact format: "sender → you (+N)"
+    Single message uses verbose format: "sender → recipient + N others"
+    Multiple messages use compact format: "sender → recipient (+N)"
 
     Format includes envelope info: [intent:thread #id] sender → recipient: text
     """
@@ -930,59 +990,30 @@ def format_hook_messages(messages: list[dict[str, Any]], instance_name: str) -> 
     if hints:
         reason = f"{reason} | [{hints}]"
 
+    # Show recv:intent tip on first receipt of each intent type
+    from .tips import has_seen_tip, mark_tip_seen, TIPS
+
+    for msg in messages:
+        intent = msg.get("intent")
+        if intent:
+            tip_key = f"recv:intent:{intent}"
+            if tip_key in TIPS and not has_seen_tip(instance_name, tip_key):
+                mark_tip_seen(instance_name, tip_key)
+                reason = f"{reason}\n{TIPS[tip_key]}"
+                break  # Only show one tip per delivery
+
     return reason
 
 
 def format_messages_json(messages: list[dict[str, Any]], instance_name: str) -> str:
-    """Format messages as JSON for model injection.
+    """Format messages for model injection.
 
-    Used by all hook-based message delivery (Claude, Gemini) and cmd_listen.
-    Structured format for clear model comprehension.
+    Wraps format_hook_messages output in <hcom> tags for model context.
+    Uses the same human-readable format for both terminal display and model injection.
 
-    Output: <hcom>{"hcom":{"to":"name","messages":[{"id":1,"from":"sender","text":"hello","intent":"request","thread":"foo","bundle_id":"bundle:abcd1234"}]}}</hcom>
-
-    Args:
-        messages: List of message dicts with keys: event_id, from, message, intent, thread
-        instance_name: Recipient instance name
-
-    Returns:
-        JSON string wrapped in <hcom> tags for model injection
+    Output: <hcom>[request #42] sender → recipient: hello world</hcom>
     """
-    import json
-    from .instances import get_full_name
-
-    def _get_sender_display_name(sender_base_name: str) -> str:
-        sender_data = load_instance_position(sender_base_name)
-        return get_full_name(sender_data) or sender_base_name
-
-    msg_list = []
-    for msg in messages:
-        msg_obj: dict = {
-            "id": msg.get("event_id", ""),
-            "from": _get_sender_display_name(msg["from"]),
-            "text": msg["message"],
-        }
-        if msg.get("intent"):
-            msg_obj["intent"] = msg["intent"]
-        if msg.get("thread"):
-            msg_obj["thread"] = msg["thread"]
-        if msg.get("bundle_id"):
-            msg_obj["bundle_id"] = msg["bundle_id"]
-        msg_list.append(msg_obj)
-
-    result_obj: dict = {"hcom": {"to": instance_name, "messages": msg_list}}
-
-    # Add hints if configured
-    instance_data = load_instance_position(instance_name)
-    hints = None
-    if instance_data:
-        hints = instance_data.get("hints")
-    if not hints:
-        hints = get_config().hints
-    if hints:
-        result_obj["hcom"]["hints"] = hints
-
-    return "<hcom>" + json.dumps(result_obj) + "</hcom>"
+    return f"<hcom>{format_hook_messages(messages, instance_name)}</hcom>"
 
 
 def get_read_receipts(

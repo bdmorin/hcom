@@ -30,9 +30,9 @@ from __future__ import annotations
 from typing import Any
 import sys
 import time
-import os
 import socket
 
+from ..core.thread_context import get_background_name
 from ..shared import MAX_MESSAGES_PER_DELIVERY
 from ..core.instances import (
     load_instance_position,
@@ -43,11 +43,15 @@ from ..core.messages import get_unread_messages, format_messages_json
 from ..core.log import log_error, log_info
 
 
-def _check_claude_alive() -> bool:
+def _check_claude_alive(is_background: bool | None = None) -> bool:
     """Check if the parent Claude process is still alive (orphan detection).
 
     Prevents marking messages as read when Claude has died but the hook
     process is still running. This avoids message loss. (not sure this is correct)
+
+    Args:
+        is_background: If True, always return True. If None, falls back to
+                       get_background_name() for thread-safe access.
 
     Returns:
         True if Claude is alive (or if running headless), False if Claude died.
@@ -56,8 +60,10 @@ def _check_claude_alive() -> bool:
         - Background instances: always return True (intentionally detached)
         - Interactive instances: check if stdin is closed (Claude death signal)
     """
-    # Background instances are intentionally detached (HCOM_BACKGROUND is log filename, not '1')
-    if os.environ.get("HCOM_BACKGROUND"):
+    # Background instances are intentionally detached
+    if is_background is None:
+        is_background = bool(get_background_name())
+    if is_background:
         return True
     # stdin closed = Claude Code died
     return not sys.stdin.closed
@@ -92,6 +98,7 @@ def _setup_tcp_notification(instance_name: str) -> tuple[socket.socket | None, b
 def poll_messages(
     instance_id: str,
     timeout: int,
+    is_background: bool | None = None,
 ) -> tuple[int, dict[str, Any] | None, bool]:
     """Stop hook polling loop - NOT used by main path (hcom claude).
 
@@ -111,6 +118,8 @@ def poll_messages(
     Args:
         instance_id: Instance name to poll for
         timeout: Timeout in seconds (wait_timeout for parent, subagent_timeout for subagent)
+        is_background: If True, running in headless mode. If None, falls back to
+                       get_background_name() for thread-safe access.
 
     Returns:
         (exit_code, hook_output, timed_out)
@@ -159,7 +168,10 @@ def poll_messages(
 
         # Set status BEFORE loop (visible immediately)
         # Note: set_status() atomically updates last_stop when status='listening'
-        is_headless = bool(os.environ.get("HCOM_BACKGROUND"))
+        # Resolve is_background with thread-safe fallback
+        if is_background is None:
+            is_background = bool(get_background_name())
+        is_headless = is_background
         current_status = instance_data.get("status", "unknown")
         log_info(
             "hooks",
@@ -207,7 +219,7 @@ def poll_messages(
 
                 if messages:
                     # Orphan detection - don't mark as read if Claude died
-                    if not _check_claude_alive():
+                    if not _check_claude_alive(is_background):
                         return (0, None, False)
 
                     # Limit messages (both parent and subagent) without losing any unread messages.
@@ -275,8 +287,10 @@ def poll_messages(
                     pass
 
     except Exception as e:
-        # Participant context (after gates) - log errors for debugging
-        log_error("hooks", "hook.error", e, hook="poll_messages")
+        import traceback
+
+        # Participant context (after gates) - log with traceback for debugging
+        log_error("hooks", "hook.error", e, hook="poll_messages", tb=traceback.format_exc())
         return (0, None, False)
 
 
@@ -339,7 +353,7 @@ def bind_vanilla_instance_from_marker(
     hook: str,
     error_returns_instance: bool,
 ) -> str | None:
-    """Bind instance based on [HCOM:BIND:name] marker.
+    """Bind instance based on [hcom:name] marker.
 
     Centralizes vanilla binding logic for codex (and potentially other tools).
     Gemini keeps its own parsing due to complex tool_response format.

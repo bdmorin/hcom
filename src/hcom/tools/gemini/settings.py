@@ -10,17 +10,13 @@ Key Functions:
     setup_gemini_hooks: Install all hcom hooks into settings.json
     remove_gemini_hooks: Clean removal of hcom hooks only
     verify_gemini_hooks_installed: Check hooks are correctly configured
-    ensure_hooks_enabled: Set hooks.enabled=true (v0.24.0+ requirement)
+    ensure_hooks_enabled: Set hooksConfig.enabled=true (version-aware)
 
-Settings Structure (v0.24.0+):
-    {
-        "tools": {"enableHooks": true, "allowed": [...]},
-        "hooks": {
-            "enabled": true,
-            "SessionStart": [{"matcher": "*", "hooks": [...]}],
-            ...
-        }
-    }
+Settings Structure:
+    v0.24.0 - v0.25.x:
+        {"hooks": {"enabled": true, "SessionStart": [...]}}
+    v0.26.0+:
+        {"hooksConfig": {"enabled": true}, "hooks": {"SessionStart": [...]}}
 """
 
 from __future__ import annotations
@@ -35,7 +31,7 @@ from ...core.paths import read_file_with_retry, atomic_write
 
 # ==================== Version Detection ====================
 
-GEMINI_MIN_VERSION = (0, 24, 0)  # hooks.enabled schema changed in 0.24.0
+GEMINI_MIN_VERSION = (0, 26, 0)  # Minimum supported version (hooksConfig.enabled schema)
 
 
 def get_gemini_version() -> tuple[int, int, int] | None:
@@ -78,10 +74,10 @@ def get_gemini_version() -> tuple[int, int, int] | None:
 
 
 def is_gemini_version_supported() -> bool:
-    """Check if installed Gemini version supports hcom hooks (>= 0.24.0).
+    """Check if installed Gemini version supports hcom hooks (>= 0.26.0).
 
     Returns True if:
-    - Version detected and >= 0.24.0
+    - Version detected and >= 0.26.0
     - Version cannot be detected (optimistic fallback - don't block users)
     Returns False only if version detected AND too old.
     """
@@ -91,13 +87,37 @@ def is_gemini_version_supported() -> bool:
     return version >= GEMINI_MIN_VERSION
 
 
-def ensure_hooks_enabled() -> bool:
-    """Ensure hooks.enabled = true in Gemini settings.
+def _set_hooks_enabled(settings: dict[str, Any]) -> None:
+    """Set hooksConfig.enabled = true and clean up legacy hooks.enabled if present."""
+    if "hooksConfig" not in settings:
+        settings["hooksConfig"] = {}
+    settings["hooksConfig"]["enabled"] = True
 
-    Gemini v0.24.0+ requires hooks.enabled = true for hooks to run.
+    # Clean up legacy hooks.enabled from older hcom versions
+    hooks = settings.get("hooks")
+    if isinstance(hooks, dict) and isinstance(hooks.get("enabled"), bool):
+        del settings["hooks"]["enabled"]
+        if settings.get("hooks") == {}:
+            del settings["hooks"]
+
+
+def _is_hooks_enabled(settings: dict[str, Any]) -> bool:
+    """Check if hooksConfig.enabled is set."""
+    return settings.get("hooksConfig", {}).get("enabled") is True
+
+
+def ensure_hooks_enabled() -> bool:
+    """Ensure hooksConfig.enabled = true, migrating from legacy hooks.enabled if needed.
+
     Call this on any hcom gemini command to auto-fix settings.
     Returns True if already set or successfully fixed, False on error.
+    Skips mutation if Gemini version < 0.26.0 (to avoid breaking old installs).
     """
+    # Don't mutate settings for old Gemini versions
+    version = get_gemini_version()
+    if version is not None and version < GEMINI_MIN_VERSION:
+        return False  # Old version - don't touch settings
+
     settings_path = get_gemini_settings_path()
     if not settings_path.exists():
         return True  # No settings yet, setup_gemini_hooks will handle it
@@ -107,17 +127,14 @@ def ensure_hooks_enabled() -> bool:
         if settings is None:
             settings = {}
 
-        hooks = settings.get("hooks", {})
-        if not isinstance(hooks, dict):
-            return True  # Malformed, let setup handle it
+        # Check if migration needed (legacy hooks.enabled present)
+        needs_migration = isinstance(settings.get("hooks", {}).get("enabled"), bool)
 
-        if hooks.get("enabled") is True:
+        if _is_hooks_enabled(settings) and not needs_migration:
             return True  # Already correct
 
-        # Need to fix - add hooks.enabled = true
-        if "hooks" not in settings:
-            settings["hooks"] = {}
-        settings["hooks"]["enabled"] = True
+        # Fix settings (sets hooksConfig.enabled, cleans up legacy hooks.enabled)
+        _set_hooks_enabled(settings)
 
         return atomic_write(settings_path, json.dumps(settings, indent=2))
     except Exception:
@@ -129,6 +146,7 @@ from ...core.tool_utils import (
     build_gemini_permissions,
     build_hcom_hook_patterns,
     HCOM_ENV_VAR_PATTERNS,
+    _build_all_gemini_permission_patterns,
 )
 
 # ==================== Permission Configuration ====================
@@ -241,18 +259,22 @@ def _remove_hcom_hooks_from_gemini_settings(settings: dict[str, Any]) -> None:
         else:
             del settings["hooks"][hook_type]
 
-    # Clean up empty hooks dict (but preserve hooks.enabled)
-    hooks_dict = settings.get("hooks", {})
-    if isinstance(hooks_dict, dict):
-        non_empty_keys = [k for k, v in hooks_dict.items() if k == "enabled" or v]
-        if not non_empty_keys:
-            del settings["hooks"]
+    # Clean up legacy hooks.enabled (schema-invalid in 0.26.0+)
+    hooks = settings.get("hooks")
+    if isinstance(hooks, dict) and isinstance(hooks.get("enabled"), bool):
+        del settings["hooks"]["enabled"]
 
-    # Remove hcom permission patterns from tools.allowed
+    # Clean up empty hooks dict
+    hooks_dict = settings.get("hooks", {})
+    if isinstance(hooks_dict, dict) and not hooks_dict:
+        del settings["hooks"]
+
+    # Remove hcom permission patterns from tools.allowed (both hcom and uvx hcom variants)
     if "tools" in settings and isinstance(settings["tools"], dict):
         allowed = settings["tools"].get("allowed")
         if isinstance(allowed, list):
-            settings["tools"]["allowed"] = [p for p in allowed if p not in GEMINI_HCOM_PERMISSIONS]
+            all_hcom_patterns = _build_all_gemini_permission_patterns()
+            settings["tools"]["allowed"] = [p for p in allowed if p not in all_hcom_patterns]
             if not settings["tools"]["allowed"]:
                 del settings["tools"]["allowed"]
 
@@ -312,9 +334,10 @@ def setup_gemini_hooks(include_permissions: bool = True) -> bool:
             if pattern not in settings["tools"]["allowed"]:
                 settings["tools"]["allowed"].append(pattern)
     else:
-        # Remove hcom permissions if disabled
+        # Remove hcom permissions if disabled (both hcom and uvx hcom variants)
         if "allowed" in settings["tools"]:
-            settings["tools"]["allowed"] = [p for p in settings["tools"]["allowed"] if p not in GEMINI_HCOM_PERMISSIONS]
+            all_hcom_patterns = _build_all_gemini_permission_patterns()
+            settings["tools"]["allowed"] = [p for p in settings["tools"]["allowed"] if p not in all_hcom_patterns]
             if not settings["tools"]["allowed"]:
                 del settings["tools"]["allowed"]
 
@@ -330,12 +353,12 @@ def setup_gemini_hooks(include_permissions: bool = True) -> bool:
     # HCOM_DIR is inherited from container/shell environment - not baked into command
     hcom_cmd = build_hcom_command()
 
-    # Build hooks from config (handle malformed hooks gracefully)
+    # Set hooksConfig.enabled and clean up legacy hooks.enabled if present
+    _set_hooks_enabled(settings)
+
+    # Ensure hooks dict exists for adding hook entries
     if not isinstance(settings.get("hooks"), dict):
         settings["hooks"] = {}
-
-    # Gemini v0.24.0+ requires hooks.enabled = true (defaults to false)
-    settings["hooks"]["enabled"] = True
 
     for hook_type, matcher, cmd_suffix, timeout, description in GEMINI_HOOK_CONFIGS:
         hook_name = f"hcom-{hook_type.lower()}"
@@ -383,13 +406,13 @@ def _verify_gemini_hooks_at(settings_path: Path, check_permissions: bool = True)
         # Note: skipNextSpeakerCheck no longer enforced (bug was fixed in Gemini CLI)
         # Previously required False, now left at default (true) to avoid verbose loops
 
+        # Check hooksConfig.enabled is set
+        if not _is_hooks_enabled(settings):
+            return False
+
         # Check all hook types
         hooks = settings.get("hooks", {})
         if not isinstance(hooks, dict):
-            return False
-
-        # Gemini v0.24.0+ requires hooks.enabled = true
-        if hooks.get("enabled") is not True:
             return False
 
         # Build expected command (HCOM_DIR inherited from environment)
@@ -460,9 +483,9 @@ def verify_gemini_hooks_installed(check_permissions: bool = True) -> bool:
     """Verify that hcom hooks are correctly installed in Gemini settings.
 
     Checks:
+    - Hooks enabled flag set in correct location (version-aware)
     - All hook types from GEMINI_HOOK_CONFIGS exist
     - Each has exactly one hcom hook with correct command
-    - skipNextSpeakerCheck is False
     - If check_permissions, all GEMINI_HCOM_PERMISSIONS are in tools.allowed
 
     Args:

@@ -66,6 +66,7 @@ from .input import (
     calculate_text_input_rows,
     text_input_insert,
     text_input_backspace,
+    text_input_delete,
     text_input_move_left,
     text_input_move_right,
 )
@@ -80,11 +81,12 @@ from .colors import (
     FG_YELLOW,
     FG_LIGHTGRAY,
     FG_ORANGE,
+    FG_RED,
     FG_DELIVER,
     FG_CYAN,
     FG_BLACK,
+    FG_STALE,
     BG_CHARCOAL,
-    BG_GRAY,
     BG_GOLD,
 )
 
@@ -100,7 +102,7 @@ from ..core.instances import get_status_icon
 # Import from source modules
 from ..core.config import get_config
 from ..commands.messaging import cmd_send
-from ..commands.lifecycle import cmd_stop
+from ..commands.lifecycle import cmd_stop, cmd_fork
 
 
 class ManageScreen:
@@ -140,6 +142,7 @@ class ManageScreen:
         is_remote: bool = False,
         show_tool: bool = False,
         project_tag: str = "",
+        age_col_width: int = 10,
     ) -> str:
         """Render a single instance row with status indicator and details.
 
@@ -156,18 +159,12 @@ class ManageScreen:
         Returns:
             Formatted line string with ANSI colors.
         """
-        from ..core.instances import is_launching_placeholder
-
         # Row exists = participating (no enabled field)
         status = info.get("status", "unknown")
 
         # Use get_status_icon for adhoc-aware icon selection
         instance_data = info.get("data", {})
         icon = get_status_icon(instance_data, status) if instance_data else "?"
-
-        # Mask name for launching placeholders (temp name that will change during resume)
-        if is_launching_placeholder(instance_data):
-            name = "· · ·"
         color = STATUS_FG.get(status, FG_WHITE)
 
         # Get binding status (needed for both tool prefix and timeout warning)
@@ -180,26 +177,26 @@ class ManageScreen:
         tool_prefix_info = None
         if show_tool:
             tool = info.get("data", {}).get("tool", "claude")
-            # Tool colors: brand-aligned, dark/muted for subtlety
-            tool_colors = {
-                "claude": "\033[48;5;94m",  # Dark rust/brown (Anthropic)
-                "gemini": "\033[48;5;54m",  # Dark purple (Google Gemini)
-                "codex": "\033[48;5;23m",  # Dark teal (OpenAI/ChatGPT)
+            # Tool colors: foreground-only, dim
+            tool_fg_colors = {
+                "claude": "\033[38;5;173m",  # Muted rust (Anthropic)
+                "gemini": "\033[38;5;140m",  # Muted purple (Google Gemini)
+                "codex": "\033[38;5;73m",  # Muted teal (OpenAI/ChatGPT)
             }
-            tool_bg = tool_colors.get(tool, BG_GRAY)
+            tool_fg = tool_fg_colors.get(tool, FG_GRAY)
             # Display based on binding: UPPER=pty+hooks, lower=hooks, UPPER*=pty only, lower*=none
             if bindings["process_bound"] and bindings["hooks_bound"]:
-                tool_display = tool.upper()  # CLAUDE - pty + hooks
+                tool_display = tool[:3]  # cla / gem / cod
             elif bindings["process_bound"]:
-                tool_display = tool.upper() + "*"  # CLAUDE* - pty only (unusual)
+                tool_display = tool[:3] + "*"  # cla* - pty only (unusual)
             elif bindings["hooks_bound"]:
-                tool_display = tool.lower()  # claude - hooks only
+                tool_display = tool[:3]  # cla - hooks only
             elif tool != "adhoc":
-                tool_display = tool.lower() + "*"  # claude* - no binding
+                tool_display = tool[:3] + "*"  # cla* - no binding
             else:
-                tool_display = "ad-hoc"  # ad-hoc tool type
-            tool_label = tool_display[:7].ljust(7)  # Pad to 7 chars (for CLAUDE*)
-            tool_prefix_info = (tool_bg, tool_label)
+                tool_display = "ah"  # ad-hoc tool type
+            tool_label = tool_display.ljust(4)  # Pad to 4 chars
+            tool_prefix_info = (tool_fg, tool_label)
 
         # Light green coloring for message delivery (active with deliver token)
         status_context = info.get("data", {}).get("status_context", "")
@@ -221,8 +218,8 @@ class ManageScreen:
 
         age_text = info.get("age_text", "")
         # "now" special case (listening status uses age=0)
-        age_str = age_text if age_text == "now" else (f"{age_text} ago" if age_text else "")
-        age_padded = age_str.rjust(10)
+        age_str = age_text if age_text == "now" else (age_text if age_text else "")
+        age_padded = age_str.rjust(age_col_width)
 
         # Badges
         is_background = info.get("data", {}).get("background", False)
@@ -289,8 +286,8 @@ class ManageScreen:
         # Build tool prefix
         tool_prefix = ""
         if tool_prefix_info:
-            tool_bg, tool_label = tool_prefix_info
-            tool_prefix = f"{tool_bg}{FG_WHITE} {tool_label}{RESET}"
+            tool_fg, tool_label = tool_prefix_info
+            tool_prefix = f"{DIM}{tool_fg}{tool_label}{RESET}"
 
         # Left border indicators: orange for detail open, yellow for unread
         # Indicator adds 1 char width (pushes content right) - matches original detail behavior
@@ -305,7 +302,7 @@ class ManageScreen:
             else:
                 border = f"{BG_CHARCOAL} "
             line = (
-                f"{tool_prefix}{border}{color}{icon} {weight}{color}{name_padded}{RESET}{BG_CHARCOAL}{weight}"
+                f"{BG_CHARCOAL}{tool_prefix}{border}{color}{icon} {weight}{color}{name_padded}{RESET}{BG_CHARCOAL}"
                 f"{FG_GRAY}{age_padded}{desc_sep}{display_text}{timeout_marker}{RESET}"
             )
             line = truncate_ansi(line, width)
@@ -315,7 +312,41 @@ class ManageScreen:
                 border = f"{FG_YELLOW}▐{RESET} "
             else:
                 border = " "
-            line = f"{tool_prefix}{border}{color}{icon}{RESET} {weight}{color}{name_padded}{RESET}{weight}{FG_GRAY}{age_padded}{desc_sep}{display_text}{timeout_marker}{RESET}"
+            line = f"{tool_prefix}{border}{color}{icon}{RESET} {weight}{color}{name_padded}{RESET}{FG_GRAY}{age_padded}{desc_sep}{display_text}{timeout_marker}{RESET}"
+            line = truncate_ansi(line, width)
+
+        return line
+
+    def _render_orphan_row(self, orphan: dict, display_idx: int, width: int) -> str:
+        """Render an orphan process row (running hcom process not in active instances)"""
+        pid = orphan["pid"]
+        names = orphan.get("names", [])
+        tool = orphan.get("tool", "unknown")
+        launched_at = orphan.get("launched_at", 0)
+
+        # Format: "  ◌ pid:12345 (luna, nova) · claude · 16m"
+        names_str = f" ({', '.join(names)})" if names else ""
+        age_str = format_age(time.time() - launched_at) if launched_at else ""
+        content = f" ◌ pid:{pid}{names_str} · {tool}"
+        if age_str:
+            content += f" · {age_str}"
+
+        # Check if kill confirmation is pending for this orphan
+        orphan_key = f"orphan:{pid}"
+        is_confirming = (
+            self.state.confirm.pending_stop == orphan_key
+            and (time.time() - self.state.confirm.pending_stop_time) <= self.tui.CONFIRMATION_TIMEOUT
+        )
+
+        if is_confirming:
+            content += f"  {FG_RED}[Enter to kill]{RESET}"
+
+        if display_idx == self.state.manage.cursor:
+            line = f"{BG_CHARCOAL}{DIM}{FG_GRAY}{content}{RESET}"
+            line = truncate_ansi(line, width)
+            line = bg_ljust(line, width, BG_CHARCOAL)
+        else:
+            line = f"{DIM}{FG_GRAY}{content}{RESET}"
             line = truncate_ansi(line, width)
 
         return line
@@ -333,15 +364,15 @@ class ManageScreen:
         arrow = "[→]"
 
         # Format: "  ◌ Recently stopped (10m): luna, nova, kira  [→]"
-        content = f"  ◌ Recently stopped ({RECENTLY_STOPPED_MINUTES}m): {names}  {arrow}"
+        content = f" Recently stopped ({RECENTLY_STOPPED_MINUTES}m): {names}  {arrow}"
 
-        # Apply styling based on cursor position
+        # Styled distinctly from orphan PID rows (which use DIM FG_GRAY)
         if display_idx == self.state.manage.cursor:
-            line = f"{BG_CHARCOAL}{FG_GRAY}{content}{RESET}"
+            line = f"{BG_CHARCOAL}{DIM}{FG_STALE}{content}{RESET}"
             line = truncate_ansi(line, width)
             line = bg_ljust(line, width, BG_CHARCOAL)
         else:
-            line = f"{DIM}{FG_GRAY}{content}{RESET}"
+            line = f"{DIM}{FG_STALE}{content}{RESET}"
             line = truncate_ansi(line, width)
 
         return line
@@ -349,7 +380,7 @@ class ManageScreen:
     def build(self, height: int, width: int) -> List[str]:
         """Build the complete manage screen as a list of lines.
 
-        Constructs the visual layout including:
+        Delegates to sub-methods for each section:
         - Instance list (with scrolling if needed)
         - Instance detail panel (if an instance is selected)
         - Message history
@@ -362,14 +393,45 @@ class ManageScreen:
         Returns:
             List of formatted line strings ready for display.
         """
-        # Use minimum height for layout calculation to maintain structure
         layout_height = max(10, height)
-
-        lines = []
-
-        # Calculate layout using shared function
+        lines: List[str] = []
         instance_rows, message_rows, input_rows = self.calculate_layout(layout_height, width)
 
+        # Instance list section
+        self._build_instance_list(lines, instance_rows, width)
+
+        # Separator between instances and messages/detail
+        lines.append(separator_line(width))
+
+        # Instance detail section (if active) - render ABOVE messages
+        detail_rows = 0
+        if self.state.manage.show_instance_detail:
+            detail_lines = self.build_instance_detail(self.state.manage.show_instance_detail, width)
+            lines.extend(detail_lines)
+            detail_rows = len(detail_lines)
+            lines.append(separator_line(width))
+            detail_rows += 1  # Include separator in count
+
+        # Messages section
+        self._build_messages(lines, message_rows - detail_rows, width)
+
+        # Pad and add input section at bottom
+        input_section_height = input_rows + 2  # input + 2 separators
+        max_lines_before_input = height - input_section_height
+
+        if len(lines) > max_lines_before_input:
+            lines = lines[:max_lines_before_input]
+        while len(lines) < max_lines_before_input:
+            lines.append("")
+
+        lines.append(separator_line(width))
+        lines.extend(self.render_wrapped_input(width, input_rows))
+        lines.append(separator_line(width))
+
+        return lines
+
+    def _build_instance_list(self, lines: List[str], instance_rows: int, width: int):
+        """Build instance list rows including cursor management and scrolling."""
         from ..core.instances import is_remote_instance
         from ..core.db import get_recently_stopped
 
@@ -389,6 +451,12 @@ class ManageScreen:
         # Get recently stopped instances (from events, last 10 min)
         active_names = set(self.state.manage.instances.keys())
         recently_stopped = get_recently_stopped(exclude_active=active_names)
+
+        # Get orphan processes (running hcom-launched processes not in active instances)
+        from ..core.pidtrack import get_orphan_processes
+
+        active_pids = {i.get("data", {}).get("pid") for _, i in all_instances if i.get("data", {}).get("pid")}
+        orphan_processes = get_orphan_processes(active_pids=active_pids)
 
         # Auto-expand remote section if user hasn't explicitly toggled
         # Expand if count <= 3 OR any device synced < 5min ago
@@ -417,8 +485,9 @@ class ManageScreen:
             if not found and self.state.manage.show_remote:
                 for i, (name, _) in enumerate(remote_instances):
                     if name == target_name:
-                        # Position = local_count + 1 (remote separator) + index
-                        self.state.manage.cursor = len(local_instances) + 1 + i
+                        # Position = local + orphans + stopped + separator + index
+                        remote_sep_pos = len(local_instances) + len(orphan_processes) + (1 if recently_stopped else 0)
+                        self.state.manage.cursor = remote_sep_pos + 1 + i
                         found = True
                         break
 
@@ -426,12 +495,13 @@ class ManageScreen:
                 # Instance disappeared (likely removed), move cursor to next logical position
                 # Calculate total display count first
                 temp_display_count = len(local_instances)
+                temp_display_count += len(orphan_processes)
+                if recently_stopped:
+                    temp_display_count += 1  # recently stopped row
                 if remote_count > 0:
                     temp_display_count += 1  # remote separator
                     if self.state.manage.show_remote:
                         temp_display_count += remote_count
-                if recently_stopped:
-                    temp_display_count += 1  # recently stopped row
 
                 # Keep cursor at same position or move up if we were at the end
                 if temp_display_count > 0:
@@ -444,28 +514,30 @@ class ManageScreen:
                 self.state.manage.cursor_instance_name = None
                 self.sync_scroll_to_cursor()
 
-        # Calculate total display items for cursor bounds (local + remote + recently_stopped)
+        # Calculate total display items for cursor bounds
+        # Order: local → orphans → recently_stopped → relay separator → remote
         display_count = len(local_instances)
+        orphan_start_pos = display_count
+        display_count += len(orphan_processes)
+        if recently_stopped:
+            display_count += 1  # recently stopped summary row
+        recently_stopped_pos = display_count - 1 if recently_stopped else -1
+        remote_sep = display_count if remote_count > 0 else -1
         if remote_count > 0:
             display_count += 1  # remote separator row
             if self.state.manage.show_remote:
                 display_count += remote_count
-        if recently_stopped:
-            display_count += 1  # recently stopped summary row
-
-        # Calculate separator position for cursor tracking
-        remote_sep = len(local_instances) if remote_count > 0 else -1
 
         # Ensure cursor is valid
         if display_count > 0:
             self.state.manage.cursor = max(0, min(self.state.manage.cursor, display_count - 1))
-            # Update tracked instance name (None if on separator)
+            # Update tracked instance name (None if on separator/orphan/stopped)
             cursor = self.state.manage.cursor
             if cursor < len(local_instances):
                 self.state.manage.cursor_instance_name = local_instances[cursor][0]
             elif remote_sep >= 0 and cursor == remote_sep:
                 self.state.manage.cursor_instance_name = None  # Remote separator
-            elif self.state.manage.show_remote and remote_count > 0:
+            elif remote_sep >= 0 and self.state.manage.show_remote and cursor > remote_sep:
                 remote_idx = cursor - remote_sep - 1
                 if remote_idx < remote_count:
                     self.state.manage.cursor_instance_name = remote_instances[remote_idx][0]
@@ -477,8 +549,8 @@ class ManageScreen:
             self.state.manage.cursor = 0
             self.state.manage.cursor_instance_name = None
 
-        # Empty state - no instances (neither local nor remote)
-        if len(local_instances) == 0 and remote_count == 0:
+        # Empty state - no instances and no orphan processes
+        if len(local_instances) == 0 and remote_count == 0 and not orphan_processes:
             lines.append("")
             lines.append(f"{FG_ORANGE}  ╦ ╦╔═╗╔═╗╔╦╗{RESET}")
             lines.append(f"{FG_ORANGE}  ╠═╣║  ║ ║║║║{RESET}")
@@ -499,88 +571,165 @@ class ManageScreen:
             # Pad to instance_rows
             while len(lines) < instance_rows:
                 lines.append("")
-        else:
-            # Calculate total display items: local + remote section + recently stopped
-            display_count = len(local_instances)
-            if remote_count > 0:
-                display_count += 1  # remote separator row
-                if self.state.manage.show_remote:
-                    display_count += remote_count
-            if recently_stopped:
-                display_count += 1  # recently stopped summary row
+            return
 
-            # Track recently stopped row position for cursor
-            recently_stopped_pos = display_count - 1 if recently_stopped else -1
-            self._recently_stopped_row_pos = recently_stopped_pos
-
-            # Calculate visible window
-            max_scroll = max(0, display_count - instance_rows)
-            self.state.manage.instance_scroll_pos = max(0, min(self.state.manage.instance_scroll_pos, max_scroll))
-
-            # Calculate dynamic name column width based on actual names
-            all_for_width = list(local_instances)
+        # Calculate total display items: local → orphans → stopped → relay → remote
+        display_count = len(local_instances)
+        orphan_start_pos = display_count
+        display_count += len(orphan_processes)
+        if recently_stopped:
+            display_count += 1  # recently stopped summary row
+        recently_stopped_pos = display_count - 1 if recently_stopped else -1
+        self._recently_stopped_row_pos = recently_stopped_pos
+        remote_sep = display_count if remote_count > 0 else -1
+        if remote_count > 0:
+            display_count += 1  # remote separator row
             if self.state.manage.show_remote:
-                all_for_width += remote_instances
-            max_instance_name_len = max((len(name) for name, _ in all_for_width), default=0)
-            # Check if any instance has badges
-            has_background = any(info.get("data", {}).get("background", False) for _, info in all_for_width)
+                display_count += remote_count
 
-            # Check if multiple tool types exist (show tool prefix if so)
-            all_instances_for_tool = local_instances + remote_instances
-            tool_types = set(info.get("data", {}).get("tool", "claude") for _, info in all_instances_for_tool)
-            show_tool = len(tool_types) > 1
+        # Calculate visible window
+        max_scroll = max(0, display_count - instance_rows)
+        self.state.manage.instance_scroll_pos = max(0, min(self.state.manage.instance_scroll_pos, max_scroll))
 
-            # Check if multiple directories exist (show project tag if so)
-            from ..shared import get_project_tag
+        # Calculate dynamic name column width based on actual names
+        all_for_width = list(local_instances)
+        if self.state.manage.show_remote:
+            all_for_width += remote_instances
+        max_instance_name_len = max((len(name) for name, _ in all_for_width), default=0)
+        # Check if any instance has badges
+        has_background = any(info.get("data", {}).get("background", False) for _, info in all_for_width)
 
-            directories = set(
-                info.get("data", {}).get("directory", "")
-                for _, info in all_instances_for_tool
-                if info.get("data", {}).get("directory")
+        # Check if multiple tool types exist (show tool prefix if so)
+        all_instances_for_tool = local_instances + remote_instances
+        tool_types = set(info.get("data", {}).get("tool", "claude") for _, info in all_instances_for_tool)
+        show_tool = len(tool_types) > 1
+
+        # Check if multiple directories exist (show project tag if so)
+        from ..shared import get_project_tag
+
+        directories = set(
+            info.get("data", {}).get("directory", "")
+            for _, info in all_instances_for_tool
+            if info.get("data", {}).get("directory")
+        )
+        show_project = len(directories) > 1
+
+        # Calculate max badge length for column width
+        badge_len = 0
+        if has_background:
+            badge_len += 11  # " [headless]"
+        # Note: tool prefix (CLAUDE/CODEX) is rendered separately, not counted here
+        if show_project:
+            # " · " + max project tag length
+            max_tag_len = max(
+                (
+                    len(get_project_tag(info.get("data", {}).get("directory", "")))
+                    for _, info in all_for_width
+                    if info.get("data", {}).get("directory")
+                ),
+                default=0,
             )
-            show_project = len(directories) > 1
+            badge_len += 3 + max_tag_len  # " · " + tag
+        # Compute dynamic age column width from visible instances
+        def _age_str_len(info: dict) -> int:
+            age_text = info.get("age_text", "")
+            s = age_text if age_text == "now" else (age_text if age_text else "")
+            return len(s)
 
-            # Calculate max badge length for column width
-            badge_len = 0
-            if has_background:
-                badge_len += 11  # " [headless]"
-            if show_tool:
-                badge_len += 8  # " CLAUDE " prefix
-            if show_project:
-                # " · " + max project tag length
-                max_tag_len = max(
-                    (
-                        len(get_project_tag(info.get("data", {}).get("directory", "")))
-                        for _, info in all_for_width
-                        if info.get("data", {}).get("directory")
-                    ),
-                    default=0,
+        age_col_width = max(
+            (_age_str_len(info) for _, info in all_for_width),
+            default=3,
+        )
+        age_col_width = max(3, age_col_width)  # minimum "now"
+
+        # Add 2 for cursor icon/spacing
+        name_col_width = max_instance_name_len + badge_len + 2
+        # Only clamp name if it would leave no room for age+sep at all
+        tool_prefix_width = 4 if show_tool else 0
+        # Minimum reserved: tool + icon(2) + age + sep(2) — no description minimum
+        min_reserved = 4 + age_col_width + tool_prefix_width
+        name_col_width = min(name_col_width, max(6, width - min_reserved))
+
+        # Build display rows
+        visible_start = self.state.manage.instance_scroll_pos
+        visible_end = min(visible_start + instance_rows, display_count)
+
+        # If only 1 item would be hidden, show it instead of scroll indicator
+        if visible_start == 1:
+            visible_start = 0
+        if display_count - visible_end == 1:
+            visible_end = display_count
+
+        for display_idx in range(visible_start, visible_end):
+            # Order: local → orphans → recently_stopped → relay separator → remote
+            if display_idx < len(local_instances):
+                # Local instance
+                name, info = local_instances[display_idx]
+                project_tag = get_project_tag(info.get("data", {}).get("directory", "")) if show_project else ""
+                line = self._render_instance_row(
+                    name,
+                    info,
+                    display_idx,
+                    name_col_width,
+                    width,
+                    show_tool=show_tool,
+                    project_tag=project_tag,
+                    age_col_width=age_col_width,
                 )
-                badge_len += 3 + max_tag_len  # " · " + tag
-            # Unread count now shown as superscript on icon (○³), doesn't affect name column
-            # Add 2 for cursor icon/spacing
-            name_col_width = max_instance_name_len + badge_len + 2
-            # Set bounds: min 20, max based on terminal width
-            # Reserve: 2 (icon) + 10 (age) + 2 (sep) + 15 (desc min) = 29
-            # Prioritize showing full instance names over description space
-            max_name_width = max(20, width - 29)
-            name_col_width = max(20, min(name_col_width, max_name_width))
+                lines.append(line)
+            elif orphan_start_pos <= display_idx < orphan_start_pos + len(orphan_processes):
+                # Orphan process row
+                orphan_idx = display_idx - orphan_start_pos
+                line = self._render_orphan_row(orphan_processes[orphan_idx], display_idx, width)
+                lines.append(line)
+            elif recently_stopped_pos >= 0 and display_idx == recently_stopped_pos:
+                # Recently stopped summary row
+                line = self._render_recently_stopped_row(recently_stopped, display_idx, width)
+                lines.append(line)
+            elif remote_sep >= 0 and display_idx == remote_sep:
+                # Relay separator row
+                is_cursor = display_idx == self.state.manage.cursor
+                arrow = "▼" if self.state.manage.show_remote else "▶"
 
-            # Build display rows
-            visible_start = self.state.manage.instance_scroll_pos
-            visible_end = min(visible_start + instance_rows, display_count)
+                # Build sync status when expanded: relay (BOXE:1m, CATA:2s) ▼
+                if self.state.manage.show_remote and self.state.manage.device_sync_times:
+                    device_suffixes = {}
+                    for name, info in remote_instances:
+                        origin_device = info.get("data", {}).get("origin_device_id", "")
+                        if origin_device and ":" in name:
+                            suffix = name.rsplit(":", 1)[1]
+                            device_suffixes[origin_device] = suffix
 
-            # If only 1 item would be hidden, show it instead of scroll indicator
-            if visible_start == 1:
-                visible_start = 0
-            if display_count - visible_end == 1:
-                visible_end = display_count
+                    sync_parts = []
+                    for device, sync_time in sorted(self.state.manage.device_sync_times.items()):
+                        if sync_time:
+                            sync_age = time.time() - sync_time
+                            suffix = device_suffixes.get(device, device[:4].upper())
+                            color = get_device_sync_color(sync_age)
+                            sync_parts.append(f"{color}{suffix}:{format_age(sync_age)}{FG_GRAY}")
 
-            for display_idx in range(visible_start, visible_end):
-                # Determine what this display row represents
-                if display_idx < len(local_instances):
-                    # Local instance
-                    name, info = local_instances[display_idx]
+                    if sync_parts:
+                        sep_text = f" relay ({', '.join(sync_parts)}) {arrow} "
+                    else:
+                        sep_text = f" relay ({remote_count}) {arrow} "
+                else:
+                    sep_text = f" relay ({remote_count}) {arrow} "
+
+                text_len = ansi_len(sep_text)
+                left_pad = max(0, (width - text_len) // 2)
+                right_pad = max(0, width - text_len - left_pad)
+                sep_line = f"{'─' * left_pad}{sep_text}{'─' * right_pad}"
+                if is_cursor:
+                    line = f"{BG_CHARCOAL}{FG_GRAY}{sep_line}{RESET}"
+                    line = bg_ljust(line, width, BG_CHARCOAL)
+                else:
+                    line = f"{FG_GRAY}{sep_line}{RESET}"
+                lines.append(truncate_ansi(line, width))
+            elif remote_sep >= 0 and self.state.manage.show_remote and display_idx > remote_sep:
+                # Remote instance (only when expanded)
+                remote_idx = display_idx - remote_sep - 1
+                if 0 <= remote_idx < remote_count:
+                    name, info = remote_instances[remote_idx]
                     project_tag = get_project_tag(info.get("data", {}).get("directory", "")) if show_project else ""
                     line = self._render_instance_row(
                         name,
@@ -588,133 +737,57 @@ class ManageScreen:
                         display_idx,
                         name_col_width,
                         width,
+                        is_remote=True,
                         show_tool=show_tool,
                         project_tag=project_tag,
+                        age_col_width=age_col_width,
                     )
                     lines.append(line)
-                elif remote_sep >= 0 and display_idx == remote_sep:
-                    # Relay separator row (no dot here - dot is in top bar)
-                    is_cursor = display_idx == self.state.manage.cursor
-                    arrow = "▼" if self.state.manage.show_remote else "▶"
 
-                    # Build sync status when expanded: relay (BOXE:1m, CATA:2s) ▼
-                    if self.state.manage.show_remote and self.state.manage.device_sync_times:
-                        # Build device_id -> suffix mapping from remote instances
-                        device_suffixes = {}
-                        for name, info in remote_instances:
-                            origin_device = info.get("data", {}).get("origin_device_id", "")
-                            if origin_device and ":" in name:
-                                suffix = name.rsplit(":", 1)[1]
-                                device_suffixes[origin_device] = suffix
+        # Add scroll indicators if needed
+        if display_count > instance_rows:
+            # If cursor will conflict with indicator, move cursor line first
+            if visible_start > 0 and self.state.manage.cursor == visible_start:
+                # Save cursor line (at position 0), move to position 1
+                cursor_line = lines[0] if lines else ""
+                lines[0] = lines[1] if len(lines) > 1 else ""
+                if len(lines) > 1:
+                    lines[1] = cursor_line
 
-                        sync_parts = []
-                        for device, sync_time in sorted(self.state.manage.device_sync_times.items()):
-                            if sync_time:
-                                sync_age = time.time() - sync_time
-                                suffix = device_suffixes.get(device, device[:4].upper())
-                                color = get_device_sync_color(sync_age)
-                                sync_parts.append(f"{color}{suffix}:{format_age(sync_age)}{FG_GRAY}")
+            if visible_end < display_count and self.state.manage.cursor == visible_end - 1:
+                # Save cursor line (at position -1), move to position -2
+                cursor_line = lines[-1] if lines else ""
+                lines[-1] = lines[-2] if len(lines) > 1 else ""
+                if len(lines) > 1:
+                    lines[-2] = cursor_line
 
-                        if sync_parts:
-                            sep_text = f" relay ({', '.join(sync_parts)}) {arrow} "
-                        else:
-                            sep_text = f" relay ({remote_count}) {arrow} "
-                    else:
-                        sep_text = f" relay ({remote_count}) {arrow} "
+            # Now add indicators at edges (may overwrite moved content, that's fine)
+            if visible_start > 0:
+                count_above = visible_start
+                indicator = f"{FG_GRAY}↑ {count_above} more{RESET}"
+                if lines:
+                    lines[0] = ansi_ljust(indicator, width)
 
-                    pad_len = max(0, (width - ansi_len(sep_text) - 2) // 2)
-                    sep_line = f"{'─' * pad_len}{sep_text}{'─' * pad_len}"
-                    if is_cursor:
-                        line = f"{BG_CHARCOAL}{FG_GRAY}{sep_line}{RESET}"
-                        line = bg_ljust(line, width, BG_CHARCOAL)
-                    else:
-                        line = f"{FG_GRAY}{sep_line}{RESET}"
-                    lines.append(truncate_ansi(line, width))
-                elif self.state.manage.show_remote and remote_count > 0:
-                    # Remote instance (only when expanded)
-                    remote_idx = display_idx - remote_sep - 1
-                    if 0 <= remote_idx < remote_count:
-                        name, info = remote_instances[remote_idx]
-                        project_tag = get_project_tag(info.get("data", {}).get("directory", "")) if show_project else ""
-                        line = self._render_instance_row(
-                            name,
-                            info,
-                            display_idx,
-                            name_col_width,
-                            width,
-                            is_remote=True,
-                            show_tool=show_tool,
-                            project_tag=project_tag,
-                        )
-                        lines.append(line)
-                    elif recently_stopped_pos >= 0 and display_idx == recently_stopped_pos:
-                        # Recently stopped summary row
-                        line = self._render_recently_stopped_row(recently_stopped, display_idx, width)
-                        lines.append(line)
-                elif recently_stopped_pos >= 0 and display_idx == recently_stopped_pos:
-                    # Recently stopped summary row (when remote not expanded or no remote)
-                    line = self._render_recently_stopped_row(recently_stopped, display_idx, width)
-                    lines.append(line)
+            if visible_end < display_count:
+                count_below = display_count - visible_end
+                indicator = f"{FG_GRAY}↓ {count_below} more{RESET}"
+                if lines:
+                    lines[-1] = ansi_ljust(indicator, width)
 
-            # Add scroll indicators if needed
-            if display_count > instance_rows:
-                # If cursor will conflict with indicator, move cursor line first
-                if visible_start > 0 and self.state.manage.cursor == visible_start:
-                    # Save cursor line (at position 0), move to position 1
-                    cursor_line = lines[0] if lines else ""
-                    lines[0] = lines[1] if len(lines) > 1 else ""
-                    if len(lines) > 1:
-                        lines[1] = cursor_line
+        # Pad instances
+        while len(lines) < instance_rows:
+            lines.append("")
 
-                if visible_end < display_count and self.state.manage.cursor == visible_end - 1:
-                    # Save cursor line (at position -1), move to position -2
-                    cursor_line = lines[-1] if lines else ""
-                    lines[-1] = lines[-2] if len(lines) > 1 else ""
-                    if len(lines) > 1:
-                        lines[-2] = cursor_line
-
-                # Now add indicators at edges (may overwrite moved content, that's fine)
-                if visible_start > 0:
-                    count_above = visible_start
-                    indicator = f"{FG_GRAY}↑ {count_above} more{RESET}"
-                    if lines:
-                        lines[0] = ansi_ljust(indicator, width)
-
-                if visible_end < display_count:
-                    count_below = display_count - visible_end
-                    indicator = f"{FG_GRAY}↓ {count_below} more{RESET}"
-                    if lines:
-                        lines[-1] = ansi_ljust(indicator, width)
-
-            # Pad instances
-            while len(lines) < instance_rows:
-                lines.append("")
-
-        # Separator
-        lines.append(separator_line(width))
-
-        # Instance detail section (if active) - render ABOVE messages
-        detail_rows = 0
-        if self.state.manage.show_instance_detail:
-            detail_lines = self.build_instance_detail(self.state.manage.show_instance_detail, width)
-            lines.extend(detail_lines)
-            detail_rows = len(detail_lines)
-            # Separator after detail
-            lines.append(separator_line(width))
-            detail_rows += 1  # Include separator in count
-
-        # Calculate remaining message rows (subtract detail from message budget)
-        actual_message_rows = message_rows - detail_rows
-
-        # Messages - Slack-style format with sender on separate line
-        if self.state.manage.messages and actual_message_rows > 0:
-            all_wrapped_lines = []
+    def _build_messages(self, lines: List[str], message_rows: int, width: int):
+        """Build message history section with read receipts and wrapping."""
+        if self.state.manage.messages and message_rows > 0:
+            all_wrapped_lines: List[str] = []
 
             # Get instance read positions for read receipt calculation
             # Keys are full display names to match delivered_to list
-            instance_reads = {}
-            remote_instance_set = set()
-            remote_msg_ts = {}
+            instance_reads: dict = {}
+            remote_instance_set: set = set()
+            remote_msg_ts: dict = {}
             try:
                 from ..core.db import get_db
                 from ..core.instances import get_full_name
@@ -799,6 +872,11 @@ class ManageScreen:
                     if recipient_str:
                         recipient_str = f" {FG_GRAY}→{RESET} {recipient_str}"
 
+                # Message recency: recent messages (< 30s) get brighter body text
+                msg_age = (time.time() - dt.timestamp()) if dt else 9999.0
+                is_recent = msg_age < 30.0
+                body_color = FG_WHITE if is_recent else FG_LIGHTGRAY
+
                 # Header line: timestamp + sender + recipients (truncated to width)
                 header = f"{FG_GRAY}{display_time}{RESET} {BOLD}{sender}{RESET}{recipient_str}"
                 header = truncate_ansi(header, width)
@@ -807,16 +885,16 @@ class ManageScreen:
                 # Replace literal newlines with space for preview
                 display_message = message.replace("\n", " ")
 
-                # Bold @mentions in message (e.g., @name or @name:DEVICE)
+                # Amber @mentions in message (e.g., @name or @name:DEVICE)
                 if "@" in display_message:
                     display_message = re.sub(
                         r"(@[\w\-_:]+)",
-                        f"{BOLD}\\1{RESET}{FG_LIGHTGRAY}",
+                        f"{BOLD}{FG_ORANGE}\\1{RESET}{body_color}",
                         display_message,
                     )
 
-                # Message lines with indent (6 spaces for visual balance)
-                indent = "      "
+                # Message lines with indent (4 spaces — tighter, more content visible)
+                indent = "    "
                 max_msg_len = width - len(indent)
 
                 # Wrap message text
@@ -828,19 +906,19 @@ class ManageScreen:
                     # Truncate to max_msg_len to prevent terminal wrapping on long unbreakable sequences
                     for wrapped_line in wrapped:
                         truncated = truncate_ansi(wrapped_line, max_msg_len)
-                        line = f"{indent}{FG_LIGHTGRAY}{truncated}{RESET}"
+                        line = f"{indent}{body_color}{truncated}{RESET}"
                         all_wrapped_lines.append(line)
                 else:
                     # Fallback if width too small
-                    all_wrapped_lines.append(f"{indent}{FG_LIGHTGRAY}{display_message[: width - len(indent)]}{RESET}")
+                    all_wrapped_lines.append(f"{indent}{body_color}{display_message[: width - len(indent)]}{RESET}")
 
                 # Blank line after each message (for separation)
                 all_wrapped_lines.append("")
 
             # Take last N lines to fit available space (mid-message truncation)
             visible_lines = (
-                all_wrapped_lines[-actual_message_rows:]
-                if len(all_wrapped_lines) > actual_message_rows
+                all_wrapped_lines[-message_rows:]
+                if len(all_wrapped_lines) > message_rows
                 else all_wrapped_lines
             )
             lines.extend(visible_lines)
@@ -848,33 +926,6 @@ class ManageScreen:
             # No messages - show hint only if instances exist (empty state shows logo instead)
             if self.state.manage.instances:
                 lines.append(f"{FG_GRAY}No messages yet - type to compose | @ to mention{RESET}")
-
-        # Calculate how many lines are used before input (instances + detail + messages + separators)
-        lines_before_input = len(lines)
-
-        # Reserve space for input at bottom: input_rows + 2 separators (before + after)
-        input_section_height = input_rows + 2
-        max_lines_before_input = height - input_section_height
-
-        # Truncate message/detail area if it overflows, keeping input visible
-        if lines_before_input > max_lines_before_input:
-            lines = lines[:max_lines_before_input]
-
-        # Pad to fill space before input
-        while len(lines) < max_lines_before_input:
-            lines.append("")
-
-        # Separator before input
-        lines.append(separator_line(width))
-
-        # Input area (auto-wrapped) - at bottom, always visible
-        input_lines = self.render_wrapped_input(width, input_rows)
-        lines.extend(input_lines)
-
-        # Separator after input
-        lines.append(separator_line(width))
-
-        return lines
 
     def _get_display_lists(self):
         """Build local/remote instance lists for cursor navigation"""
@@ -898,47 +949,61 @@ class ManageScreen:
         active_names = set(self.state.manage.instances.keys())
         recently_stopped = get_recently_stopped(exclude_active=active_names)
 
-        # Calculate display count: local + remote section + recently stopped
+        # Get orphan processes (running but not in active instances)
+        from ..core.pidtrack import get_orphan_processes
+
+        active_pids = {i.get("data", {}).get("pid") for _, i in all_instances if i.get("data", {}).get("pid")}
+        orphan_processes = get_orphan_processes(active_pids=active_pids)
+
+        # Calculate display count: local → orphans → stopped → relay → remote
         display_count = len(local_instances)
+        display_count += len(orphan_processes)
+        if recently_stopped:
+            display_count += 1  # recently stopped row
         if remote_count > 0:
             display_count += 1  # remote separator
             if self.state.manage.show_remote:
                 display_count += remote_count
-        if recently_stopped:
-            display_count += 1  # recently stopped row
 
-        return local_instances, remote_instances, display_count, recently_stopped
+        return local_instances, remote_instances, display_count, recently_stopped, orphan_processes
 
-    def _get_instance_at_cursor(self, local, remote, recently_stopped=None):
+    def _get_instance_at_cursor(self, local, remote, recently_stopped=None, orphan_processes=None):
         """Get (instance, is_remote, row_type) at cursor.
 
         Returns:
             (instance_tuple, is_remote, row_type) where row_type is:
             - 'instance': normal instance row
             - 'remote_sep': remote separator row
+            - 'orphan': orphan process row (instance_tuple is the orphan dict)
             - 'recently_stopped': recently stopped summary row
             - None: unknown/empty
         """
         remote_count = len(remote)
+        orphans = orphan_processes or []
 
-        # Calculate section boundaries
+        # Order: local → orphans → recently_stopped → relay separator → remote
         local_end = len(local)
-        remote_sep_pos = local_end if remote_count > 0 else -1
+        orphan_start = local_end
+        orphan_end = orphan_start + len(orphans)
 
-        # Calculate recently stopped row position (after all instances)
-        recently_stopped_pos = -1
-        if recently_stopped:
-            recently_stopped_pos = len(local)
-            if remote_count > 0:
-                recently_stopped_pos += 1  # remote separator
-                if self.state.manage.show_remote:
-                    recently_stopped_pos += remote_count
+        recently_stopped_pos = orphan_end if recently_stopped else -1
+        pos_after_stopped = orphan_end + (1 if recently_stopped else 0)
+
+        remote_sep_pos = pos_after_stopped if remote_count > 0 else -1
 
         cursor = self.state.manage.cursor
 
         # Local section
         if cursor < local_end:
             return local[cursor], False, "instance"
+
+        # Orphan process rows
+        if orphans and orphan_start <= cursor < orphan_end:
+            return orphans[cursor - orphan_start], False, "orphan"
+
+        # Recently stopped row
+        if recently_stopped_pos >= 0 and cursor == recently_stopped_pos:
+            return None, False, "recently_stopped"
 
         # Remote separator
         if remote_count > 0 and cursor == remote_sep_pos:
@@ -950,23 +1015,18 @@ class ManageScreen:
             if remote_start <= cursor < remote_start + remote_count:
                 return remote[cursor - remote_start], True, "instance"
 
-        # Recently stopped row
-        if recently_stopped_pos >= 0 and cursor == recently_stopped_pos:
-            return None, False, "recently_stopped"
-
         return None, False, None
 
-    def _get_separator_positions(self, local, remote):
+    def _get_separator_positions(self, local, remote, recently_stopped=None, orphan_processes=None):
         """Calculate separator position for remote section"""
         remote_count = len(remote)
-
-        # Remote separator is right after local instances
-        remote_sep = len(local) if remote_count > 0 else -1
-
+        orphans = orphan_processes or []
+        pos = len(local) + len(orphans) + (1 if recently_stopped else 0)
+        remote_sep = pos if remote_count > 0 else -1
         return remote_sep
 
     # Key handler methods for dispatch pattern
-    def _handle_nav(self, key: str, local: list, remote: list, display_count: int, recently_stopped: list):
+    def _handle_nav(self, key: str, local: list, remote: list, display_count: int, recently_stopped: list, orphan_processes: list | None = None):
         """Handle UP/DOWN navigation"""
         if key == "UP" and display_count > 0 and self.state.manage.cursor > 0:
             self.state.manage.cursor -= 1
@@ -975,17 +1035,22 @@ class ManageScreen:
         else:
             return
 
-        inst, is_remote, row_type = self._get_instance_at_cursor(local, remote, recently_stopped)
-        self.state.manage.cursor_instance_name = inst[0] if inst else None
+        inst, is_remote, row_type = self._get_instance_at_cursor(local, remote, recently_stopped, orphan_processes)
+        self.state.manage.cursor_instance_name = inst[0] if (inst and row_type == "instance") else None
         self.tui.clear_all_pending_confirmations()
         self.state.manage.show_instance_detail = None
+        # Cancel tag edit if navigating away
+        if self.state.manage.tag_edit_target:
+            self._handle_tag_cancel()
         self.sync_scroll_to_cursor()
 
-    def _handle_at(self, local: list, remote: list, recently_stopped: list):
-        """Handle @ key - insert mention"""
+    def _handle_at(self, local: list, remote: list, recently_stopped: list, orphan_processes: list | None = None):
+        """Handle @ key - insert mention (disabled during tag edit)"""
+        if self.state.manage.tag_edit_target:
+            return  # Don't insert mentions into tag field
         self.tui.clear_all_pending_confirmations()
-        inst, is_remote, row_type = self._get_instance_at_cursor(local, remote, recently_stopped)
-        if inst:
+        inst, is_remote, row_type = self._get_instance_at_cursor(local, remote, recently_stopped, orphan_processes)
+        if inst and row_type == "instance":
             name, _ = inst
             mention = f"@{name} "
             if mention not in self.state.manage.message_buffer:
@@ -1004,7 +1069,9 @@ class ManageScreen:
             )
 
     def _handle_esc(self):
-        """Handle ESC - clear everything"""
+        """Handle ESC - cancel tag edit or clear everything"""
+        if self.state.manage.tag_edit_target:
+            return self._handle_tag_cancel()
         self.state.manage.message_buffer = ""
         self.state.manage.message_cursor_pos = 0
         self.state.manage.show_instance_detail = None
@@ -1017,16 +1084,20 @@ class ManageScreen:
             self.state.manage.message_buffer, self.state.manage.message_cursor_pos
         )
 
-    def _handle_enter(self, local: list, remote: list, recently_stopped: list):
-        """Handle ENTER - send message or toggle instance"""
+    def _handle_enter(self, local: list, remote: list, recently_stopped: list, orphan_processes: list | None = None):
+        """Handle ENTER - send message, save tag, or toggle instance"""
         self.tui.clear_pending_confirmations_except("stop")
+
+        # Tag edit mode: save tag
+        if self.state.manage.tag_edit_target:
+            return self._handle_tag_save()
 
         # Smart Enter: send message if text exists, otherwise toggle instances
         if self.state.manage.message_buffer.strip():
             return self._send_message()
 
         # Get what's at cursor
-        inst, is_remote, row_type = self._get_instance_at_cursor(local, remote, recently_stopped)
+        inst, is_remote, row_type = self._get_instance_at_cursor(local, remote, recently_stopped, orphan_processes)
 
         # Handle special rows
         if row_type == "remote_sep":
@@ -1036,6 +1107,9 @@ class ManageScreen:
 
         if row_type == "recently_stopped":
             return ("switch_events", {"view": "instances"})
+
+        if row_type == "orphan":
+            return self._handle_orphan_process(inst)
 
         if not inst:
             return
@@ -1122,6 +1196,42 @@ class ManageScreen:
             self.state.confirm.pending_stop_time = time.time()
             self.state.manage.show_instance_detail = name
 
+    def _handle_orphan_process(self, orphan: dict):
+        """Handle ENTER on orphan process row — kill with two-step confirmation"""
+        pid = orphan["pid"]
+        names = ", ".join(orphan.get("names", []))
+        label = f"pid:{pid}" + (f" ({names})" if names else "")
+
+        # Use pending_stop with a special prefix to avoid collision with instance stops
+        orphan_key = f"orphan:{pid}"
+        if (
+            self.state.confirm.pending_stop == orphan_key
+            and (time.time() - self.state.confirm.pending_stop_time) <= self.tui.CONFIRMATION_TIMEOUT
+        ):
+            # Second press — close terminal pane then kill
+            from ..terminal import KillResult, kill_process
+            result, _pane_closed = kill_process(pid, preset_name=orphan.get("terminal_preset", ""), pane_id=orphan.get("pane_id", ""), process_id=orphan.get("process_id", ""))
+            if result == KillResult.PERMISSION_DENIED:
+                self.tui.flash_error(f"Permission denied killing {label}")
+            else:
+                from ..core.pidtrack import remove_pid
+                remove_pid(pid)
+                if result == KillResult.ALREADY_DEAD:
+                    self.tui.flash(f"{FG_GRAY}{label}{RESET} already dead")
+                else:
+                    self.tui.flash(f"Killed {FG_GRAY}{label}{RESET}")
+            self.state.confirm.pending_stop = None
+            self.state.manage.show_instance_detail = None
+        else:
+            # First press — show confirmation
+            self.state.confirm.pending_stop = orphan_key
+            self.state.confirm.pending_stop_time = time.time()
+            self.tui.flash(
+                f"{FG_WHITE}Kill {label}? (press Enter again){RESET}",
+                duration=self.tui.CONFIRMATION_FLASH_DURATION,
+                color="white",
+            )
+
     def _handle_ctrl_k(self):
         """Handle CTRL_K - stop all instances with confirmation"""
         is_confirming = (
@@ -1162,6 +1272,91 @@ class ManageScreen:
                 color="white",
             )
 
+    def _handle_fork(self, local: list, remote: list, recently_stopped: list, orphan_processes: list | None = None):
+        """Handle f key - fork instance (immediate, no confirmation)"""
+        inst, is_remote, row_type = self._get_instance_at_cursor(local, remote, recently_stopped, orphan_processes)
+
+        if not inst or row_type != "instance" or is_remote:
+            return
+
+        name, info = inst
+        base_name = info.get("base_name", name)
+
+        try:
+            with suppress_output():
+                result = cmd_fork([base_name])
+            if result == 0:
+                self.tui.flash(f"Forked {name}")
+                self.tui.load_status()
+            else:
+                self.tui.flash_error("Fork failed")
+        except Exception as e:
+            self.tui.flash_error(f"Fork error: {str(e)}")
+
+    def _handle_tag_start(self, local: list, remote: list, recently_stopped: list, orphan_processes: list | None = None):
+        """Handle t key - start tag editing mode"""
+        inst, is_remote, row_type = self._get_instance_at_cursor(local, remote, recently_stopped, orphan_processes)
+
+        if not inst or row_type != "instance" or is_remote:
+            return
+
+        name, info = inst
+        base_name = info.get("base_name", name)
+        current_tag = info.get("data", {}).get("tag") or ""
+
+        # Enter tag edit mode (save original buffer and cursor)
+        self.state.manage.tag_edit_target = base_name
+        self.state.manage.tag_edit_original_buffer = self.state.manage.message_buffer
+        self.state.manage.tag_edit_original_cursor = self.state.manage.message_cursor_pos
+        self.state.manage.message_buffer = current_tag
+        self.state.manage.message_cursor_pos = len(current_tag)
+        self.state.manage.show_instance_detail = name
+        self.tui.clear_all_pending_confirmations()
+
+    def _handle_tag_save(self):
+        """Save tag and exit tag edit mode"""
+        from ..core.db import update_instance
+        import re
+
+        target = self.state.manage.tag_edit_target
+        if not target:
+            return
+
+        new_tag = self.state.manage.message_buffer.strip()
+
+        # Validate: alphanumeric + dash/underscore, or empty
+        if new_tag and not re.match(r"^[a-zA-Z0-9_-]+$", new_tag):
+            self.tui.flash_error("Tag must be alphanumeric (a-z, 0-9, -, _)")
+            return
+
+        # Save to DB (empty string becomes None)
+        try:
+            if not update_instance(target, {"tag": new_tag if new_tag else None}):
+                self.tui.flash_error("Failed to save tag")
+                return
+        except Exception as e:
+            self.tui.flash_error(f"Tag save error: {e}")
+            return
+
+        # Exit tag edit mode
+        self.state.manage.tag_edit_target = None
+        self.state.manage.message_buffer = ""
+        self.state.manage.message_cursor_pos = 0
+        self.state.manage.tag_edit_original_buffer = ""
+        self.state.manage.show_instance_detail = None
+
+        self.tui.load_status()
+        self.tui.flash(f"Tag {'set to ' + new_tag if new_tag else 'removed'}")
+
+    def _handle_tag_cancel(self):
+        """Cancel tag editing and restore original buffer and cursor"""
+        self.state.manage.message_buffer = self.state.manage.tag_edit_original_buffer
+        self.state.manage.message_cursor_pos = self.state.manage.tag_edit_original_cursor
+        self.state.manage.tag_edit_target = None
+        self.state.manage.tag_edit_original_buffer = ""
+        self.state.manage.tag_edit_original_cursor = 0
+        self.state.manage.show_instance_detail = None
+
     def _handle_text_input(self, key: str):
         """Handle text input - space, newline, printable chars"""
         self.tui.clear_all_pending_confirmations()
@@ -1183,26 +1378,39 @@ class ManageScreen:
             None for most keys, or a tuple like ("switch_events", {...})
             to signal mode changes to the orchestrator.
         """
-        local, remote, display_count, recently_stopped = self._get_display_lists()
+        local, remote, display_count, recently_stopped, orphan_processes = self._get_display_lists()
         self._get_separator_positions(local, remote)
 
         # Dispatch table for simple key handlers
         if key in ("UP", "DOWN"):
-            return self._handle_nav(key, local, remote, display_count, recently_stopped)
+            return self._handle_nav(key, local, remote, display_count, recently_stopped, orphan_processes)
         elif key == "@":
-            return self._handle_at(local, remote, recently_stopped)
+            return self._handle_at(local, remote, recently_stopped, orphan_processes)
         elif key in ("LEFT", "RIGHT"):
             return self._handle_cursor_move(key)
         elif key == "ESC":
             return self._handle_esc()
         elif key == "BACKSPACE":
             return self._handle_backspace()
+        elif key == "DELETE":
+            self.state.manage.message_buffer, self.state.manage.message_cursor_pos = text_input_delete(
+                self.state.manage.message_buffer, self.state.manage.message_cursor_pos
+            )
+        elif key in ("HOME", "CTRL_A"):
+            self.state.manage.message_cursor_pos = 0
+        elif key in ("END", "CTRL_E"):
+            self.state.manage.message_cursor_pos = len(self.state.manage.message_buffer)
         elif key == "ENTER":
-            return self._handle_enter(local, remote, recently_stopped)
+            return self._handle_enter(local, remote, recently_stopped, orphan_processes)
         elif key == "CTRL_K":
             return self._handle_ctrl_k()
         elif key == "CTRL_R":
             return self._handle_ctrl_r()
+        # Fork and tag: Ctrl+F and Ctrl+T (avoids collision with typing)
+        elif key == "CTRL_F" and not self.state.manage.tag_edit_target:
+            return self._handle_fork(local, remote, recently_stopped, orphan_processes)
+        elif key == "CTRL_T" and not self.state.manage.tag_edit_target:
+            return self._handle_tag_start(local, remote, recently_stopped, orphan_processes)
         elif key in ("SPACE", "\n") or (key and len(key) == 1 and key.isprintable()):
             return self._handle_text_input(key)
 
@@ -1231,12 +1439,19 @@ class ManageScreen:
         active_names = set(self.state.manage.instances.keys())
         recently_stopped = get_recently_stopped(exclude_active=active_names)
 
-        # Build display count: local + remote section + recently_stopped
+        # Get orphan process count
+        from ..core.pidtrack import get_orphan_processes
+
+        active_pids = {i.get("data", {}).get("pid") for i in all_instances if i.get("data", {}).get("pid")}
+        orphan_count = len(get_orphan_processes(active_pids=active_pids))
+
+        # Build display count: local + remote section + orphans + recently_stopped
         display_count = local_count
         if remote_count > 0:
             display_count += 1  # remote separator
             if self.state.manage.show_remote:
                 display_count += remote_count
+        display_count += orphan_count
         if recently_stopped:
             display_count += 1  # recently stopped row
 
@@ -1263,12 +1478,13 @@ class ManageScreen:
 
     def render_wrapped_input(self, width: int, input_rows: int) -> List[str]:
         """Render message input (delegates to shared helper)"""
+        prefix = "Tag: " if self.state.manage.tag_edit_target else "> "
         return render_text_input(
             self.state.manage.message_buffer,
             self.state.manage.message_cursor_pos,
             width,
             input_rows,
-            prefix="> ",
+            prefix=prefix,
             send_state=self.state.manage.send_state,
         )
 
@@ -1318,29 +1534,29 @@ class ManageScreen:
             sync_time = self.state.manage.device_sync_times.get(origin_device, 0)
             sync_str = f"{format_age(time.time() - sync_time)} ago" if sync_time else "never"
 
-            lines.append(truncate_ansi(f"  device:     {device_short}", width))
-            lines.append(truncate_ansi(f"  last_sync:  {sync_str}", width))
+            lines.append(truncate_ansi(f"  device:      {device_short}", width))
+            lines.append(truncate_ansi(f"  last_sync:   {sync_str}", width))
 
             # Show available remote instance details
             session_id = data.get("session_id") or "(none)"
             tool = data.get("tool", "claude")
-            lines.append(truncate_ansi(f"  session_id: {session_id}", width))
-            lines.append(truncate_ansi(f"  tool:       {tool}", width))
+            lines.append(truncate_ansi(f"  session_id:  {session_id}", width))
+            lines.append(truncate_ansi(f"  tool:        {tool}", width))
 
             parent = data.get("parent_name")
             if parent:
-                lines.append(truncate_ansi(f"  parent:     {parent}", width))
+                lines.append(truncate_ansi(f"  parent:      {parent}", width))
 
             directory = data.get("directory")
             if directory:
-                lines.append(truncate_ansi(f"  directory:  {shorten_path(directory)}", width))
+                lines.append(truncate_ansi(f"  directory:   {shorten_path(directory)}", width))
 
             # Format status_time
             status_time = data.get("status_time", 0)
             if status_time:
                 lines.append(
                     truncate_ansi(
-                        f"  status_at:  {format_age(time.time() - status_time)} ago",
+                        f"  status_at:   {format_age(time.time() - status_time)} ago",
                         width,
                     )
                 )
@@ -1349,7 +1565,7 @@ class ManageScreen:
             if last_stop:
                 lines.append(
                     truncate_ansi(
-                        f"  last_stop:  {format_age(time.time() - last_stop)} ago",
+                        f"  last_stop:   {format_age(time.time() - last_stop)} ago",
                         width,
                     )
                 )
@@ -1372,21 +1588,21 @@ class ManageScreen:
             tool = data.get("tool", "claude")
 
             # Build detail lines (truncated to terminal width)
-            lines.append(truncate_ansi(f"  session_id:   {session_id}", width))
-            lines.append(truncate_ansi(f"  tool:         {tool}", width))
+            lines.append(truncate_ansi(f"  session_id:  {session_id}", width))
+            lines.append(truncate_ansi(f"  tool:        {tool}", width))
 
             # Show status_detail if present
             status_detail = data.get("status_detail", "")
             if status_detail:
-                lines.append(truncate_ansi(f"  detail:       {status_detail}", width))
+                lines.append(truncate_ansi(f"  detail:      {status_detail}", width))
 
-            lines.append(truncate_ansi(f"  created:      {created}", width))
-            lines.append(truncate_ansi(f"  directory:    {directory}", width))
+            lines.append(truncate_ansi(f"  created:     {created}", width))
+            lines.append(truncate_ansi(f"  directory:   {directory}", width))
 
             if parent:
                 agent_id = data.get("agent_id") or "(none)"
-                lines.append(truncate_ansi(f"  parent:       {parent}", width))
-                lines.append(truncate_ansi(f"  agent_id:     {agent_id}", width))
+                lines.append(truncate_ansi(f"  parent:      {parent}", width))
+                lines.append(truncate_ansi(f"  agent_id:    {agent_id}", width))
 
             # Show binding status (integration tier): pty/hooks/none
             from ..core.db import get_instance_bindings, format_binding_status
@@ -1394,15 +1610,23 @@ class ManageScreen:
             base_name = info.get("base_name", name)
             bindings = get_instance_bindings(base_name)
             bind_str = format_binding_status(bindings)
-            lines.append(truncate_ansi(f"  bindings:     {bind_str}", width))
+            lines.append(truncate_ansi(f"  bindings:    {bind_str}", width))
 
             if log_file:
-                lines.append(truncate_ansi(f"  headless log: {log_file}", width))
+                lines.append(truncate_ansi(f"  log:         {log_file}", width))
 
-            lines.append(truncate_ansi(f"  transcript:   {transcript}", width))
+            lines.append(truncate_ansi(f"  transcript:  {transcript}", width))
 
-        # Show available action
+        # Show available actions
         lines.append("")
-        lines.append(truncate_ansi(f"{FG_CYAN}[Enter]{RESET} Stop hcom", width))
+        if self.state.manage.tag_edit_target:
+            # Tag edit mode
+            lines.append(truncate_ansi(f"{FG_CYAN}[Enter]{RESET} Save tag  {FG_CYAN}[Esc]{RESET} Cancel", width))
+        elif is_remote_instance(data):
+            # Remote: stop only
+            lines.append(truncate_ansi(f"{FG_CYAN}[Enter]{RESET} Stop hcom", width))
+        else:
+            # Local: stop, fork, tag
+            lines.append(truncate_ansi(f"{FG_CYAN}[Enter]{RESET} Stop  {FG_CYAN}[^F]{RESET} Fork  {FG_CYAN}[^T]{RESET} Tag", width))
 
         return lines

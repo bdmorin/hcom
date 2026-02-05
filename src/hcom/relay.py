@@ -18,6 +18,7 @@ from __future__ import annotations
 import json
 import os
 import sqlite3
+import threading
 import time
 import urllib.request
 import urllib.error
@@ -31,6 +32,55 @@ from .core.log import log_info, log_warn, log_error
 from .shared import parse_iso_timestamp
 
 _poll_ts: float = 0
+_poll_ts_lock = threading.Lock()
+_relay_worker_flag = threading.local()
+
+
+def _safe_kv_get(key: str, default: str | None = None) -> str | None:
+    """kv_get that won't crash on DB errors."""
+    try:
+        return kv_get(key) or default
+    except Exception:
+        return default
+
+
+def _safe_kv_set(key: str, value: str | None) -> None:
+    """kv_set that won't crash on DB errors."""
+    try:
+        kv_set(key, value)
+    except Exception:
+        pass
+
+
+def _mark_as_relay_worker() -> None:
+    """Mark current thread as relay worker (daemon threads only)."""
+    _relay_worker_flag.is_worker = True
+
+
+def _is_relay_worker() -> bool:
+    return bool(getattr(_relay_worker_flag, "is_worker", False))
+
+
+def _set_relay_status(status: str, error: str | None = None) -> None:
+    """Write relay status to KV. Uses PID lock so only one process owns status."""
+    is_worker = _is_relay_worker()
+    daemon_active = False
+    if not is_worker:
+        daemon_active = is_relay_handled_by_daemon()
+        if daemon_active:
+            return
+    pid = str(os.getpid())
+    owner = _safe_kv_get("relay_status_owner")
+    if status == "ok":
+        # Success: claim ownership
+        _safe_kv_set("relay_status_owner", pid)
+        _safe_kv_set("relay_status", "ok")
+        _safe_kv_set("relay_last_error", None)
+    else:
+        # Error: only write if we're the owner (the process that last succeeded)
+        if owner == pid or not daemon_active:
+            _safe_kv_set("relay_status", status)
+            _safe_kv_set("relay_last_error", error)
 
 
 def _get_relay_url() -> str | None:
@@ -56,17 +106,31 @@ def _get_auth_headers() -> dict[str, str]:
     return headers
 
 
+_last_http_error: str = ""
+
+
 def _http(method: str, url: str, data: bytes | None = None, timeout: int = 5) -> tuple[int, bytes]:
-    """HTTP request."""
+    """HTTP request. On connection failure, sets _last_http_error with reason."""
+    global _last_http_error
     req = urllib.request.Request(url, data=data, method=method)
     for k, v in _get_auth_headers().items():
         req.add_header(k, v)
     try:
         with urllib.request.urlopen(req, timeout=timeout) as resp:
+            _last_http_error = ""
             return (resp.status, resp.read())
     except urllib.error.HTTPError as e:
+        _last_http_error = ""
         return (e.code, b"")
-    except (urllib.error.URLError, socket.timeout):
+    except (urllib.error.URLError, socket.timeout) as e:
+        reason = str(getattr(e, "reason", e))
+        # Condense SSL errors for display
+        if "CERTIFICATE_VERIFY_FAILED" in reason:
+            _last_http_error = "SSL certificate error"
+        elif "timed out" in reason.lower():
+            _last_http_error = "timed out"
+        else:
+            _last_http_error = "network unreachable"
         return (0, b"")
 
 
@@ -139,7 +203,7 @@ def push(force: bool = False) -> tuple[bool, str | None]:
 
     # Rate limit
     if not force:
-        last = float(kv_get("relay_last_push") or 0)
+        last = float(_safe_kv_get("relay_last_push") or 0)
         if time.time() - last < 1.0:
             return (True, None)
 
@@ -147,7 +211,7 @@ def push(force: bool = False) -> tuple[bool, str | None]:
     state = build_state()
 
     # Get new events since last push (exclude imported events - they have _relay marker)
-    last_push_id = int(kv_get("relay_last_push_id") or 0)
+    last_push_id = int(_safe_kv_get("relay_last_push_id") or 0)
     conn = get_db()
     rows = conn.execute(
         """
@@ -181,22 +245,19 @@ def push(force: bool = False) -> tuple[bool, str | None]:
         timeout=3,
     )
     if status == 200:
-        kv_set("relay_last_push", str(time.time()))
-        kv_set("relay_last_push_id", str(max_id))
-        kv_set("relay_status", "ok")
-        kv_set("relay_last_error", None)
+        _safe_kv_set("relay_last_push", str(time.time()))
+        _safe_kv_set("relay_last_push_id", str(max_id))
+        _set_relay_status("ok")
         log_info("relay", "relay.push", events=len(events))
         return (True, None)
     elif status == 0:
-        error = "network unreachable"
-        kv_set("relay_status", "error")
-        kv_set("relay_last_error", error)
+        error = _last_http_error or "network unreachable"
+        _set_relay_status("error", error)
         log_warn("relay", "relay.network", error)  # Transient - WARN appropriate
         return (False, error)
     else:
         error = f"server returned {status}"
-        kv_set("relay_status", "error")
-        kv_set("relay_last_error", error)
+        _set_relay_status("error", error)
         log_warn("relay", "relay.network", error)  # Transient - WARN appropriate
         return (False, error)
 
@@ -216,9 +277,12 @@ def pull(timeout: int = 0) -> tuple[dict[str, Any], str | None]:
     if not url:
         return ({"devices": {}}, None)  # Not configured
 
+    with _poll_ts_lock:
+        since = _poll_ts
+
     status, content = _http(
         "GET",
-        f"{url}/poll?since={_poll_ts}&timeout={timeout}",
+        f"{url}/poll?since={since}&timeout={timeout}",
         timeout=timeout + 5 if timeout else 5,
     )
     if status == 200 and content:
@@ -226,14 +290,15 @@ def pull(timeout: int = 0) -> tuple[dict[str, Any], str | None]:
             result = json.loads(content)
         except json.JSONDecodeError as e:
             error = f"invalid json: {e}"
-            kv_set("relay_status", "error")
-            kv_set("relay_last_error", error)
+            _set_relay_status("error", error)
             log_error("relay", "relay.error", e, msg="pull: invalid json")
             return ({"devices": {}}, error)
 
-        _poll_ts = result.get("ts", _poll_ts)
-        kv_set("relay_status", "ok")
-        kv_set("relay_last_error", None)
+        with _poll_ts_lock:
+            new_ts = result.get("ts", _poll_ts)
+            if new_ts > _poll_ts:
+                _poll_ts = new_ts
+        _set_relay_status("ok")
 
         devices = result.get("devices", {})
         if devices:
@@ -242,15 +307,13 @@ def pull(timeout: int = 0) -> tuple[dict[str, Any], str | None]:
 
         return (result, None)
     elif status == 0:
-        error = "network unreachable"
-        kv_set("relay_status", "error")
-        kv_set("relay_last_error", error)
+        error = _last_http_error or "network unreachable"
+        _set_relay_status("error", error)
         log_warn("relay", "relay.network", error)
         return ({"devices": {}}, error)
     else:
         error = f"server returned {status}"
-        kv_set("relay_status", "error")
-        kv_set("relay_last_error", error)
+        _set_relay_status("error", error)
         log_warn("relay", "relay.network", error)
         return ({"devices": {}}, error)
 
@@ -262,7 +325,7 @@ def _apply_remote_devices(devices: dict[str, dict], own_device: str) -> None:
 
     # Get local reset timestamp from KV (set by cmd_reset for cross-process reliability)
     # Fallback to events table for long-running pollers that missed the KV write
-    local_reset_ts = float(kv_get("relay_local_reset_ts") or 0)
+    local_reset_ts = float(_safe_kv_get("relay_local_reset_ts") or 0)
     if local_reset_ts == 0:
         row = conn.execute("""
             SELECT timestamp FROM events
@@ -274,7 +337,7 @@ def _apply_remote_devices(devices: dict[str, dict], own_device: str) -> None:
         if row:
             local_reset_ts = _parse_ts(row[0])
             if local_reset_ts:
-                kv_set("relay_local_reset_ts", str(local_reset_ts))
+                _safe_kv_set("relay_local_reset_ts", str(local_reset_ts))
     if local_reset_ts == 0:
         log_warn("relay", "relay.warn", "local_reset_ts=0, quarantine disabled")
 
@@ -289,7 +352,7 @@ def _apply_remote_devices(devices: dict[str, dict], own_device: str) -> None:
 
         # Detect short_id collision: two different devices with same short_id
         # Would cause instance primary key collisions (name:SHORT)
-        cached_device = kv_get(f"relay_short_{short_id}")
+        cached_device = _safe_kv_get(f"relay_short_{short_id}")
         if cached_device and cached_device != device_id:
             log_warn(
                 "relay",
@@ -300,11 +363,11 @@ def _apply_remote_devices(devices: dict[str, dict], own_device: str) -> None:
             )
             continue  # Skip this device to prevent data corruption
         if not cached_device:
-            kv_set(f"relay_short_{short_id}", device_id)
+            _safe_kv_set(f"relay_short_{short_id}", device_id)
 
         # Check for device reset FIRST - always clean old data before deciding to import
         # This must run even if we later skip the device (stale check)
-        cached_reset = float(kv_get(f"relay_reset_{device_id}") or 0)
+        cached_reset = float(_safe_kv_get(f"relay_reset_{device_id}") or 0)
         if reset_ts > cached_reset:
             with _write_lock:
                 conn.execute("DELETE FROM instances WHERE origin_device_id = ?", (device_id,))
@@ -313,21 +376,15 @@ def _apply_remote_devices(devices: dict[str, dict], own_device: str) -> None:
                     (device_id,),
                 )
                 conn.commit()
-            kv_set(f"relay_reset_{device_id}", str(reset_ts))
+            _safe_kv_set(f"relay_reset_{device_id}", str(reset_ts))
             # Reset event cursor so new events from restarted device are imported
-            kv_set(f"relay_events_{device_id}", "0")
+            _safe_kv_set(f"relay_events_{device_id}", "0")
             log_info("relay", "relay.reset", device=short_id)
 
         # Note: Device-level quarantine removed - caused deadlocks when devices reset at different times.
         # Per-event and per-instance timestamp filtering handles stale data instead.
 
-        # Get current remote instances for this device (to detect removals)
-        current_remote = {
-            row["name"]
-            for row in conn.execute("SELECT name FROM instances WHERE origin_device_id = ?", (device_id,)).fetchall()
-        }
-
-        # Upsert instances from state (no lifecycle reconstruction!)
+        # Upsert instances from state and remove stale ones atomically
         seen_instances = set()
         for name, inst in state.get("instances", {}).items():
             # Skip instances with no activity or activity from before our reset
@@ -339,6 +396,10 @@ def _apply_remote_devices(devices: dict[str, dict], own_device: str) -> None:
             seen_instances.add(namespaced)
             # Namespace parent with short_id suffix
             parent_namespaced = f"{inst['parent']}:{short_id}" if inst.get("parent") else None
+            # Relay-origin rows must not populate UNIQUE local identifiers
+            relay_session_id = None
+            relay_parent_session_id = None
+            relay_agent_id = None
             try:
                 with _write_lock:
                     conn.execute(
@@ -367,9 +428,9 @@ def _apply_remote_devices(devices: dict[str, dict], own_device: str) -> None:
                             inst.get("directory"),
                             inst.get("transcript"),
                             time.time(),
-                            inst.get("session_id"),
-                            inst.get("parent_session_id"),
-                            inst.get("agent_id"),
+                            relay_session_id,
+                            relay_parent_session_id,
+                            relay_agent_id,
                             inst.get("wait_timeout", 86400),
                             inst.get("last_stop", 0),
                             inst.get("tcp_mode", False),
@@ -377,12 +438,21 @@ def _apply_remote_devices(devices: dict[str, dict], own_device: str) -> None:
                     )
                     conn.commit()
             except sqlite3.Error as e:
+                try:
+                    conn.rollback()
+                except Exception:
+                    pass
                 log_error("relay", "relay.error", e, op="instance_upsert", instance=namespaced)
 
         # Remove instances no longer in state (stopped/removed on remote)
-        stale = current_remote - seen_instances
-        if stale:
-            with _write_lock:
+        # Read + delete under same lock to avoid TOCTOU race
+        with _write_lock:
+            current_remote = {
+                row["name"]
+                for row in conn.execute("SELECT name FROM instances WHERE origin_device_id = ?", (device_id,)).fetchall()
+            }
+            stale = current_remote - seen_instances
+            if stale:
                 for name in stale:
                     conn.execute("DELETE FROM instances WHERE name = ?", (name,))
                 conn.commit()
@@ -392,7 +462,7 @@ def _apply_remote_devices(devices: dict[str, dict], own_device: str) -> None:
 
         # Insert events (for history + message delivery)
         # Dedup by monotonic event ID (not timestamp - avoids clock skew issues)
-        last_event_id = int(kv_get(f"relay_events_{device_id}") or 0)
+        last_event_id = int(_safe_kv_get(f"relay_events_{device_id}") or 0)
 
         # Detect ID regression: remote DB was recreated without proper reset event
         # SQLite autoincrement IDs never decrease, so regression = DB recreation
@@ -416,7 +486,7 @@ def _apply_remote_devices(devices: dict[str, dict], own_device: str) -> None:
                     )
                     conn.commit()
                 last_event_id = 0
-                kv_set(f"relay_events_{device_id}", "0")
+                _safe_kv_set(f"relay_events_{device_id}", "0")
 
         max_event_id = last_event_id
 
@@ -452,8 +522,13 @@ def _apply_remote_devices(devices: dict[str, dict], own_device: str) -> None:
             data = event.get("data", {}).copy()
             if "from" in data and ":" not in data["from"]:
                 data["from"] = f"{data['from']}:{short_id}"
+
+            # Strip our device suffix from mentions so local instances match
             if "mentions" in data:
-                data["mentions"] = [f"{m}:{short_id}" if ":" not in m else m for m in data["mentions"]]
+                data["mentions"] = [
+                    name.rsplit(":", 1)[0] if name.upper().endswith(f":{own_short_id}") else name
+                    for name in data["mentions"]
+                ]
 
             # Strip our device suffix from delivered_to so local instances match
             if "delivered_to" in data:
@@ -474,10 +549,10 @@ def _apply_remote_devices(devices: dict[str, dict], own_device: str) -> None:
             max_event_id = max(max_event_id, event_id)
 
         if max_event_id > last_event_id:
-            kv_set(f"relay_events_{device_id}", str(max_event_id))
+            _safe_kv_set(f"relay_events_{device_id}", str(max_event_id))
 
         # Update sync timestamp for this device (separate from event ID cursor)
-        kv_set(f"relay_sync_time_{device_id}", str(time.time()))
+        _safe_kv_set(f"relay_sync_time_{device_id}", str(time.time()))
 
     # Wake local TCP instances so they see new messages immediately
     from .core.runtime import notify_all_instances
@@ -538,7 +613,7 @@ def send_control(action: str, target: str, device_short_id: str) -> bool:
         )
         return True
     elif status == 0:
-        log_warn("relay", "relay.network", "control: network unreachable")
+        log_warn("relay", "relay.network", f"control: {_last_http_error or 'network unreachable'}")
     else:
         log_warn("relay", "relay.network", f"control: status={status}")
     return False
@@ -549,7 +624,7 @@ def _handle_control_events(events: list[dict], own_short_id: str, source_device:
     from .core.tool_utils import stop_instance
 
     # Dedup: skip already-processed control events from this device
-    last_ctrl_ts = float(kv_get(f"relay_ctrl_{source_device}") or 0)
+    last_ctrl_ts = float(_safe_kv_get(f"relay_ctrl_{source_device}") or 0)
     max_ctrl_ts = last_ctrl_ts
 
     for event in events:
@@ -597,18 +672,19 @@ def _handle_control_events(events: list[dict], own_short_id: str, source_device:
 
     # Persist dedup timestamp
     if max_ctrl_ts > last_ctrl_ts:
-        kv_set(f"relay_ctrl_{source_device}", str(max_ctrl_ts))
+        _safe_kv_set(f"relay_ctrl_{source_device}", str(max_ctrl_ts))
 
 
-# ==================== TUI Notification ====================
+# ==================== Daemon Notification ====================
 
 
-def is_relay_handled_by_tui() -> bool:
-    """Check if TUI is actively handling relay polling.
+def is_relay_handled_by_daemon() -> bool:
+    """Check if daemon is actively handling relay polling.
 
-    Validates port is actually reachable to handle stale ports from crashed TUIs.
+    Validates port is actually reachable to handle stale ports from crashed daemons.
+    Only clears port after consecutive failures to avoid stampede from transient timeouts.
     """
-    port = kv_get("relay_tui_port")
+    port = _safe_kv_get("relay_daemon_port")
     if not port:
         return False
 
@@ -616,13 +692,27 @@ def is_relay_handled_by_tui() -> bool:
     sock = None
     try:
         sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        sock.settimeout(0.05)  # 50ms timeout
+        sock.settimeout(0.1)  # 100ms timeout
         sock.connect(("127.0.0.1", int(port)))
+        _safe_kv_set("relay_daemon_fail_count", None)  # Reset on success
         return True
     except Exception:
-        # Port stale - clear it so future calls don't waste time
+        # Track consecutive failures — only clear port after 3 in a row
+        # Prevents stampede when daemon port is briefly busy
+        # Atomic increment to avoid lost updates under concurrency
         try:
-            kv_set("relay_tui_port", None)
+            conn = get_db()
+            with _write_lock:
+                conn.execute(
+                    "INSERT INTO kv (key, value) VALUES ('relay_daemon_fail_count', '1') "
+                    "ON CONFLICT(key) DO UPDATE SET value = CAST(CAST(value AS INTEGER) + 1 AS TEXT)"
+                )
+                conn.commit()
+                row = conn.execute("SELECT value FROM kv WHERE key = 'relay_daemon_fail_count'").fetchone()
+            fail_count = int(row[0]) if row else 1
+            if fail_count >= 3:
+                _safe_kv_set("relay_daemon_port", None)
+                _safe_kv_set("relay_daemon_fail_count", None)
         except Exception:
             pass
         return False
@@ -634,9 +724,9 @@ def is_relay_handled_by_tui() -> bool:
                 pass
 
 
-def notify_relay_tui() -> bool:
-    """Notify TUI to push. Returns True if TUI is listening."""
-    port = kv_get("relay_tui_port")
+def notify_relay_daemon() -> bool:
+    """Notify daemon to push. Returns True if daemon is listening."""
+    port = _safe_kv_get("relay_daemon_port")
     if not port:
         return False
     sock = None
@@ -655,6 +745,11 @@ def notify_relay_tui() -> bool:
                 pass
 
 
+def notify_relay() -> bool:
+    """Notify relay handler (daemon) to push immediately."""
+    return notify_relay_daemon()
+
+
 # ==================== Wait Helper ====================
 
 
@@ -663,10 +758,8 @@ def relay_wait(timeout: float = 25.0) -> bool:
 
     Used by cmd_events --wait and cmd_listen.
     """
-    # TUI worker subprocess sets HCOM_TUI_WORKER=1 - it should always poll
-    # Other processes should defer to TUI if it's running
-    if not os.environ.get("HCOM_TUI_WORKER") and is_relay_handled_by_tui():
-        # TUI is polling - just sleep to preserve timing behavior
+    # If daemon is polling, just sleep to preserve timing behavior
+    if is_relay_handled_by_daemon():
         time.sleep(min(timeout, 1.0))
         return False
 
@@ -693,9 +786,9 @@ def get_relay_status() -> dict[str, Any]:
     return {
         "configured": bool(config.relay),
         "enabled": config.relay_enabled,
-        "status": kv_get("relay_status"),
-        "error": kv_get("relay_last_error"),
-        "last_push": float(kv_get("relay_last_push") or 0),
+        "status": _safe_kv_get("relay_status"),
+        "error": _safe_kv_get("relay_last_error"),
+        "last_push": float(_safe_kv_get("relay_last_push") or 0),
     }
 
 
@@ -709,6 +802,7 @@ __all__ = [
     "send_control",
     "get_relay_status",
     "is_relay_enabled",
-    "is_relay_handled_by_tui",
-    "notify_relay_tui",
+    "is_relay_handled_by_daemon",
+    "notify_relay_daemon",
+    "notify_relay",
 ]

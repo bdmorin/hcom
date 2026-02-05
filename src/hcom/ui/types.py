@@ -118,6 +118,10 @@ class ManageState:
     send_state: Optional[str] = None  # None, 'sending', 'sent'
     send_state_until: float = 0.0
     unread_counts: dict = field(default_factory=dict)
+    # Tag editing mode
+    tag_edit_target: Optional[str] = None  # Instance name being edited (None = normal mode)
+    tag_edit_original_buffer: str = ""  # Saved message buffer to restore on cancel
+    tag_edit_original_cursor: int = 0  # Saved cursor position to restore on cancel
 
 
 @dataclass

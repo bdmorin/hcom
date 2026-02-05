@@ -12,9 +12,9 @@ Identity Model:
 """
 
 from __future__ import annotations
-import os
 import re
 
+from .thread_context import get_process_id
 from .db import get_db
 from .instances import load_instance_position, resolve_instance_name
 from ..shared import SenderIdentity, HcomError
@@ -30,8 +30,18 @@ def _looks_like_uuid(value: str) -> bool:
     return bool(_UUID_PATTERN.match(value))
 
 
+def _looks_like_agent_id(name: str) -> bool:
+    """Check if name looks like a Claude Task agent_id (7-char hex)."""
+    return len(name) == 7 and all(c in "0123456789abcdef" for c in name.lower())
+
+
 def instance_not_found_error(name: str) -> str:
-    """Generate actionable error message for instance not found."""
+    """Generate actionable error message for instance not found.
+
+    For subagent agent_ids, don't suggest --as (causes process binding conflicts).
+    """
+    if _looks_like_agent_id(name):
+        return f"Instance '{name}' not found. Your session may have ended. Stop working and end your turn."
     return f"Instance '{name}' not found. Run 'hcom start --as {name}' to reclaim your identity."
 
 
@@ -91,6 +101,8 @@ def resolve_from_name(name: str) -> SenderIdentity:
     Raises:
         HcomError: If instance not found
     """
+    from .log import log_info, log_warn
+
     # Reject invalid base names (tag/device suffixes are not allowed here)
     if not _looks_like_uuid(name) and not is_valid_base_name(name):
         raise HcomError(base_name_error(name))
@@ -98,6 +110,7 @@ def resolve_from_name(name: str) -> SenderIdentity:
     # 1. Instance name lookup (exact match)
     data = load_instance_position(name)
     if data:
+        log_info("identity", "resolve_from_name", name=name, method="instance_name")
         return SenderIdentity(
             kind="instance",
             name=name,
@@ -112,6 +125,7 @@ def resolve_from_name(name: str) -> SenderIdentity:
         instance_name = row["name"]
         instance_data = load_instance_position(instance_name)
         if instance_data:
+            log_info("identity", "resolve_from_name", name=name, method="agent_id", resolved=instance_name)
             return SenderIdentity(
                 kind="instance",
                 name=instance_name,
@@ -120,6 +134,7 @@ def resolve_from_name(name: str) -> SenderIdentity:
             )
 
     # 3. Not found - use central error helper
+    log_warn("identity", "resolve_from_name.not_found", name=name)
     raise HcomError(instance_not_found_error(name))
 
 
@@ -148,6 +163,8 @@ def resolve_identity(
     Raises:
         HcomError: If identity required but not resolvable
     """
+    from .log import log_info, log_warn
+
     # 1. System sender (internal use)
     if system_sender:
         return SenderIdentity(kind="system", name=system_sender)
@@ -156,7 +173,9 @@ def resolve_identity(
     if session_id:
         resolved_name, data = resolve_instance_name(session_id)
         if not resolved_name or not data:
+            log_warn("identity", "resolve.session_id_not_found", session_id=session_id)
             raise HcomError("Instance not found for session_id")
+        log_info("identity", "resolve", method="session_id", name=resolved_name)
         return SenderIdentity(
             kind="instance",
             name=resolved_name,
@@ -169,16 +188,19 @@ def resolve_identity(
         return resolve_from_name(name)
 
     # 5. Auto-detect from process binding (hcom-launched instances)
-    process_id = os.environ.get("HCOM_PROCESS_ID")
+    process_id = get_process_id()
     if process_id:
         from .instances import resolve_process_binding
 
         bound_name = resolve_process_binding(process_id)
         if not bound_name:
+            log_warn("identity", "resolve.process_binding_expired", process_id=process_id)
             raise HcomError("Session expired. Run 'hcom start' to reconnect.")
         bound_data = load_instance_position(bound_name)
         if not bound_data:
+            log_warn("identity", "resolve.process_instance_missing", process_id=process_id, bound_name=bound_name)
             raise HcomError(instance_not_found_error(bound_name))
+        log_info("identity", "resolve", method="process_binding", name=bound_name, process_id=process_id)
         # Row exists = participating
         return SenderIdentity(
             kind="instance",
@@ -188,6 +210,7 @@ def resolve_identity(
         )
 
     # 6. No identity - provide actionable guidance
+    log_warn("identity", "resolve.no_identity", has_process_id=bool(get_process_id()), has_name=bool(name))
     raise HcomError("No hcom identity. Run 'hcom start' first, then use --name <yourname> on commands.")
 
 

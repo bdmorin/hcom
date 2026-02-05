@@ -31,6 +31,9 @@ from ..args_common import (
     extract_flag_names_from_tokens as _extract_flag_names_from_tokens,
     extract_flag_name_from_token as _extract_flag_name_from_token,
     deduplicate_boolean_flags as _deduplicate_boolean_flags_base,
+    looks_like_flag as _looks_like_flag_base,
+    set_positional as _set_positional,
+    remove_positional as _remove_positional,
 )
 
 # Type aliases (Claude-specific)
@@ -83,6 +86,9 @@ _BOOLEAN_FLAGS: Final[frozenset[str]] = frozenset(
         "--disable-slash-commands",
         "--chrome",
         "--no-chrome",
+        "--init",
+        "--init-only",
+        "--maintenance",
         "-v",
         "--version",
         "-h",
@@ -97,6 +103,7 @@ _OPTIONAL_VALUE_FLAGS: Final[frozenset[str]] = frozenset(
         "-r",
         "--debug",
         "-d",
+        "--teleport",
     }
 )
 
@@ -106,6 +113,7 @@ _OPTIONAL_VALUE_FLAG_PREFIXES: Final[frozenset[str]] = frozenset(
         "-r=",
         "--debug=",
         "-d=",
+        "--teleport=",
     }
 )
 
@@ -126,7 +134,9 @@ _VALUE_FLAGS: Final[frozenset[str]] = frozenset(
         "--allowed-tools",
         "--allowedtools",
         "--append-system-prompt",
+        "--append-system-prompt-file",
         "--betas",
+        "--debug-file",
         "--disallowedtools",
         "--disallowed-tools",
         "--fallback-model",
@@ -141,6 +151,7 @@ _VALUE_FLAGS: Final[frozenset[str]] = frozenset(
         "--permission-mode",
         "--permission-prompt-tool",
         "--plugin-dir",
+        "--remote",
         "--session-id",
         "--setting-sources",
         "--settings",
@@ -158,7 +169,9 @@ _VALUE_FLAG_PREFIXES: Final[frozenset[str]] = frozenset(
         "--allowedtools=",
         "--allowed-tools=",
         "--append-system-prompt=",
+        "--append-system-prompt-file=",
         "--betas=",
+        "--debug-file=",
         "--disallowedtools=",
         "--disallowed-tools=",
         "--fallback-model=",
@@ -173,6 +186,7 @@ _VALUE_FLAG_PREFIXES: Final[frozenset[str]] = frozenset(
         "--permission-mode=",
         "--permission-prompt-tool=",
         "--plugin-dir=",
+        "--remote=",
         "--session-id=",
         "--setting-sources=",
         "--settings=",
@@ -212,16 +226,20 @@ class ClaudeArgsSpec(BaseArgsSpec):
     ) -> "ClaudeArgsSpec":
         """Return new spec with requested updates applied."""
         tokens = list(self.clean_tokens)
+        positional_indexes = self.positional_indexes
 
         if background is not None:
-            tokens = _toggle_background(tokens, self.positional_indexes, background)
+            tokens = _toggle_background(tokens, positional_indexes, background)
+            # Recalculate positional indexes after toggle
+            temp_spec = _parse_tokens(tokens, self.source)
+            positional_indexes = temp_spec.positional_indexes
 
         if prompt is not None:
             if prompt == "":
                 # Empty string = delete positional arg
-                tokens = _remove_positional(tokens)
+                tokens = _remove_positional(tokens, positional_indexes)
             else:
-                tokens = _set_prompt(tokens, prompt)
+                tokens = _set_positional(tokens, prompt, positional_indexes)
 
         return _parse_tokens(tokens, self.source)
 
@@ -494,6 +512,17 @@ def _parse_tokens(
     source: SourceType,
     initial_errors: Sequence[str] | None = None,
 ) -> ClaudeArgsSpec:
+    """Parse CLI tokens into structured ClaudeArgsSpec.
+
+    State machine that processes tokens sequentially, tracking:
+    - pending_canonical: Known flag awaiting its value (e.g., --model expects next token)
+    - pending_generic_flag: Unknown value-taking flag awaiting its value
+    - after_double_dash: Whether we've passed '--' (all subsequent tokens are positional)
+
+    Validates unknown options and suggests close matches. Detects --background for
+    async launch mode. Preserves original token order in clean_tokens while extracting
+    flag_values dict for known canonical flags.
+    """
     errors: list[str] = list(initial_errors or [])
     clean: TokenList = []
     positional: TokenList = []
@@ -697,29 +726,22 @@ def _looks_like_new_flag(token_lower: str) -> bool:
 
     Used to detect when a flag is missing its value (next token is another flag).
     Recognizes known flags explicitly, no catch-all hyphen check.
+
+    NOTE: No catch-all token_lower.startswith("-") check here!
+    That would reject valid values like "- check something" or "-1"
+    Instead, we explicitly list known boolean flags.
     """
-    if token_lower in _BACKGROUND_SWITCHES:
-        return True
-    if token_lower in _BOOLEAN_FLAGS:
-        return True
-    if token_lower in _FLAG_ALIASES:
-        return True
-    if token_lower in _OPTIONAL_VALUE_FLAGS:
-        return True
-    if token_lower in _VALUE_FLAGS:
-        return True
-    if token_lower == "--":
-        return True
-    if any(token_lower.startswith(prefix) for prefix in _OPTIONAL_VALUE_FLAG_PREFIXES):
-        return True
-    if any(token_lower.startswith(prefix) for prefix in _VALUE_FLAG_PREFIXES):
-        return True
-    if any(token_lower.startswith(prefix) for prefix in _CANONICAL_PREFIXES):
-        return True
-    # NOTE: No catch-all token_lower.startswith("-") check here!
-    # That would reject valid values like "- check something" or "-1"
-    # Instead, we explicitly list known boolean flags above
-    return False
+    return _looks_like_flag_base(
+        token_lower,
+        boolean_flags=_BOOLEAN_FLAGS,
+        value_flags=_VALUE_FLAGS,
+        value_flag_prefixes=_VALUE_FLAG_PREFIXES,
+        optional_value_flags=_OPTIONAL_VALUE_FLAGS,
+        flag_aliases=_FLAG_ALIASES,
+        optional_value_flag_prefixes=_OPTIONAL_VALUE_FLAG_PREFIXES,
+        canonical_prefixes=_CANONICAL_PREFIXES,
+        extra_flags=_BACKGROUND_SWITCHES,
+    )
 
 
 def _toggle_background(tokens: Sequence[str], positional_indexes: tuple[int, ...], desired: bool) -> TokenList:
@@ -753,73 +775,3 @@ def _toggle_background(tokens: Sequence[str], positional_indexes: tuple[int, ...
     return filtered
 
 
-def _set_prompt(tokens: Sequence[str], value: str) -> TokenList:
-    """Set or replace the first positional argument (prompt text).
-
-    If a positional exists, replaces it. Otherwise appends the value.
-    """
-    tokens_list: TokenList = list(tokens)
-    index: int | None = _find_first_positional_index(tokens_list)
-    if index is None:
-        tokens_list.append(value)
-    else:
-        tokens_list[index] = value
-    return tokens_list
-
-
-def _remove_positional(tokens: Sequence[str]) -> TokenList:
-    """Remove first positional argument from tokens"""
-    tokens_list: TokenList = list(tokens)
-    index: int | None = _find_first_positional_index(tokens_list)
-    if index is not None:
-        tokens_list.pop(index)
-    return tokens_list
-
-
-def _find_first_positional_index(tokens: Sequence[str]) -> int | None:
-    """Find index of first positional argument in token list.
-
-    Walks through tokens, tracking flag state to distinguish positional
-    arguments from flag values. Returns None if no positional found.
-    """
-    pending_canonical: bool = False
-    pending_generic: bool = False
-    after_double_dash: bool = False
-
-    for idx, token in enumerate(tokens):
-        token_lower: str = token.lower()
-
-        if after_double_dash:
-            return idx
-        if token_lower == "--":
-            after_double_dash = True
-            continue
-        if pending_canonical:
-            pending_canonical = False
-            continue
-        if pending_generic:
-            pending_generic = False
-            continue
-        if token_lower in _BACKGROUND_SWITCHES:
-            continue
-        if token_lower in _BOOLEAN_FLAGS:
-            continue
-        if _extract_canonical_prefixed(token, token_lower):
-            continue
-        if any(token_lower.startswith(prefix) for prefix in _OPTIONAL_VALUE_FLAG_PREFIXES):
-            continue
-        if any(token_lower.startswith(prefix) for prefix in _VALUE_FLAG_PREFIXES):
-            continue
-        if token_lower in _FLAG_ALIASES:
-            pending_canonical = True
-            continue
-        if token_lower in _OPTIONAL_VALUE_FLAGS:
-            pending_generic = True
-            continue
-        if token_lower in _VALUE_FLAGS:
-            pending_generic = True
-            continue
-        if _looks_like_new_flag(token_lower):
-            continue
-        return idx
-    return None

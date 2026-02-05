@@ -186,6 +186,11 @@ def will_run_in_current_terminal(
     """
     if run_here is not None:
         return run_here
+    # Daemon mode: never execve (would kill daemon process)
+    from .core.thread_context import is_in_daemon_mode
+
+    if is_in_daemon_mode():
+        return False
     # HCOM_TERMINAL=here: internal/debug - forces current terminal
     from .core.config import get_config
 
@@ -318,7 +323,7 @@ def _ensure_hooks_installed(tool: str, include_permissions: bool) -> tuple[bool,
     fails (permission error, etc), return error - don't attempt launch.
     """
     if tool in ("claude", "claude-pty"):
-        from .hooks.settings import verify_claude_hooks_installed, setup_claude_hooks
+        from .tools.claude.settings import verify_claude_hooks_installed, setup_claude_hooks
 
         try:
             if verify_claude_hooks_installed(check_permissions=include_permissions):
@@ -400,6 +405,8 @@ def launch(
     env: dict[str, str] | None = None,
     launcher: str | None = None,
     run_here: bool | None = None,
+    batch_id: str | None = None,
+    name: str | None = None,
 ) -> dict[str, Any]:
     """Launch one or more AI tool instances with consistent tracking.
 
@@ -428,6 +435,9 @@ def launch(
             - True: Run in current terminal (blocks)
             - False: Launch in new terminal window
             - None: Auto-decide based on context
+        name: Explicit instance name to use instead of auto-generating.
+            Used for resume (reuse stopped instance's name). If provided,
+            count must be 1 and name must not be in use by an active instance.
 
     Returns:
         Dictionary with launch results:
@@ -467,6 +477,7 @@ def launch(
     from .core.runtime import build_claude_env
     from .core.paths import hcom_path
     from .core.tool_utils import is_tool_installed
+    from .core.thread_context import get_cwd
 
     normalized = _normalize_tool(tool, pty=pty)
     args = args or []
@@ -519,9 +530,9 @@ def launch(
         # Strict: never launch without working hooks
         raise HcomError(hooks_error)
 
-    working_dir = cwd or os.getcwd()
+    working_dir = cwd or str(get_cwd())
     launcher_name = _resolve_launcher_name(launcher)
-    batch_id = str(uuid.uuid4()).split("-")[0]
+    batch_id = batch_id or str(uuid.uuid4()).split("-")[0]
 
     # Build base environment from config.env defaults (+ user overrides via caller-provided env).
     base_env: dict[str, str] = {}
@@ -551,6 +562,16 @@ def launch(
             codex_resume_thread_id = None
         if codex_resume_thread_id and count > 1:
             raise HcomError(f"Cannot resume the same thread-id with multiple instances (count={count})")
+
+    # Explicit name validation (used for resume to reuse stopped instance's name)
+    if name is not None:
+        if count > 1:
+            raise HcomError(f"Cannot use explicit name with count > 1 (count={count})")
+        # Check if name is already in use by an active instance
+        from .core.db import get_instance
+        existing = get_instance(name)
+        if existing:
+            raise HcomError(f"Instance '{name}' already exists (stop it first or use a different name)")
 
     # Tool args validation (strict by default, overridable).
     # IMPORTANT: validation only; does not alter args/hcom behavior.
@@ -622,12 +643,16 @@ def launch(
         instance_env["HCOM_LAUNCH_BATCH_ID"] = batch_id
         # Propagate resolved HCOM_DIR to children for root consistency
         instance_env["HCOM_DIR"] = str(hcom_path())
-        # Propagate HCOM_DEV_ROOT if set (dev worktree mode)
-        if dev_root := os.environ.get("HCOM_DEV_ROOT"):
-            instance_env["HCOM_DEV_ROOT"] = dev_root
+        # Propagate dev mode env var if set (via hdev script)
+        if val := os.environ.get("HCOM_DEV_ROOT"):
+            instance_env["HCOM_DEV_ROOT"] = val
         process_id = str(uuid.uuid4())
         instance_env["HCOM_PROCESS_ID"] = process_id
-        instance_name = generate_unique_name()
+        # Pass resolved terminal preset so child can record it in launch_context
+        _terminal_cfg = get_config().terminal
+        if _terminal_cfg and _terminal_cfg not in ("default", "here", "print") and "{script}" not in _terminal_cfg:
+            instance_env["HCOM_LAUNCHED_PRESET"] = _terminal_cfg
+        instance_name = name if name is not None else generate_unique_name()
         process_export_var = os.environ.get("HCOM_PROCESS_ID_EXPORT")
         if process_export_var:
             instance_env[process_export_var] = process_id
@@ -709,6 +734,14 @@ def launch(
                                 update_instance_position(instance_name, {"pid": pid})
                             except Exception:
                                 pass
+                            # Track PID for orphan detection
+                            # Terminal info (preset, pane_id) added later by stop_instance
+                            # when the child's launch_context is available
+                            try:
+                                from .core.pidtrack import record_pid
+                                record_pid(pid, "claude", instance_name, working_dir)
+                            except Exception:
+                                pass
                             launched += 1
                             log_files.append(str(log_file))
                             handles.append(
@@ -749,7 +782,7 @@ def launch(
                         pass
 
                     effective_run_here = will_run_in_current_terminal(count, False, run_here)
-                    name = launch_pty(
+                    pty_result = launch_pty(
                         "claude",
                         working_dir,
                         instance_env,
@@ -758,7 +791,7 @@ def launch(
                         tag=effective_tag,
                         run_here=effective_run_here,
                     )
-                    if name:
+                    if pty_result:
                         launched += 1
                         handles.append({"tool": "claude-pty", "instance_name": instance_name})
                     else:
@@ -774,7 +807,7 @@ def launch(
                     except Exception:
                         pass
 
-                    name = launch_pty(
+                    pty_result = launch_pty(
                         "gemini",
                         working_dir,
                         instance_env,
@@ -783,7 +816,7 @@ def launch(
                         tag=effective_tag,
                         run_here=effective_run_here,
                     )
-                    if name:
+                    if pty_result:
                         launched += 1
                         handles.append({"tool": "gemini", "instance_name": instance_name})
                     else:
@@ -791,6 +824,7 @@ def launch(
 
                 case "codex":
                     from .pty.pty_handler import launch_pty
+                    from .tools.codex.preprocessing import preprocess_codex_args
 
                     # Bootstrap delivered via developer_instructions at launch - mark announced
                     try:
@@ -798,15 +832,23 @@ def launch(
                     except Exception:
                         pass
 
-                    # Add developer instructions if system prompt provided
-                    # Uses developer_instructions (adds to context) not experimental_instructions_file
-                    # (which replaces system prompt and fails validation with GPT-5 models)
+                    # Build base args (system_prompt first if provided, will be merged with bootstrap)
                     effective_codex_args = list(codex_args or args or [])
                     if system_prompt:
                         effective_codex_args = [
                             "-c",
                             f"developer_instructions={system_prompt}",
                         ] + effective_codex_args
+
+                    # Preprocess: sandbox flags, --add-dir ~/.hcom, bootstrap injection
+                    # (merges with existing developer_instructions if present)
+                    sandbox_mode = instance_env.get("HCOM_CODEX_SANDBOX_MODE", "workspace")
+                    effective_codex_args = preprocess_codex_args(
+                        effective_codex_args,
+                        instance_name,
+                        sandbox_mode=sandbox_mode,
+                    )
+
                     try:
                         update_instance_position(
                             instance_name,
@@ -816,27 +858,35 @@ def launch(
                         pass
 
                     effective_run_here = will_run_in_current_terminal(count, False, run_here)
-                    # Codex uses custom runner for transcript watcher + resume handling
-                    resume_kwargs = f"resume_thread_id={repr(codex_resume_thread_id)}" if codex_resume_thread_id else ""
-                    name = launch_pty(
+
+                    # Handle resume binding before launch (so native PTY uses correct name)
+                    effective_instance_name = instance_name
+                    if codex_resume_thread_id:
+                        try:
+                            from .core.instances import bind_session_to_process
+                            canonical = bind_session_to_process(codex_resume_thread_id, process_id)
+                            if canonical:
+                                effective_instance_name = canonical
+                                instance_env["HCOM_INSTANCE_NAME"] = canonical
+                        except Exception:
+                            pass  # Non-fatal, continue with launch
+
+                    pty_result = launch_pty(
                         "codex",
                         working_dir,
                         instance_env,
-                        instance_name,
+                        effective_instance_name,
                         effective_codex_args,
                         tag=effective_tag,
                         run_here=effective_run_here,
-                        extra_env={"HCOM_CODEX_SANDBOX_MODE": instance_env.get("HCOM_CODEX_SANDBOX_MODE", "workspace")},
-                        runner_module="hcom.pty.codex",
-                        runner_function="run_codex_with_hcom",
-                        runner_extra_kwargs=resume_kwargs,
+                        extra_env={"HCOM_CODEX_SANDBOX_MODE": sandbox_mode},
                     )
-                    if name:
+                    if pty_result:
                         launched += 1
                         handles.append(
                             {
                                 "tool": "codex",
-                                "instance_name": instance_name,
+                                "instance_name": effective_instance_name,
                             }
                         )
                     else:
@@ -880,11 +930,11 @@ def launch(
     except Exception:
         pass
 
-    # Push launch event to relay (notify TUI if running, else inline push)
+    # Push launch event to relay (notify daemon if running, else inline push)
     try:
-        from .relay import notify_relay_tui, push
+        from .relay import notify_relay, push
 
-        if not notify_relay_tui():
+        if not notify_relay():
             push()
     except Exception:
         pass

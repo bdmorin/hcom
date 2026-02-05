@@ -82,7 +82,16 @@ specific utilities:
 """
 
 from .identity import resolve_identity
+from .hcom_context import HcomContext, ToolType
+from .hook_payload import HookPayload
+from .hook_result import HookResult
+
 
 __all__ = [
     "resolve_identity",
+    # Context and payload types for daemon integration
+    "HcomContext",
+    "ToolType",
+    "HookPayload",
+    "HookResult",
 ]

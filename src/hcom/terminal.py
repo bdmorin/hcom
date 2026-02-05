@@ -3,7 +3,9 @@
 
 from __future__ import annotations
 
+import enum
 import os
+import signal
 import sys
 import re
 import shlex
@@ -21,11 +23,91 @@ from .shared import (
     CREATE_NO_WINDOW,
     is_wsl,
     is_termux,
-    TERMINAL_PRESETS,
     HcomError,
+    TOOL_MARKER_VARS,
+    HCOM_IDENTITY_VARS,
 )
 from .core.paths import hcom_path, LAUNCH_DIR, read_file_with_retry
 from .core.config import get_config
+
+
+class KillResult(enum.Enum):
+    """Result of kill_process()."""
+    SENT = "sent"
+    ALREADY_DEAD = "already_dead"
+    PERMISSION_DENIED = "permission_denied"
+
+
+class TerminalInfo:
+    """Terminal info resolved for an instance."""
+    __slots__ = ("preset_name", "pane_id", "process_id", "kitty_listen_on")
+
+    def __init__(self, preset_name: str = "", pane_id: str = "", process_id: str = "", kitty_listen_on: str = ""):
+        self.preset_name = preset_name
+        self.pane_id = pane_id
+        self.process_id = process_id
+        self.kitty_listen_on = kitty_listen_on
+
+
+def resolve_terminal_info(name: str, pid: int) -> TerminalInfo:
+    """Resolve terminal preset, pane_id, process_id, and kitty socket for an instance.
+
+    Tries launch_context (DB) first, falls back to pidtrack, then process_bindings.
+    """
+    import json as _json
+
+    info = TerminalInfo()
+
+    # Primary: launch_context from DB (available for active instances)
+    try:
+        from .core.instances import load_instance_position
+        pos = load_instance_position(name)
+        if pos:
+            lc = pos.get("launch_context", "")
+            if lc:
+                lc_data = _json.loads(lc)
+                info.preset_name = lc_data.get("terminal_preset", "")
+                info.pane_id = lc_data.get("pane_id", "")
+                info.process_id = lc_data.get("process_id", "")
+                # Extract KITTY_LISTEN_ON from captured env
+                lc_env = lc_data.get("env", {})
+                info.kitty_listen_on = lc_env.get("KITTY_LISTEN_ON", "")
+    except Exception:
+        pass
+
+    # Fallback: pidtrack (for orphans after stop deleted the DB row)
+    if not info.preset_name:
+        from .core.pidtrack import get_pane_id_for_pid, get_preset_for_pid, get_process_id_for_pid
+        info.preset_name = get_preset_for_pid(pid) or ""
+        info.pane_id = get_pane_id_for_pid(pid)
+        if not info.process_id:
+            info.process_id = get_process_id_for_pid(pid)
+
+    # Fallback: process_bindings table (for process_id if not in launch_context)
+    if not info.process_id:
+        try:
+            from .core.db import get_db as _get_db
+            row = _get_db().execute(
+                "SELECT process_id FROM process_bindings WHERE instance_name = ?",
+                (name,),
+            ).fetchone()
+            if row:
+                info.process_id = row["process_id"]
+        except Exception:
+            pass
+
+    return info
+
+
+def _kitty_listen_fd() -> int | None:
+    """Extract fd number from KITTY_LISTEN_ON=fd:N, if present."""
+    val = os.environ.get("KITTY_LISTEN_ON", "")
+    if val.startswith("fd:"):
+        try:
+            return int(val[3:])
+        except ValueError:
+            pass
+    return None
 
 # ==================== Terminal Presets ====================
 
@@ -36,8 +118,10 @@ _available_presets_cache: list[tuple[str, bool]] | None = None
 # Used when CLI binary isn't in PATH but .app bundle is installed
 _MACOS_APP_FALLBACKS: dict[str, str] = {
     "kitty": "open -n -a kitty.app --args {script}",
-    "WezTerm": "open -n -a WezTerm.app --args start -- bash {script}",
-    "Alacritty": "open -n -a Alacritty.app --args -e bash {script}",
+    "kitty-window": "open -n -a kitty.app --args {script}",
+    "wezterm": "open -n -a WezTerm.app --args start -- bash {script}",
+    "wezterm-window": "open -n -a WezTerm.app --args start -- bash {script}",
+    "alacritty": "open -n -a Alacritty.app --args -e bash {script}",
 }
 
 
@@ -72,7 +156,12 @@ def get_available_presets() -> list[tuple[str, bool]]:
     system = platform.system()
     result: list[tuple[str, bool]] = [("default", True)]  # Always available
 
-    for name, (binary, cmd, platforms) in TERMINAL_PRESETS.items():
+    from .core.settings import get_merged_presets
+    merged = get_merged_presets()
+
+    for name, preset in merged.items():
+        binary = preset.get("binary")
+        platforms = preset.get("platforms", [])
         # Skip if not for current platform
         if system not in platforms:
             continue
@@ -80,15 +169,14 @@ def get_available_presets() -> list[tuple[str, bool]]:
         # Check availability
         available = False
         if binary:
-            # Check if binary exists in PATH
+            # Check if binary exists in PATH or resolvable via app bundle
             available = shutil.which(binary) is not None
-            # On macOS, also check for .app bundle fallback
-            if not available and system == "Darwin" and name in _MACOS_APP_FALLBACKS:
-                available = _find_macos_app(name) is not None
+            if not available and system == "Darwin":
+                available = _resolve_binary_path(binary, preset, name) is not None
         else:
             # For macOS apps (binary=None), check app bundle locations
             if system == "Darwin":
-                available = _find_macos_app(name) is not None
+                available = _find_macos_app(preset.get("app_name", name)) is not None
             else:
                 available = True  # Assume available if no binary check
 
@@ -99,23 +187,174 @@ def get_available_presets() -> list[tuple[str, bool]]:
     return result
 
 
+def _resolve_binary_path(binary: str, preset: dict, preset_name: str) -> str | None:
+    """Resolve binary to full path. Returns None if already on PATH or not found."""
+    if shutil.which(binary):
+        return None
+    if platform.system() != "Darwin":
+        return None
+    app = _find_macos_app(preset.get("app_name", preset_name))
+    if not app:
+        return None
+    full_path = app / "Contents" / "MacOS" / binary
+    return str(full_path) if full_path.exists() else None
+
+
 def resolve_terminal_preset(preset_name: str) -> str | None:
     """Resolve preset name to command template.
 
     On macOS, if CLI binary isn't in PATH but .app bundle exists,
-    returns the app bundle command instead.
+    uses a hardcoded fallback (new window presets) or substitutes
+    the full binary path into the open command (tab/split presets).
     """
-    if preset_name not in TERMINAL_PRESETS:
+    from .core.settings import get_merged_preset
+
+    preset = get_merged_preset(preset_name)
+    if not preset:
         return None
 
-    binary, cmd, platforms = TERMINAL_PRESETS[preset_name]
+    binary = preset.get("binary")
+    open_cmd = preset["open"]
 
-    # On macOS, check if we need to use app bundle fallback
-    if platform.system() == "Darwin" and binary and preset_name in _MACOS_APP_FALLBACKS:
-        if shutil.which(binary) is None and _find_macos_app(preset_name) is not None:
-            return _MACOS_APP_FALLBACKS[preset_name]
+    if binary and not shutil.which(binary) and platform.system() == "Darwin":
+        # New-window presets have hardcoded fallbacks using `open -a`
+        if preset_name in _MACOS_APP_FALLBACKS:
+            if _find_macos_app(preset.get("app_name", preset_name)) is not None:
+                return _MACOS_APP_FALLBACKS[preset_name]
+        # Tab/split presets: substitute leading binary with full path
+        full_path = _resolve_binary_path(binary, preset, preset_name)
+        if full_path and open_cmd.startswith(binary):
+            open_cmd = full_path + open_cmd[len(binary):]
 
-    return cmd
+    return open_cmd
+
+
+def _find_kitty_socket() -> str:
+    """Find a reachable kitty remote control socket. Returns 'unix:<path>' or ''."""
+    for sock_path in ("/tmp/kitty",):
+        if Path(sock_path).exists():
+            socket_uri = f"unix:{sock_path}"
+            try:
+                result = subprocess.run(
+                    ["kitten", "@", "--to", socket_uri, "ls"],
+                    capture_output=True, timeout=2,
+                )
+                if result.returncode == 0:
+                    return socket_uri
+            except Exception:
+                pass
+    return ""
+
+
+def _wezterm_reachable() -> bool:
+    """Check if a wezterm mux server is reachable."""
+    try:
+        result = subprocess.run(
+            ["wezterm", "cli", "list"], capture_output=True, timeout=2,
+        )
+        return result.returncode == 0
+    except Exception:
+        return False
+
+
+def detect_terminal_from_env() -> str | None:
+    """Detect terminal preset from inherited environment variables.
+
+    Used for same-terminal PTY launches (run_here=True) to enable close-on-kill.
+    Returns preset name if a recognized terminal env var is set, None otherwise.
+    """
+    from .shared import TERMINAL_ENV_MAP
+
+    for env_var, preset_name in TERMINAL_ENV_MAP.items():
+        if os.environ.get(env_var):
+            return preset_name
+    return None
+
+
+def close_terminal_pane(pid: int, preset_name: str, pane_id: str = "", process_id: str = "",
+                        kitty_listen_on: str = "") -> bool:
+    """Run terminal-specific close command before SIGTERM.
+
+    Must run before SIGTERM because terminal CLIs match panes by PID, pane_id, or process_id.
+    Returns True if close command ran successfully, False otherwise.
+    Non-fatal: caller should always proceed with SIGTERM regardless.
+    """
+    from .core.log import log_info, log_warn
+    from .core.settings import get_merged_preset
+
+    log_info("terminal", "close_pane_attempt", preset=preset_name, pane_id=pane_id, process_id=process_id, pid=pid)
+
+    preset = get_merged_preset(preset_name)
+    if not preset:
+        return False
+
+    close_cmd = preset.get("close")
+    if not close_cmd:
+        return False
+
+    # Skip if command needs a placeholder we don't have
+    if "{pane_id}" in close_cmd and not pane_id:
+        return False
+    if "{process_id}" in close_cmd and not process_id:
+        return False
+
+    close_cmd = close_cmd.replace("{pid}", str(pid))
+    close_cmd = close_cmd.replace("{pane_id}", pane_id)
+    close_cmd = close_cmd.replace("{process_id}", process_id)
+
+    # Resolve binary path (app bundle fallback on macOS)
+    binary = preset.get("binary")
+    if binary:
+        full_path = _resolve_binary_path(binary, preset, preset_name)
+        if full_path and close_cmd.startswith(binary):
+            close_cmd = full_path + close_cmd[len(binary):]
+
+    # Inject --to for kitten commands when we have the socket path
+    # (daemon doesn't inherit KITTY_LISTEN_ON, so use the value from launch_context)
+    if ("kitten @" in close_cmd and kitty_listen_on and "--to" not in close_cmd
+            and not kitty_listen_on.startswith("fd:")):
+        close_cmd = close_cmd.replace("kitten @", f"kitten @ --to {shlex.quote(kitty_listen_on)}")
+
+    try:
+        popen_kwargs: dict[str, Any] = {}
+        kitty_fd = _kitty_listen_fd()
+        if kitty_fd is not None and "kitten" in close_cmd:
+            popen_kwargs["pass_fds"] = (kitty_fd,)
+        result = subprocess.run(
+            close_cmd,
+            shell=True,
+            timeout=5,
+            capture_output=True,
+            text=True,
+            **popen_kwargs,
+        )
+        _log = log_warn if result.returncode != 0 else log_info
+        _log("terminal", "close_pane", cmd=close_cmd, rc=result.returncode,
+             stdout=result.stdout.strip(), stderr=result.stderr.strip())
+        return result.returncode == 0
+    except subprocess.TimeoutExpired:
+        return False
+    except Exception:
+        return False
+
+
+def kill_process(pid: int, preset_name: str = "", pane_id: str = "", process_id: str = "",
+                 kitty_listen_on: str = "") -> tuple[KillResult, bool]:
+    """Close terminal pane (if applicable) then SIGTERM the process group.
+
+    Returns (kill_result, pane_closed) tuple.
+    """
+    pane_closed = False
+    if preset_name:
+        pane_closed = close_terminal_pane(pid, preset_name, pane_id=pane_id, process_id=process_id,
+                                          kitty_listen_on=kitty_listen_on)
+    try:
+        os.killpg(pid, signal.SIGTERM)
+        return KillResult.SENT, pane_closed
+    except ProcessLookupError:
+        return KillResult.ALREADY_DEAD, pane_closed
+    except PermissionError:
+        return KillResult.PERMISSION_DENIED, pane_closed
 
 
 # ==================== Environment Building ====================
@@ -220,67 +459,61 @@ def create_bash_script(
         f.write(f'printf "\\033]0;hcom: starting {tool_name}...\\007"\n')
         f.write(f'echo "Starting {tool_name}..."\n')
 
-        # Unset tool markers when opening new windows to prevent identity inheritance
-        # Custom terminals (Alacritty, etc.) inherit env vars from parent process
-        if opens_new_window:
-            f.write("unset CLAUDECODE GEMINI_CLI GEMINI_SYSTEM_MD ")
-            f.write("CODEX_SANDBOX CODEX_SANDBOX_NETWORK_DISABLED ")
-            f.write("CODEX_MANAGED_BY_NPM CODEX_MANAGED_BY_BUN\n")
+        # Unset tool markers and HCOM identity vars to prevent inheritance
+        # Tool markers: prevent false tool detection in children
+        # Identity vars: prevent parent identity leakage (critical for env=None fork inheritance)
+        f.write(f"unset {' '.join(TOOL_MARKER_VARS)}\n")
+        f.write(f"unset {' '.join(HCOM_IDENTITY_VARS)}\n")
 
         if platform.system() != "Windows":
-            # Check for 'claude' command (with or without args)
+            from .core.tool_utils import find_tool_path
+
+            # Discover paths for minimal environments (kitty splits, etc.)
+            paths_to_add: list[str] = []
+
+            def _add_path(binary_path: str | None) -> None:
+                if binary_path:
+                    dir_path = str(Path(binary_path).resolve().parent)
+                    if dir_path not in paths_to_add:
+                        paths_to_add.append(dir_path)
+
+            # Always add hcom's own directory so 'hcom' is findable
+            _add_path(shutil.which("hcom"))
+
+            # Detect tool from command and add its path
             cmd_stripped = command_str.lstrip()
-            is_claude_command = cmd_stripped == "claude" or cmd_stripped.startswith("claude ")
-            if is_claude_command:
-                # 1. Discover paths once
-                claude_path = shutil.which("claude")
-                if not claude_path:
-                    # Fallback for native installer (alias-based, not in PATH)
-                    for fallback in [
-                        Path.home() / ".claude" / "local" / "claude",
-                        Path.home() / ".local" / "bin" / "claude",
-                        Path.home() / ".claude" / "bin" / "claude",
-                    ]:
-                        if fallback.exists() and fallback.is_file():
-                            claude_path = str(fallback)
-                            break
-                node_path = shutil.which("node")
+            tool_cmd = cmd_stripped.split()[0] if cmd_stripped else ""
+            tool_path = find_tool_path(tool_cmd) if tool_cmd else None
+            _add_path(tool_path)
 
-                # 2. Add to PATH for minimal environments
-                paths_to_add = []
-                for p in [node_path, claude_path]:
-                    if p:
-                        dir_path = str(Path(p).resolve().parent)
-                        if dir_path not in paths_to_add:
-                            paths_to_add.append(dir_path)
+            # Claude needs node for Termux and general operation
+            is_claude_command = tool_cmd == "claude"
+            node_path = shutil.which("node") if is_claude_command else None
+            _add_path(node_path)
 
-                if paths_to_add:
-                    path_addition = ":".join(paths_to_add)
-                    f.write(f'export PATH="{path_addition}:$PATH"\n')
-                elif not claude_path:
-                    # Warning for debugging
-                    print("Warning: Could not locate 'claude' in PATH", file=sys.stderr)
+            # Write PATH additions
+            if paths_to_add:
+                f.write(f'export PATH="{":".join(paths_to_add)}:$PATH"\n')
 
-            # 3. Write environment variables
+            # Write environment variables
             f.write(build_env_string(env, "bash_export") + "\n")
 
             if cwd:
                 f.write(f"cd {shlex.quote(cwd)}\n")
 
-            # 4. Platform-specific command modifications
-            if is_claude_command and claude_path:
+            # Platform-specific command modifications
+            if is_claude_command and tool_path:
                 if is_termux():
                     # Termux: explicit node to bypass shebang issues
                     final_node = node_path or "/data/data/com.termux/files/usr/bin/node"
-                    # Quote paths for safety
                     command_str = command_str.replace(
                         "claude ",
-                        f"{shlex.quote(final_node)} {shlex.quote(claude_path)} ",
+                        f"{shlex.quote(final_node)} {shlex.quote(tool_path)} ",
                         1,
                     )
                 else:
                     # Mac/Linux: use full path (PATH now has node if needed)
-                    command_str = command_str.replace("claude ", f"{shlex.quote(claude_path)} ", 1)
+                    command_str = command_str.replace("claude ", f"{shlex.quote(tool_path)} ", 1)
         else:
             # Windows: no PATH modification needed
             f.write(build_env_string(env, "bash_export") + "\n")
@@ -289,8 +522,15 @@ def create_bash_script(
 
         f.write(f"{command_str}\n")
 
-        # Self-delete for normal mode (not background)
-        if not background:
+        # For new terminal windows: clean up identity env vars and keep
+        # terminal open with a login shell after the tool exits
+        if opens_new_window:
+            f.write("unset HCOM_PROCESS_ID HCOM_LAUNCHED HCOM_PTY_MODE HCOM_TAG HCOM_CODEX_SANDBOX_MODE\n")
+            f.write(f"rm -f {shlex.quote(script_file)}\n")
+            # Terminal close now runs from Python cmd_kill, not the bash script
+            f.write("exec bash -l\n")
+        elif not background:
+            # Self-delete for normal mode (not background)
             f.write("hcom_status=$?\n")
             f.write(f"rm -f {shlex.quote(script_file)}\n")
             f.write("exit $hcom_status\n")
@@ -381,13 +621,14 @@ PLATFORM_TERMINAL_GETTERS = {
 }
 
 
-def _parse_terminal_command(template: str, script_file: str) -> list[str]:
+def _parse_terminal_command(template: str, script_file: str, process_id: str = "") -> list[str]:
     """Parse terminal command template safely to prevent shell injection.
-    Parses the template FIRST, then replaces {script} placeholder in the
-    parsed tokens. This avoids shell injection and handles paths with spaces.
+    Parses the template FIRST, then replaces {script} and {process_id}
+    placeholders in the parsed tokens.
     Args:
         template: Terminal command template with {script} placeholder
         script_file: Path to script file to substitute
+        process_id: HCOM process ID for {process_id} substitution
     Returns:
         list: Parsed command as argv array
     Raises:
@@ -413,15 +654,16 @@ def _parse_terminal_command(template: str, script_file: str) -> list[str]:
             )
         )
 
-    # Replace {script} in parsed tokens
+    # Replace {script} and {process_id} in parsed tokens
     replaced = []
     placeholder_found = False
     for part in parts:
+        if "{process_id}" in part:
+            part = part.replace("{process_id}", process_id)
         if "{script}" in part:
-            replaced.append(part.replace("{script}", script_file))
+            part = part.replace("{script}", script_file)
             placeholder_found = True
-        else:
-            replaced.append(part)
+        replaced.append(part)
 
     if not placeholder_found:
         raise ValueError(
@@ -462,64 +704,38 @@ def launch_terminal(
     from .core.paths import LOGS_DIR
     import time
 
-    # config.env defaults + internal vars, then shell env overrides
-    env_vars = env.copy()
+    # env param contains config.env + instance vars (from launcher)
+    # We'll build different env sets based on launch mode
+    config_and_instance_env = env.copy()
 
-    # Ensure SHELL is in env dict BEFORE os.environ update
-    # (Critical for Termux Activity Manager which launches scripts in clean environment)
-    if "SHELL" not in env_vars:
-        shell_path = os.environ.get("SHELL")
-        if not shell_path:
-            shell_path = shutil.which("bash") or shutil.which("sh")
-        if not shell_path:
-            # Platform-specific fallback
-            if is_termux():
-                shell_path = "/data/data/com.termux/files/usr/bin/bash"
-            else:
-                shell_path = "/bin/bash"
-        if shell_path:
-            env_vars["SHELL"] = shell_path
-
-    # Filter instance-specific vars to prevent identity inheritance from parent AI tool
-    # - CLAUDECODE: new instances get their own from Claude Code
-    # - GEMINI_SYSTEM_MD: hcom-set system prompt file for Gemini (shouldn't leak to children)
-    # - CODEX_*: Codex sandbox vars that would cause is_inside_ai_tool() loop in children
-    # - GEMINI_CLI: Gemini CLI marker (shouldn't leak to children)
-    # - HCOM_* not in KNOWN_CONFIG_KEYS: identity/internal vars (HCOM_PROCESS_ID, etc.)
-    # Config vars (HCOM_TAG, etc.) are inherited - surfaced in launch context for override
-    # Shell env still overrides config.env for non-HCOM user vars (ANTHROPIC_MODEL, etc)
-    # HCOM_DIR is special: always propagate for sandbox/project-local support
-    TOOL_SPECIFIC_VARS = {
-        "CLAUDECODE",
-        "GEMINI_SYSTEM_MD",
-        "GEMINI_CLI",
-        "CODEX_SANDBOX",
-        "CODEX_SANDBOX_NETWORK_DISABLED",
-        "CODEX_MANAGED_BY_NPM",
-        "CODEX_MANAGED_BY_BUN",
-    }
-    PROPAGATE_HCOM_VARS = {
-        "HCOM_DIR",
-        "HCOM_VIA_SHIM",
-    }  # Always propagate these HCOM_* vars
-    # Config keys that should NOT propagate - each launch uses its own config
-    NO_PROPAGATE_CONFIG_KEYS = {
-        "HCOM_TERMINAL",  # Terminal preference is per-user, not inherited
-    }
+    # For same-terminal modes, we need full env (config + instance + shell)
+    # Build this by adding filtered shell env
+    PROPAGATE_HCOM_VARS = {"HCOM_DIR", "HCOM_VIA_SHIM"}
+    NO_PROPAGATE_CONFIG_KEYS = {"HCOM_TERMINAL"}
     from .core.config import KNOWN_CONFIG_KEYS
 
     def should_propagate(key: str) -> bool:
-        """Determine if an env var should be passed to child processes."""
-        if key in TOOL_SPECIFIC_VARS:
+        """Determine if shell env var should propagate to child."""
+        if key in TOOL_MARKER_VARS:
             return False
         if key in NO_PROPAGATE_CONFIG_KEYS:
             return False
         if not key.startswith("HCOM_"):
-            return True  # Non-HCOM vars pass through
-        # HCOM_* vars: only propagate if known config or explicitly listed
+            return True
         return key in KNOWN_CONFIG_KEYS or key in PROPAGATE_HCOM_VARS
 
-    env_vars.update({k: v for k, v in os.environ.items() if should_propagate(k)})
+    full_env_vars = config_and_instance_env.copy()
+    full_env_vars.update({k: v for k, v in os.environ.items() if should_propagate(k)})
+
+    # Ensure SHELL for Termux (launches in clean env via Activity Manager)
+    if "SHELL" not in full_env_vars:
+        shell_path = os.environ.get("SHELL") or shutil.which("bash") or shutil.which("sh")
+        if not shell_path:
+            shell_path = "/data/data/com.termux/files/usr/bin/bash" if is_termux() else "/bin/bash"
+        if shell_path:
+            full_env_vars["SHELL"] = shell_path
+            config_and_instance_env["SHELL"] = shell_path
+
     command_str = command
 
     # 1) Determine script extension
@@ -540,9 +756,24 @@ def launch_terminal(
         tool_name = "Claude Code"
 
     opens_new_window = not background and not run_here
+
+    # Build script_env based on launch mode
+    # Principle: new windows get ONLY config.env + instance vars (nothing from shell)
+    if opens_new_window:
+        # New window: launched by terminal app, no shell inheritance
+        # Want env var in new window? Put it in config.env
+        script_env = config_and_instance_env
+    elif run_here:
+        # Run-here: os.execve REPLACES env entirely, needs full env
+        script_env = full_env_vars
+    else:
+        # Background (same terminal): subprocess inherits via fork
+        # Script only exports deltas (vars not already in shell)
+        script_env = {k: v for k, v in full_env_vars.items() if os.environ.get(k) != v}
+
     create_bash_script(
         script_file,
-        env_vars,
+        script_env,
         cwd,
         command_str,
         background,
@@ -559,21 +790,22 @@ def launch_terminal(
             with open(log_file, "w", encoding="utf-8") as log_handle:
                 if IS_WINDOWS:
                     # Windows: hidden bash execution with Python-piped logs
+                    # Windows needs explicit env (no fork() semantics)
                     bash_exe = find_bash_on_windows()
                     if not bash_exe:
                         raise Exception("Git Bash not found")
 
                     process = windows_hidden_popen(
                         [bash_exe, script_file],
-                        env=env_vars,
+                        env=full_env_vars,
                         cwd=cwd,
                         stdout=log_handle,
                     )
                 else:
-                    # Unix(Mac/Linux/Termux): detached bash execution with Python-piped logs
+                    # Unix: subprocess inherits shell env via fork()
+                    # Script exports only deltas (script_env has vars not in shell)
                     process = subprocess.Popen(
                         ["bash", script_file],
-                        env=env_vars,
                         cwd=cwd,
                         stdin=subprocess.DEVNULL,
                         stdout=log_handle,
@@ -618,26 +850,67 @@ def launch_terminal(
             if not bash_exe:
                 print(format_error("Git Bash not found"), file=sys.stderr)
                 return False
-            # Windows: can't exec, use subprocess
-            result = subprocess.run([bash_exe, script_file], env=env_vars, cwd=cwd)
+            # Windows: can't exec, use subprocess with full env
+            result = subprocess.run([bash_exe, script_file], env=full_env_vars, cwd=cwd)
             if result.returncode != 0:
                 raise HcomError(format_error("Terminal launch failed"))
             return True
         else:
-            # Unix: exec replaces this process entirely, saving ~5MB per agent
-            # The bash script's exit code becomes this process's exit code
+            # Unix: exec REPLACES this process entirely
+            # execve needs full env dict (not inherited like fork)
             if cwd:
                 os.chdir(cwd)
-            os.execve("/bin/bash", ["bash", script_file], env_vars)
+            os.execve("/bin/bash", ["bash", script_file], full_env_vars)
             # Never reaches here - execve replaces the process
 
     # 4) New window or custom command mode
     # Resolve terminal_mode: 'default' → platform auto-detect, preset name → command, else custom
     custom_cmd: str | list[str] | None
+    from .core.settings import get_merged_presets as _get_merged
+
+    # Smart terminal: "kitty" auto-detects split/tab/window, "wezterm" same pattern
+    kitty_socket = ""
+    if terminal_mode == "kitty":
+        if os.environ.get("KITTY_WINDOW_ID"):
+            terminal_mode = "kitty-split"
+        else:
+            kitty_socket = _find_kitty_socket()
+            terminal_mode = "kitty-tab" if kitty_socket else "kitty-window"
+    elif terminal_mode == "wezterm":
+        if os.environ.get("WEZTERM_PANE"):
+            terminal_mode = "wezterm-split"
+        elif _wezterm_reachable():
+            terminal_mode = "wezterm-tab"
+        else:
+            terminal_mode = "wezterm-window"
+
+    # Update HCOM_LAUNCHED_PRESET so launch_context captures the resolved preset
+    if terminal_mode != get_config().terminal:
+        env["HCOM_LAUNCHED_PRESET"] = terminal_mode
+
     if terminal_mode == "default":
         custom_cmd = None  # Will use platform default
-    elif terminal_mode in TERMINAL_PRESETS:
+    elif terminal_mode in _get_merged():
+        # Kitty split/tab presets need remote control (kitten @)
+        if terminal_mode in ("kitty-tab", "kitty-split"):
+            listen_on = os.environ.get("KITTY_LISTEN_ON", "") or kitty_socket
+            if not listen_on:
+                raise HcomError(
+                    f"{terminal_mode} requires remote control.\n"
+                    "  Add to ~/.config/kitty/kitty.conf:\n"
+                    "    allow_remote_control yes\n"
+                    "    listen_on unix:/tmp/kitty\n"
+                    "  Then restart kitty."
+                )
         custom_cmd = resolve_terminal_preset(terminal_mode)  # Handles app bundle fallback
+        # Inject --to for kitty commands launched from outside kitty (no KITTY_LISTEN_ON in env)
+        if kitty_socket and custom_cmd and isinstance(custom_cmd, str) and "kitten @" in custom_cmd and "--to" not in custom_cmd:
+            custom_cmd = custom_cmd.replace("kitten @", f"kitten @ --to {shlex.quote(kitty_socket)}")
+        # Target the launcher's tab so splits/tabs open next to the launching instance
+        if terminal_mode in ("kitty-tab", "kitty-split"):
+            kitty_wid = os.environ.get("KITTY_WINDOW_ID")
+            if kitty_wid and custom_cmd and " -- " in custom_cmd:
+                custom_cmd = custom_cmd.replace(" -- ", f" --match window_id:{kitty_wid} -- ", 1)
     else:
         custom_cmd = terminal_mode  # Custom command with {script}
 
@@ -693,7 +966,7 @@ def launch_terminal(
     else:
         # User-provided string commands - parse safely without shell=True
         try:
-            final_argv = _parse_terminal_command(custom_cmd, script_file)
+            final_argv = _parse_terminal_command(custom_cmd, script_file, process_id=env.get("HCOM_PROCESS_ID", ""))
         except ValueError as e:
             print(str(e), file=sys.stderr)
             return False
@@ -744,12 +1017,17 @@ def _spawn_terminal_process(argv: list[str], format_error) -> bool:
             stderr_handle = None
             stderr_path = None
 
+        popen_kwargs: dict[str, Any] = {}
+        kitty_fd = _kitty_listen_fd()
+        if kitty_fd is not None and any("kitten" in a for a in argv):
+            popen_kwargs["pass_fds"] = (kitty_fd,)
         process = subprocess.Popen(
             argv,
             stdin=subprocess.DEVNULL,
             stdout=subprocess.DEVNULL,
             stderr=stderr_handle or subprocess.DEVNULL,
             start_new_session=True,
+            **popen_kwargs,
         )
         if stderr_handle:
             stderr_handle.close()
@@ -791,7 +1069,8 @@ def _spawn_terminal_process(argv: list[str], format_error) -> bool:
                 stderr=stderr_text,
             )
             error_msg = f"Terminal launch failed (exit code {returncode})" + (f": {stderr_text}" if stderr_text else "")
-            if argv and argv[0] == "open" and os.environ.get("CODEX_SANDBOX"):
+            from .core.thread_context import get_is_codex
+            if argv and argv[0] == "open" and get_is_codex():
                 error_msg += " (Codex sandbox blocks LaunchServices; use Agent full access or run outside sandbox)"
             raise HcomError(error_msg)
 
@@ -805,7 +1084,11 @@ def _spawn_terminal_process(argv: list[str], format_error) -> bool:
         return True  # Fire and forget
 
     # Normal case: wait for terminal launcher to complete
-    result = subprocess.run(argv, capture_output=True, text=True)
+    popen_kwargs_normal: dict[str, Any] = {}
+    kitty_fd_normal = _kitty_listen_fd()
+    if kitty_fd_normal is not None and any("kitten" in a for a in argv):
+        popen_kwargs_normal["pass_fds"] = (kitty_fd_normal,)
+    result = subprocess.run(argv, capture_output=True, text=True, **popen_kwargs_normal)
     if result.returncode != 0:
         stderr_text = (result.stderr or "").strip()
         error_msg = f"Terminal launch failed (exit code {result.returncode})" + (

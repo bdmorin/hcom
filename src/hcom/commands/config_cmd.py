@@ -36,10 +36,14 @@ def _get_config_help(key: str) -> str | None:
             elif name == "Ghostty":
                 desc = "Fast GPU-accelerated terminal"
             elif name == "kitty":
-                desc = "GPU-accelerated terminal"
-            elif name == "WezTerm":
-                desc = "Cross-platform GPU terminal"
-            elif name == "Alacritty":
+                desc = "Auto: split if inside, tab if reachable, else new window"
+            elif name == "kitty-window":
+                desc = "Always new kitty OS window"
+            elif name == "wezterm":
+                desc = "Auto: split if inside, tab if reachable, else new window"
+            elif name == "wezterm-window":
+                desc = "Always new WezTerm OS window"
+            elif name == "alacritty":
                 desc = "Minimal GPU-accelerated terminal"
             elif name == "ttab":
                 desc = "Open in new tab (npm install -g ttab)"
@@ -49,6 +53,8 @@ def _get_config_help(key: str) -> str | None:
                 desc = "New tab in WezTerm (requires wezterm CLI)"
             elif name == "kitty-tab":
                 desc = "New tab in kitty (requires kitten CLI)"
+            elif name == "kitty-split":
+                desc = "Split pane in kitty (requires kitten CLI)"
             elif name == "gnome-terminal":
                 desc = "GNOME desktop default"
             elif name == "konsole":
@@ -427,9 +433,9 @@ def _config_instance(target: str, argv: list[str], json_output: bool) -> int:
     # Validate and convert based on key type
     db_value: str | int | None
     if key == "tag":
-        if new_value and not all(c.isalnum() or c == "-" for c in new_value):
+        if new_value and not all(c.isalnum() or c in "-_" for c in new_value):
             print(
-                format_error("Tag must be alphanumeric (hyphens allowed)"),
+                format_error("Tag must be alphanumeric (hyphens and underscores allowed)"),
                 file=sys.stderr,
             )
             return 1
@@ -757,7 +763,7 @@ def cmd_config(argv: list[str], *, ctx: CommandContext | None = None) -> int:
         # Handle HCOM_AUTO_APPROVE changes - update permissions in all tools
         if key == "HCOM_AUTO_APPROVE":
             enabled = value not in ("0", "false", "False", "no", "off", "")
-            from ..hooks.settings import setup_claude_hooks
+            from ..tools.claude.settings import setup_claude_hooks
             from ..tools.gemini.settings import setup_gemini_hooks
             from ..tools.codex.settings import setup_codex_hooks
 

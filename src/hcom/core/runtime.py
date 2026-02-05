@@ -131,6 +131,31 @@ def notify_instance(instance_name: str, timeout: float = 0.05) -> None:
                 pass
 
 
+def _send_notify_to_ports(ports: list[int], timeout: float = 0.05) -> None:
+    """Send TCP notifications to specific ports (no DB lookup).
+
+    Used by stop_instance after row is deleted but before notifying listeners.
+
+    Args:
+        ports: List of TCP ports to notify
+        timeout: TCP connection timeout in seconds (default 50ms)
+    """
+    # Dedup while preserving order
+    seen = set()
+    deduped: list[int] = []
+    for p in ports:
+        if p and p not in seen:
+            deduped.append(p)
+            seen.add(p)
+
+    for port in deduped:
+        try:
+            with socket.create_connection(("127.0.0.1", port), timeout=timeout) as sock:
+                sock.send(b"\n")
+        except Exception:
+            pass  # Best effort - no pruning since row is already deleted
+
+
 def notify_all_instances(timeout: float = 0.05) -> None:
     """Send TCP wake notifications to all instance notify ports.
 

@@ -119,6 +119,16 @@ def parse_event_flags(argv: list[str]) -> tuple[dict[str, list[Any]], list[str]]
             remaining.append(arg)
             i += 1
 
+    # Resolve tag-name to base name for instance filters
+    if "instance" in filters:
+        from .instances import resolve_display_name
+
+        resolved = []
+        for name in filters["instance"]:
+            r = resolve_display_name(name)
+            resolved.append(r if r else name)
+        filters["instance"] = resolved
+
     return filters, remaining
 
 

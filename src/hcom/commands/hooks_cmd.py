@@ -13,7 +13,7 @@ HOOK_TOOLS = ("claude", "gemini", "codex")
 
 def _get_tool_status() -> dict[str, dict]:
     """Get hook installation status for each tool."""
-    from ..hooks.settings import (
+    from ..tools.claude.settings import (
         get_claude_settings_path,
         verify_claude_hooks_installed,
     )
@@ -65,7 +65,7 @@ def cmd_hooks_add(argv: list[str]) -> int:
         hcom hooks add all       # Add all hooks
     """
     from ..core.config import get_config
-    from ..hooks.settings import setup_claude_hooks
+    from ..tools.claude.settings import setup_claude_hooks
     from ..tools.gemini.settings import setup_gemini_hooks
     from ..tools.codex.settings import setup_codex_hooks
 
@@ -149,7 +149,7 @@ def cmd_hooks_remove(argv: list[str]) -> int:
         hcom hooks remove claude # Remove Claude hooks only
         hcom hooks remove all    # Remove all hooks
     """
-    from ..hooks.settings import remove_claude_hooks
+    from ..tools.claude.settings import remove_claude_hooks
     from ..tools.gemini.settings import remove_gemini_hooks
     from ..tools.codex.settings import remove_codex_hooks
 

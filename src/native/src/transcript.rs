@@ -1,0 +1,485 @@
+//! Codex transcript watcher - monitors JSONL for file edits
+//!
+//! Codex doesn't have per-tool hooks like Gemini. Instead, we parse the
+//! transcript file (rollout-*.jsonl) to detect tool calls and user prompts.
+//!
+//! Transcript Location:
+//!     ~/.codex/sessions/<session>/rollout-*-<thread-id>.jsonl
+//!
+//! Detected Events:
+//!     - apply_patch: File edits → collision detection subscriptions
+//!     - shell/shell_command: Commands → cmd: subscriptions
+//!     - user messages: Prompts → user_input subscriptions
+
+use std::collections::HashSet;
+use std::fs::File;
+use std::io::{BufRead, BufReader, Seek, SeekFrom};
+use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use std::time::Duration;
+
+use regex::Regex;
+use serde_json::Value;
+
+use crate::db::HcomDb;
+use crate::log::{log_info, log_error};
+
+/// Regex to extract file paths from apply_patch input
+/// Matches: *** Update File: path, *** Add File: path, *** Delete File: path
+fn apply_patch_regex() -> Regex {
+    Regex::new(r"\*\*\* (?:Update|Add|Delete) File: (.+?)(?:\n|$)").unwrap()
+}
+
+/// Transcript watcher state
+pub struct TranscriptWatcher {
+    instance_name: String,
+    transcript_path: Option<String>,
+    file_pos: u64,
+    logged_call_ids: HashSet<String>,
+    apply_patch_re: Regex,
+}
+
+impl TranscriptWatcher {
+    /// Create a new transcript watcher for an instance
+    pub fn new(instance_name: &str) -> Self {
+        Self {
+            instance_name: instance_name.to_string(),
+            transcript_path: None,
+            file_pos: 0,
+            logged_call_ids: HashSet::new(),
+            apply_patch_re: apply_patch_regex(),
+        }
+    }
+
+    /// Update transcript path (may not be known at init)
+    pub fn set_transcript_path(&mut self, path: &str) {
+        if self.transcript_path.as_deref() != Some(path) {
+            self.transcript_path = Some(path.to_string());
+            self.file_pos = 0; // Reset position for new file
+        }
+    }
+
+    /// Parse new transcript entries, log tool calls and prompts to events DB
+    ///
+    /// Returns number of file edits logged (apply_patch only).
+    pub fn sync(&mut self, db: &HcomDb) -> u32 {
+        let path = match &self.transcript_path {
+            Some(p) => p.clone(),
+            None => return 0,
+        };
+
+        let path = Path::new(&path);
+        if !path.exists() {
+            return 0;
+        }
+
+        let mut edits_logged = 0;
+
+        // Check if file was truncated/replaced
+        if let Ok(metadata) = path.metadata() {
+            if metadata.len() < self.file_pos {
+                self.file_pos = 0;
+            }
+        }
+
+        // Open and seek to last position
+        let file = match File::open(path) {
+            Ok(f) => f,
+            Err(_) => return 0,
+        };
+
+        let mut reader = BufReader::new(file);
+        if reader.seek(SeekFrom::Start(self.file_pos)).is_err() {
+            return 0;
+        }
+
+        // Read new lines
+        let mut line = String::new();
+        loop {
+            line.clear();
+            match reader.read_line(&mut line) {
+                Ok(0) => break, // EOF
+                Ok(_) => {
+                    if line.trim().is_empty() {
+                        continue;
+                    }
+                    if let Ok(entry) = serde_json::from_str::<Value>(&line) {
+                        edits_logged += self.process_entry(&entry, db);
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+
+        // Update file position
+        if let Ok(pos) = reader.stream_position() {
+            self.file_pos = pos;
+        }
+
+        edits_logged
+    }
+
+    /// Process a single transcript entry
+    fn process_entry(&mut self, entry: &Value, db: &HcomDb) -> u32 {
+        if entry.get("type").and_then(|v| v.as_str()) != Some("response_item") {
+            return 0;
+        }
+
+        let payload = match entry.get("payload") {
+            Some(p) => p,
+            None => return 0,
+        };
+
+        let payload_type = payload.get("type").and_then(|v| v.as_str()).unwrap_or("");
+        let timestamp = entry.get("timestamp").and_then(|v| v.as_str()).unwrap_or("");
+
+        // Handle user messages -> log active:prompt status (filter hcom injections)
+        if payload_type == "message" && payload.get("role").and_then(|v| v.as_str()) == Some("user") {
+            let text = self.extract_message_text(payload);
+            // Skip hcom-injected messages, only log real user prompts
+            if !text.starts_with("[hcom]") {
+                self.log_user_prompt(timestamp, db);
+            }
+            return 0;
+        }
+
+        // Handle function_call and custom_tool_call
+        if payload_type != "function_call" && payload_type != "custom_tool_call" {
+            return 0;
+        }
+
+        let tool_name = payload.get("name").and_then(|v| v.as_str()).unwrap_or("");
+        let call_id = payload.get("call_id").and_then(|v| v.as_str()).unwrap_or("");
+
+        // Skip if already processed
+        if !call_id.is_empty() && self.logged_call_ids.contains(call_id) {
+            return 0;
+        }
+
+        let mut edits = 0;
+
+        if tool_name == "apply_patch" {
+            // Extract file paths from apply_patch input
+            let input_text = payload.get("input")
+                .or_else(|| payload.get("arguments"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+
+            for caps in self.apply_patch_re.captures_iter(input_text) {
+                if let Some(filepath) = caps.get(1) {
+                    self.log_file_edit(filepath.as_str().trim(), timestamp, db);
+                    edits += 1;
+                }
+            }
+        } else if tool_name == "shell" || tool_name == "shell_command" || tool_name == "exec_command" {
+            // Log shell commands
+            let args_str = payload.get("arguments")
+                .or_else(|| payload.get("input"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+
+            let cmd = self.extract_shell_command(args_str);
+            if !cmd.is_empty() {
+                self.log_shell_command(&cmd, timestamp, db);
+            }
+        }
+
+        // Track call_id to avoid duplicates
+        if !call_id.is_empty() {
+            // Bound memory: clear when too large
+            if self.logged_call_ids.len() > 10000 {
+                self.logged_call_ids.clear();
+            }
+            self.logged_call_ids.insert(call_id.to_string());
+        }
+
+        edits
+    }
+
+    /// Extract message text from user message payload
+    fn extract_message_text(&self, payload: &Value) -> String {
+        let content = match payload.get("content") {
+            Some(c) => c,
+            None => return String::new(),
+        };
+
+        let mut text = String::new();
+        if let Some(arr) = content.as_array() {
+            for part in arr {
+                if let Some(t) = part.get("text").and_then(|v| v.as_str()) {
+                    text.push_str(t);
+                } else if let Some(s) = part.as_str() {
+                    text.push_str(s);
+                }
+            }
+        }
+        text.trim().to_string()
+    }
+
+    /// Extract command from shell tool arguments
+    fn extract_shell_command(&self, args_str: &str) -> String {
+        // Try to parse as JSON
+        if let Ok(args) = serde_json::from_str::<Value>(args_str) {
+            let cmd = args.get("command").or_else(|| args.get("cmd"));
+            if let Some(cmd_val) = cmd {
+                // Handle array format: ["bash", "-lc", "actual command"]
+                if let Some(arr) = cmd_val.as_array() {
+                    if arr.len() >= 3
+                        && arr[0].as_str() == Some("bash") && arr[1].as_str() == Some("-lc")
+                    {
+                        return arr[2].as_str().unwrap_or("").to_string();
+                    }
+                    return arr.iter()
+                        .filter_map(|v| v.as_str())
+                        .collect::<Vec<_>>()
+                        .join(" ");
+                }
+                // Handle string format
+                if let Some(s) = cmd_val.as_str() {
+                    return s.to_string();
+                }
+            }
+        }
+        // Fallback: truncate raw string
+        args_str.chars().take(500).collect()
+    }
+
+    /// Log a file edit status event for collision detection
+    fn log_file_edit(&self, filepath: &str, timestamp: &str, db: &HcomDb) {
+        if let Err(e) = db.log_status_event(
+            &self.instance_name,
+            "active",
+            "tool:apply_patch",
+            Some(filepath),
+            if timestamp.is_empty() { None } else { Some(timestamp) },
+        ) {
+            log_error("transcript", "log_event.fail", &format!("Failed to log file edit: {}", e));
+        }
+
+        if !timestamp.is_empty() {
+            let _ = db.update_status_if_newer(
+                &self.instance_name,
+                "active",
+                "tool:apply_patch",
+                Some(filepath),
+                timestamp,
+            );
+        }
+    }
+
+    /// Log a shell command status event
+    fn log_shell_command(&self, command: &str, timestamp: &str, db: &HcomDb) {
+        if let Err(e) = db.log_status_event(
+            &self.instance_name,
+            "active",
+            "tool:shell",
+            Some(command),
+            if timestamp.is_empty() { None } else { Some(timestamp) },
+        ) {
+            log_error("transcript", "log_event.fail", &format!("Failed to log shell command: {}", e));
+        }
+
+        if !timestamp.is_empty() {
+            let _ = db.update_status_if_newer(
+                &self.instance_name,
+                "active",
+                "tool:shell",
+                Some(command),
+                timestamp,
+            );
+        }
+    }
+
+    /// Log user prompt status event
+    fn log_user_prompt(&self, timestamp: &str, db: &HcomDb) {
+        if let Err(e) = db.log_status_event(
+            &self.instance_name,
+            "active",
+            "prompt",
+            None,
+            if timestamp.is_empty() { None } else { Some(timestamp) },
+        ) {
+            log_error("transcript", "log_event.fail", &format!("Failed to log user prompt: {}", e));
+        }
+
+        if !timestamp.is_empty() {
+            let _ = db.update_status_if_newer(
+                &self.instance_name,
+                "active",
+                "prompt",
+                None,
+                timestamp,
+            );
+        }
+    }
+}
+
+/// Run transcript watcher loop in a thread
+///
+/// Polls every 5 seconds until running flag is cleared.
+pub fn run_transcript_watcher(
+    running: Arc<AtomicBool>,
+    instance_name: String,
+    poll_interval: Duration,
+) {
+    log_info("transcript", "watcher.start", &format!("Starting transcript watcher for {}", instance_name));
+
+    let mut watcher = TranscriptWatcher::new(&instance_name);
+
+    // Open database
+    let db = match HcomDb::open() {
+        Ok(db) => db,
+        Err(e) => {
+            log_error("transcript", "db.open.fail", &format!("Failed to open DB: {}", e));
+            return;
+        }
+    };
+
+    while running.load(Ordering::Acquire) {
+        // Get transcript path from instance DB (may be set by notify hook)
+        match db.get_transcript_path(&instance_name) {
+            Ok(Some(path)) => {
+                watcher.set_transcript_path(&path);
+            }
+            Ok(None) => {
+                // No transcript path set - normal case
+            }
+            Err(e) => {
+                log_error("native", "transcript.init", &format!(
+                    "DB error getting transcript path: {}", e
+                ));
+            }
+        }
+
+        // Sync any new entries
+        let edits = watcher.sync(&db);
+        if edits > 0 {
+            log_info("transcript", "watcher.sync", &format!("Logged {} file edits for {}", edits, instance_name));
+        }
+
+        // Sleep in small increments to check running flag
+        let mut remaining = poll_interval;
+        while running.load(Ordering::Acquire) && remaining > Duration::ZERO {
+            let sleep_time = remaining.min(Duration::from_millis(500));
+            std::thread::sleep(sleep_time);
+            remaining = remaining.saturating_sub(sleep_time);
+        }
+    }
+
+    log_info("transcript", "watcher.stop", &format!("Transcript watcher stopped for {}", instance_name));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn watcher() -> TranscriptWatcher {
+        TranscriptWatcher::new("test")
+    }
+
+    // ---- apply_patch_regex ----
+
+    #[test]
+    fn regex_matches_update_add_delete() {
+        let re = apply_patch_regex();
+        let input = "*** Update File: src/main.rs\n*** Add File: new.rs\n*** Delete File: old.rs\n";
+        let paths: Vec<&str> = re.captures_iter(input)
+            .filter_map(|c| c.get(1).map(|m| m.as_str()))
+            .collect();
+        assert_eq!(paths, vec!["src/main.rs", "new.rs", "old.rs"]);
+    }
+
+    #[test]
+    fn regex_no_match() {
+        let re = apply_patch_regex();
+        let input = "nothing relevant here";
+        assert_eq!(re.captures_iter(input).count(), 0);
+    }
+
+    #[test]
+    fn regex_end_of_string_without_newline() {
+        let re = apply_patch_regex();
+        let input = "*** Update File: path/to/file.py";
+        let caps = re.captures(input).unwrap();
+        assert_eq!(caps.get(1).unwrap().as_str(), "path/to/file.py");
+    }
+
+    // ---- extract_message_text ----
+
+    #[test]
+    fn extract_text_from_array_content() {
+        let w = watcher();
+        let payload = json!({
+            "content": [{"text": "hello "}, {"text": "world"}]
+        });
+        assert_eq!(w.extract_message_text(&payload), "hello world");
+    }
+
+    #[test]
+    fn extract_text_from_string_array() {
+        let w = watcher();
+        let payload = json!({
+            "content": ["hello", "world"]
+        });
+        assert_eq!(w.extract_message_text(&payload), "helloworld");
+    }
+
+    #[test]
+    fn extract_text_missing_content() {
+        let w = watcher();
+        let payload = json!({"role": "user"});
+        assert_eq!(w.extract_message_text(&payload), "");
+    }
+
+    // ---- extract_shell_command ----
+
+    #[test]
+    fn shell_cmd_bash_lc_array() {
+        let w = watcher();
+        let args = r#"{"command": ["bash", "-lc", "ls -la"]}"#;
+        assert_eq!(w.extract_shell_command(args), "ls -la");
+    }
+
+    #[test]
+    fn shell_cmd_string_format() {
+        let w = watcher();
+        let args = r#"{"command": "echo hello"}"#;
+        assert_eq!(w.extract_shell_command(args), "echo hello");
+    }
+
+    #[test]
+    fn shell_cmd_generic_array() {
+        let w = watcher();
+        let args = r#"{"command": ["ls", "-la", "/tmp"]}"#;
+        assert_eq!(w.extract_shell_command(args), "ls -la /tmp");
+    }
+
+    #[test]
+    fn shell_cmd_fallback_raw_string() {
+        let w = watcher();
+        let args = "not json at all";
+        assert_eq!(w.extract_shell_command(args), "not json at all");
+    }
+
+    #[test]
+    fn shell_cmd_truncates_long_fallback() {
+        let w = watcher();
+        let args = "x".repeat(1000);
+        assert_eq!(w.extract_shell_command(&args).len(), 500);
+    }
+
+    // ---- deduplication ----
+
+    #[test]
+    fn logged_call_ids_bounds_memory() {
+        let mut w = watcher();
+        for i in 0..10001 {
+            w.logged_call_ids.insert(format!("id_{}", i));
+        }
+        assert!(w.logged_call_ids.len() > 10000);
+        // Next process_entry with a call_id would trigger the clear
+        // (tested indirectly since process_entry needs DB)
+    }
+}

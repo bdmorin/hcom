@@ -1,0 +1,35 @@
+[package]
+name = "hcom"
+version = "0.6.14"
+edition = "2024"
+authors = ["hcom"]
+description = "High-performance PTY wrapper and daemon client for hcom"
+license = "MIT"
+rust-version = "1.85"
+
+[[bin]]
+name = "hcom"
+path = "src/main.rs"
+
+[dependencies]
+nix = { version = "0.30", features = ["term", "signal", "poll", "process", "fs", "ioctl"] }
+vt100 = "0.16"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+anyhow = "1"
+libc = "0.2"
+rusqlite = { version = "0.32", features = ["bundled"] }
+regex = "1"
+thiserror = "2"
+# Client mode dependencies
+dirs = "5"
+chrono = "0.4"
+
+[dev-dependencies]
+serial_test = "3"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+strip = true

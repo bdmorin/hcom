@@ -11,7 +11,7 @@ from pathlib import Path
 from dataclasses import dataclass
 from typing import Any, Literal
 
-__version__ = "0.6.13"
+__version__ = "0.6.14"
 
 # ===== Platform Detection =====
 IS_WINDOWS = sys.platform == "win32"
@@ -83,33 +83,33 @@ def termux_shebang_bypass(command: list[str], tool: str) -> list[str]:
 def is_inside_ai_tool() -> bool:
     """Detect if running inside any AI CLI tool (Claude Code, Gemini CLI, Codex).
 
+    Uses contextvars for daemon mode, falls back to os.environ for CLI mode.
+
     Returns True if:
     - CLAUDECODE=1 (running inside Claude Code - may or may not be hcom-launched)
     - HCOM_LAUNCHED=1 (Gemini/Codex are always hcom-launched; catches vanilla Claude too)
     - GEMINI_CLI=1 (running inside Gemini CLI)
     - CODEX_SANDBOX* or CODEX_MANAGED_BY_* (running inside Codex)
     """
-    return (
-        os.environ.get("CLAUDECODE") == "1"
-        or os.environ.get("HCOM_LAUNCHED") == "1"
-        or os.environ.get("GEMINI_CLI") == "1"
-        or "CODEX_SANDBOX" in os.environ  # Catches CODEX_SANDBOX and CODEX_SANDBOX_NETWORK_DISABLED
-        or "CODEX_MANAGED_BY_NPM" in os.environ
-        or "CODEX_MANAGED_BY_BUN" in os.environ
-    )
+    from .core.thread_context import get_is_claude, get_is_gemini, get_is_codex, get_is_launched
+
+    return get_is_claude() or get_is_launched() or get_is_gemini() or get_is_codex()
 
 
 def detect_current_tool() -> str:
     """Detect current AI tool environment (vanilla or hcom-launched).
 
+    Uses contextvars for daemon mode, falls back to os.environ for CLI mode.
+
     Returns: 'claude', 'codex', 'gemini', or 'adhoc' if unknown.
     """
-    if os.environ.get("CLAUDECODE") == "1":
+    from .core.thread_context import get_is_claude, get_is_gemini, get_is_codex
+
+    if get_is_claude():
         return "claude"
-    codex_env_vars = ("CODEX_SANDBOX", "CODEX_MANAGED_BY_NPM", "CODEX_MANAGED_BY_BUN")
-    if any(v in os.environ for v in codex_env_vars):
+    if get_is_codex():
         return "codex"
-    if os.environ.get("GEMINI_CLI") == "1":
+    if get_is_gemini():
         return "gemini"
     return "adhoc"
 
@@ -117,9 +117,13 @@ def detect_current_tool() -> str:
 def detect_vanilla_tool() -> str | None:
     """Detect if running inside a vanilla (non-hcom-launched) AI tool.
 
+    Uses contextvars for daemon mode, falls back to os.environ for CLI mode.
+
     Returns tool type ('claude', 'codex', 'gemini') or None if not vanilla.
     """
-    if os.environ.get("HCOM_LAUNCHED") == "1":
+    from .core.thread_context import get_is_launched
+
+    if get_is_launched():
         return None  # Launched via hcom - not vanilla
     tool = detect_current_tool()
     return tool if tool != "adhoc" else None
@@ -130,6 +134,31 @@ def detect_vanilla_tool() -> str | None:
 RELEASED_TOOLS = {"claude", "gemini", "codex"}  # codex: coming soon
 # Tools that support background/headless mode
 RELEASED_BACKGROUND = {"claude"}
+
+# ===== Environment Variable Constants =====
+# Tool detection markers - set by AI tools, cleared to prevent inheritance
+TOOL_MARKER_VARS = (
+    "CLAUDECODE",
+    "GEMINI_CLI",
+    "GEMINI_SYSTEM_MD",
+    "CODEX_SANDBOX",
+    "CODEX_SANDBOX_NETWORK_DISABLED",
+    "CODEX_MANAGED_BY_NPM",
+    "CODEX_MANAGED_BY_BUN",
+)
+
+# HCOM identity vars - set per-instance, cleared to prevent parent identity leakage
+# Keep in sync with FORWARD_ENV in src/native/src/client/mod.rs
+HCOM_IDENTITY_VARS = (
+    "HCOM_PROCESS_ID",
+    "HCOM_LAUNCHED",
+    "HCOM_LAUNCHED_PRESET",
+    "HCOM_PTY_MODE",
+    "HCOM_BACKGROUND",
+    "HCOM_LAUNCHED_BY",
+    "HCOM_LAUNCH_BATCH_ID",
+    "HCOM_LAUNCH_EVENT_ID",
+)
 
 # ===== Message Constants =====
 # Message patterns
@@ -142,8 +171,8 @@ RELEASED_BACKGROUND = {"claude"}
 # Includes : for remote instance names (e.g., @luna:BOXE)
 MENTION_PATTERN = re.compile(r"(?<![a-zA-Z0-9._-])@([a-zA-Z0-9][\w:-]*)")
 
-# Binding marker for vanilla sessions: [HCOM:BIND:<base_name>]
-BIND_MARKER_RE = re.compile(r"\[HCOM:BIND:([a-z0-9_]+)\]")
+# Binding marker for vanilla sessions: [hcom:<base_name>] (also matches legacy [HCOM:BIND:<base_name>])
+BIND_MARKER_RE = re.compile(r"\[(?:hcom|HCOM:BIND):([a-z0-9_]+)\]")
 
 # Sender constants
 SENDER = "bigboss"  # CLI sender identity
@@ -222,7 +251,7 @@ FG_GREEN = "\033[32m"
 FG_CYAN = "\033[36m"
 FG_WHITE = "\033[37m"
 FG_BLACK = "\033[30m"
-FG_GRAY = "\033[38;5;245m"
+FG_GRAY = "\033[38;5;242m"
 FG_YELLOW = "\033[33m"
 FG_RED = "\033[31m"
 FG_BLUE = "\033[38;5;75m"
@@ -358,54 +387,182 @@ DEFAULT_CONFIG_DEFAULTS = [
 ]
 
 # ===== Terminal Presets =====
-# (binary_to_check, command_template, platforms)
-# binary_to_check: None means check app bundle existence instead
+# Each preset: {binary, open, close, platforms}
+# binary: executable to check for availability (None = check app bundle instead)
+# open: command template with {script} placeholder
+# close: command template with {pid} placeholder (None = no close API)
 # platforms: list of platform.system() values
-TERMINAL_PRESETS: dict[str, tuple[str | None, str, list[str]]] = {
+TERMINAL_PRESETS: dict[str, dict] = {
     # macOS
-    "Terminal.app": (None, "open -a Terminal {script}", ["Darwin"]),
-    "iTerm": (None, "open -a iTerm {script}", ["Darwin"]),
-    "Ghostty": (None, "open -na Ghostty.app --args -e bash {script}", ["Darwin"]),
+    "Terminal.app": {
+        "binary": None,
+        "open": "open -a Terminal {script}",
+        "close": None,
+        "platforms": ["Darwin"],
+    },
+    "iTerm": {
+        "binary": None,
+        "open": "open -a iTerm {script}",
+        "close": None,
+        "platforms": ["Darwin"],
+    },
+    "Ghostty": {
+        "binary": None,
+        "open": "open -na Ghostty.app --args -e bash {script}",
+        "close": None,
+        "platforms": ["Darwin"],
+    },
     # Cross-platform terminals (on macOS, falls back to .app bundle if CLI not in PATH)
-    "kitty": ("kitty", "kitty {script}", ["Darwin", "Linux"]),
-    "WezTerm": (
-        "wezterm",
-        "wezterm start -- bash {script}",
-        ["Darwin", "Linux", "Windows"],
-    ),
-    "Alacritty": (
-        "alacritty",
-        "alacritty -e bash {script}",
-        ["Darwin", "Linux", "Windows"],
-    ),
+    # "kitty" and "wezterm" are smart presets: auto-detect split/tab/window in launch_terminal().
+    # Use kitty-window/wezterm-window to force a new OS window.
+    "kitty": {
+        "binary": "kitty",
+        "open": "kitty --env HCOM_PROCESS_ID={process_id} {script}",
+        "close": "kitten @ close-window --match env:HCOM_PROCESS_ID={process_id}",
+        "platforms": ["Darwin", "Linux"],
+    },
+    "kitty-window": {
+        "binary": "kitty",
+        "app_name": "kitty",
+        "open": "kitty --env HCOM_PROCESS_ID={process_id} {script}",
+        "close": "kitten @ close-window --match env:HCOM_PROCESS_ID={process_id}",
+        "platforms": ["Darwin", "Linux"],
+    },
+    "wezterm": {
+        "binary": "wezterm",
+        "app_name": "WezTerm",
+        "open": "wezterm start -- bash {script}",
+        "close": "wezterm cli kill-pane --pane-id {pane_id}",
+        "pane_id_env": "WEZTERM_PANE",
+        "platforms": ["Darwin", "Linux", "Windows"],
+    },
+    "wezterm-window": {
+        "binary": "wezterm",
+        "app_name": "WezTerm",
+        "open": "wezterm start -- bash {script}",
+        "close": "wezterm cli kill-pane --pane-id {pane_id}",
+        "pane_id_env": "WEZTERM_PANE",
+        "platforms": ["Darwin", "Linux", "Windows"],
+    },
+    "alacritty": {
+        "binary": "alacritty",
+        "app_name": "Alacritty",
+        "open": "alacritty -e bash {script}",
+        "close": None,
+        "platforms": ["Darwin", "Linux", "Windows"],
+    },
     # Tab utilities
-    "ttab": ("ttab", "ttab {script}", ["Darwin"]),
-    "wttab": ("wttab", "wttab {script}", ["Windows"]),
+    "ttab": {
+        "binary": "ttab",
+        "open": "ttab {script}",
+        "close": None,
+        "platforms": ["Darwin"],
+    },
+    "wttab": {
+        "binary": "wttab",
+        "open": "wttab {script}",
+        "close": None,
+        "platforms": ["Windows"],
+    },
     # Linux terminals
-    "gnome-terminal": (
-        "gnome-terminal",
-        "gnome-terminal --window -- bash {script}",
-        ["Linux"],
-    ),
-    "konsole": ("konsole", "konsole -e bash {script}", ["Linux"]),
-    "xterm": ("xterm", "xterm -e bash {script}", ["Linux"]),
-    "tilix": ("tilix", "tilix -e bash {script}", ["Linux"]),
-    "terminator": ("terminator", "terminator -x bash {script}", ["Linux"]),
+    "gnome-terminal": {
+        "binary": "gnome-terminal",
+        "open": "gnome-terminal --window -- bash {script}",
+        "close": None,
+        "platforms": ["Linux"],
+    },
+    "konsole": {
+        "binary": "konsole",
+        "open": "konsole -e bash {script}",
+        "close": None,
+        "platforms": ["Linux"],
+    },
+    "xterm": {
+        "binary": "xterm",
+        "open": "xterm -e bash {script}",
+        "close": None,
+        "platforms": ["Linux"],
+    },
+    "tilix": {
+        "binary": "tilix",
+        "open": "tilix -e bash {script}",
+        "close": None,
+        "platforms": ["Linux"],
+    },
+    "terminator": {
+        "binary": "terminator",
+        "open": "terminator -x bash {script}",
+        "close": None,
+        "platforms": ["Linux"],
+    },
     # Windows
-    "Windows Terminal": ("wt", "wt bash {script}", ["Windows"]),
-    "mintty": ("mintty", "mintty bash {script}", ["Windows"]),
+    "Windows Terminal": {
+        "binary": "wt",
+        "open": "wt bash {script}",
+        "close": None,
+        "platforms": ["Windows"],
+    },
+    "mintty": {
+        "binary": "mintty",
+        "open": "mintty bash {script}",
+        "close": None,
+        "platforms": ["Windows"],
+    },
     # Within-terminal splits/tabs
-    "tmux-split": ("tmux", "tmux split-window -h {script}", ["Darwin", "Linux"]),
-    "wezterm-tab": (
-        "wezterm",
-        "wezterm cli spawn -- bash {script}",
-        ["Darwin", "Linux", "Windows"],
-    ),
-    "kitty-tab": (
-        "kitten",
-        "kitten @ launch --type=tab -- bash {script}",
-        ["Darwin", "Linux"],
-    ),
+    "tmux": {
+        "binary": "tmux",
+        "open": "tmux new-session -d bash {script}",
+        "close": "tmux kill-pane -t {pane_id}",
+        "pane_id_env": "TMUX_PANE",
+        "platforms": ["Darwin", "Linux"],
+    },
+    "tmux-split": {
+        "binary": "tmux",
+        "open": "tmux split-window -h {script}",
+        "close": "tmux kill-pane -t {pane_id}",
+        "pane_id_env": "TMUX_PANE",
+        "platforms": ["Darwin", "Linux"],
+    },
+    "wezterm-tab": {
+        "binary": "wezterm",
+        "app_name": "WezTerm",
+        "open": "wezterm cli spawn -- bash {script}",
+        "close": "wezterm cli kill-pane --pane-id {pane_id}",
+        "pane_id_env": "WEZTERM_PANE",
+        "platforms": ["Darwin", "Linux", "Windows"],
+    },
+    "wezterm-split": {
+        "binary": "wezterm",
+        "app_name": "WezTerm",
+        "open": "wezterm cli split-pane --top-level --right -- bash {script}",
+        "close": "wezterm cli kill-pane --pane-id {pane_id}",
+        "pane_id_env": "WEZTERM_PANE",
+        "platforms": ["Darwin", "Linux", "Windows"],
+    },
+    "kitty-tab": {
+        "binary": "kitten",
+        "app_name": "kitty",
+        "open": "kitten @ launch --type=tab --env HCOM_PROCESS_ID={process_id} -- bash {script}",
+        "close": "kitten @ close-tab --match env:HCOM_PROCESS_ID={process_id}",
+        "platforms": ["Darwin", "Linux"],
+    },
+    "kitty-split": {
+        "binary": "kitten",
+        "app_name": "kitty",
+        "open": "kitten @ launch --type=window --env HCOM_PROCESS_ID={process_id} -- bash {script}",
+        "close": "kitten @ close-window --match env:HCOM_PROCESS_ID={process_id}",
+        "platforms": ["Darwin", "Linux"],
+    },
+}
+
+# Map environment variables to terminal presets for auto-detection.
+# Used for same-terminal PTY launches (run_here=True) to enable close-on-kill.
+TERMINAL_ENV_MAP: dict[str, str] = {
+    "TMUX_PANE": "tmux-split",
+    "WEZTERM_PANE": "wezterm-split",
+    "KITTY_WINDOW_ID": "kitty-split",
+    "ZELLIJ_PANE_ID": "zellij",  # TODO: no external CLI to close pane by PID
+    "WAVETERM_BLOCKID": "waveterm",  # TODO: needs block_id storage, not PID-based
 }
 
 
@@ -581,9 +738,15 @@ def parse_env_file(config_path: Path) -> dict[str, str]:
                         continue
                     # Valid values: 'default', preset name, or custom command with {script}
                     # Internal/debug only: 'print' (show script), 'here' (force current terminal)
+                    from .core.settings import get_merged_presets as _get_merged
+                    _merged = _get_merged()
+                    # Resolve old casing (WezTerm→wezterm, Alacritty→alacritty)
+                    _lower_map = {k.lower(): k for k in _merged}
+                    if value not in _merged and value.lower() in _lower_map:
+                        value = _lower_map[value.lower()]
                     if (
                         value not in ("default", "print", "here")
-                        and value not in TERMINAL_PRESETS
+                        and value not in _merged
                         and "{script}" not in value
                     ):
                         print(
@@ -601,13 +764,6 @@ def parse_env_file(config_path: Path) -> dict[str, str]:
     return config
 
 
-# ===== Lazy imports for tool args (avoids ~25ms import overhead) =====
-# These are re-exported for backward compatibility (ui.py depends on them)
-# Using module __getattr__ for lazy loading
-
-_claude_args_cache: dict = {}
-_gemini_args_cache: dict = {}
-
 HCOM_SKIP_TOOL_ARGS_VALIDATION_ENV = "HCOM_SKIP_TOOL_ARGS_VALIDATION"
 
 
@@ -621,64 +777,6 @@ def skip_tool_args_validation() -> bool:
 
     value = os.environ.get(HCOM_SKIP_TOOL_ARGS_VALIDATION_ENV, "")
     return value not in ("", "0", "false", "False", "no", "NO")
-
-
-def __getattr__(name: str):
-    """Lazy load tool args modules on first access."""
-    # Claude args
-    if name in (
-        "ClaudeArgsSpec",
-        "resolve_claude_args",
-        "merge_claude_args",
-        "validate_conflicts",
-        "add_background_defaults",
-    ):
-        if not _claude_args_cache:
-            from .tools.claude.args import (
-                ClaudeArgsSpec,
-                resolve_claude_args,
-                merge_claude_args,
-                validate_conflicts,
-                add_background_defaults,
-            )
-
-            _claude_args_cache.update(
-                {
-                    "ClaudeArgsSpec": ClaudeArgsSpec,
-                    "resolve_claude_args": resolve_claude_args,
-                    "merge_claude_args": merge_claude_args,
-                    "validate_conflicts": validate_conflicts,
-                    "add_background_defaults": add_background_defaults,
-                }
-            )
-        return _claude_args_cache[name]
-
-    # Gemini args
-    if name in (
-        "GeminiArgsSpec",
-        "resolve_gemini_args",
-        "merge_gemini_args",
-        "validate_gemini_conflicts",
-    ):
-        if not _gemini_args_cache:
-            from .tools.gemini.args import (
-                GeminiArgsSpec,
-                resolve_gemini_args,
-                merge_gemini_args,
-                validate_conflicts as validate_gemini_conflicts,
-            )
-
-            _gemini_args_cache.update(
-                {
-                    "GeminiArgsSpec": GeminiArgsSpec,
-                    "resolve_gemini_args": resolve_gemini_args,
-                    "merge_gemini_args": merge_gemini_args,
-                    "validate_gemini_conflicts": validate_gemini_conflicts,
-                }
-            )
-        return _gemini_args_cache[name]
-
-    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
 __all__ = [

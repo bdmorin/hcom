@@ -9,6 +9,7 @@ import threading
 from pathlib import Path
 from typing import Callable, Any, TextIO
 
+from .thread_context import get_hcom_dir_str, get_cwd
 from ..shared import IS_WINDOWS, HcomError
 
 # Constants
@@ -34,19 +35,20 @@ def _get_hcom_dir_cache_key() -> tuple[str | None, str | None]:
     """Cache key for resolved hcom dir.
 
     If HCOM_DIR is relative, its resolved meaning depends on CWD, so include CWD.
+    Uses thread-safe accessors for daemon compatibility.
     """
-    hcom_dir = os.environ.get("HCOM_DIR")
+    hcom_dir = get_hcom_dir_str()
     if not hcom_dir:
         return (None, None)
     try:
         p = Path(hcom_dir).expanduser()
     except Exception:
         # Weird env var values shouldn't crash caching; just make it non-cacheable per-cwd.
-        return (hcom_dir, os.getcwd())
+        return (hcom_dir, str(get_cwd()))
 
     if p.is_absolute():
         return (hcom_dir, None)
-    return (hcom_dir, os.getcwd())
+    return (hcom_dir, str(get_cwd()))
 
 
 def _resolve_hcom_dir() -> Path:
@@ -58,9 +60,10 @@ def _resolve_hcom_dir() -> Path:
     3. Error: clear message with sandbox instructions
 
     No automatic fallback to ./.hcom. One env var for sandboxed environments.
+    Uses thread-safe accessors for daemon compatibility.
     """
     # 1. Explicit override (relative or absolute)
-    if hcom_dir := os.environ.get("HCOM_DIR"):
+    if hcom_dir := get_hcom_dir_str():
         # Expand ~ and resolve relative paths against CWD
         return Path(hcom_dir).expanduser().resolve()  # Returns absolute
 
@@ -124,8 +127,8 @@ def get_project_root() -> Path:
 
 
 def is_hcom_dir_override() -> bool:
-    """Check if HCOM_DIR env var is set."""
-    return bool(os.environ.get("HCOM_DIR"))
+    """Check if HCOM_DIR env var is set. Uses thread-safe accessor."""
+    return bool(get_hcom_dir_str())
 
 
 def clear_path_cache() -> None:
@@ -175,7 +178,7 @@ def launches_dir() -> Path:
 
 
 def atomic_write(filepath: str | Path, content: str) -> bool:
-    """Write content to file atomically to prevent corruption (now with NEW and IMPROVED (wow!) Windows retry logic (cool!!!)). Returns True on success, False on failure."""
+    """Write content to file atomically to prevent corruption. Includes Windows file-locking retry logic. Returns True on success, False on failure."""
     filepath = Path(filepath) if not isinstance(filepath, Path) else filepath
     filepath.parent.mkdir(parents=True, exist_ok=True)
 

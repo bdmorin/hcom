@@ -48,6 +48,7 @@ Architecture Notes
 - Row exists = participating (no enabled flags)
 - Heartbeat via last_stop field (listening instances update this)
 - Stale detection: no heartbeat for 35s (TCP) or 10s (no TCP) → inactive
+- Activity timeout bypass: fresh heartbeat (last_stop < 35s) prevents stale for active/blocked
 - Status events logged for cross-device sync and audit
 """
 
@@ -55,7 +56,6 @@ from __future__ import annotations
 import math
 import random
 from dataclasses import dataclass
-from pathlib import Path
 from typing import (
     Any,
     Callable,
@@ -65,8 +65,15 @@ from typing import (
     TypeVar,
 )
 import time
-import os
 
+from .thread_context import (
+    get_process_id,
+    get_is_launched,
+    get_launched_by,
+    get_launch_batch_id,
+    get_launch_event_id,
+    get_cwd,
+)
 from ..shared import format_age
 from .timeouts import (
     LAUNCH_PLACEHOLDER_TIMEOUT,
@@ -272,6 +279,23 @@ def load_instance_position(instance_name: str) -> InstanceData | dict[str, Any]:
     return data if data else {}
 
 
+def resolve_display_name(input_name: str) -> str | None:
+    """Resolve base name or tag-name (e.g. 'team-luna') to base name.
+
+    Returns base name if found, None if not found.
+    """
+    # Direct base name match
+    if load_instance_position(input_name):
+        return input_name
+    # Try tag-name split (first dash: tag-name)
+    if "-" in input_name:
+        tag, name = input_name.split("-", 1)
+        data = load_instance_position(name)
+        if data and data.get("tag") == tag:
+            return name
+    return None
+
+
 def update_instance_position(instance_name: str, update_fields: InstanceData | dict[str, Any]) -> None:
     """Update instance position atomically (DB wrapper).
 
@@ -371,7 +395,7 @@ def is_launching_placeholder(pos_data: InstanceData | dict[str, Any]) -> bool:
     return (
         not pos_data.get("session_id")
         and pos_data.get("status_context") == "new"
-        and pos_data.get("status", "inactive") == "inactive"
+        and pos_data.get("status", "inactive") in ("inactive", "pending")
     )
 
 
@@ -397,6 +421,46 @@ def cleanup_stale_placeholders() -> int:
     return deleted
 
 
+def _cleanup_stale_launch_scripts(max_age_seconds: int = 86400) -> None:
+    """Delete launch scripts older than max_age_seconds (default 24h)."""
+    from .paths import hcom_path, LAUNCH_DIR
+
+    launch_dir = hcom_path(LAUNCH_DIR)
+    if not launch_dir.exists():
+        return
+
+    now = time.time()
+    for f in launch_dir.iterdir():
+        try:
+            if now - f.stat().st_mtime > max_age_seconds:
+                f.unlink()
+        except Exception as e:
+            from .log import log_warn
+
+            log_warn("cleanup", "launch_script_cleanup_fail", file=str(f), error=str(e))
+
+
+def _cleanup_orphaned_db_rows() -> None:
+    """Delete notify_endpoints and process_bindings for instances no longer in DB."""
+    try:
+        from .db import get_db
+
+        conn = get_db()
+        conn.execute("""
+            DELETE FROM notify_endpoints
+            WHERE instance NOT IN (SELECT name FROM instances)
+        """)
+        conn.execute("""
+            DELETE FROM process_bindings
+            WHERE instance_name NOT IN (SELECT name FROM instances)
+        """)
+        conn.commit()
+    except Exception as e:
+        from .log import log_warn
+
+        log_warn("cleanup", "orphaned_db_cleanup_fail", error=str(e))
+
+
 def cleanup_stale_instances(
     max_stale_seconds: int = CLEANUP_STALE_THRESHOLD,
     max_inactive_seconds: int = CLEANUP_INACTIVE_THRESHOLD,
@@ -408,6 +472,8 @@ def cleanup_stale_instances(
     - stale (heartbeat/activity timeout) → 1hr default
     - other inactive (adhoc, unknown, empty) → 12hr default
 
+    Also cleans up stale launch scripts (>24h old) and orphaned DB rows.
+
     This is lazy cleanup - runs during list/TUI refresh.
 
     Args:
@@ -418,6 +484,12 @@ def cleanup_stale_instances(
     """
     from .db import iter_instances
     from .tool_utils import stop_instance
+
+    # Cleanup stale launch scripts (>24h old)
+    _cleanup_stale_launch_scripts()
+
+    # Cleanup orphaned DB rows (notify_endpoints, process_bindings for deleted instances)
+    _cleanup_orphaned_db_rows()
 
     deleted = 0
 
@@ -489,17 +561,17 @@ def get_instance_status(pos_data: InstanceData | dict[str, Any]) -> InstanceStat
 
     # Launching: instance created but session not yet bound / status not yet updated
     # This is the window between launcher creating instance and first hook firing
-    if status_context == "new" and status == "inactive":
+    if status_context == "new" and status in ("inactive", "pending"):
         created_at = pos_data.get("created_at", 0)
         age = time.time() - created_at if created_at else 0
         if age < LAUNCH_PLACEHOLDER_TIMEOUT:
-            return InstanceStatus("launching", "", "launching...", 0, "new")
+            return InstanceStatus("launching", format_age(int(age)) if age else "", "launching", int(age), "new")
         else:
             # Timeout without hooks firing = launch probably failed
             return InstanceStatus(
                 "inactive",
                 format_age(int(age)),
-                "launch probably failed",
+                "launch probably failed — check logs or hcom list -v",
                 int(age),
                 "launch_failed",
             )
@@ -575,10 +647,17 @@ def get_instance_status(pos_data: InstanceData | dict[str, Any]) -> InstanceStat
                 status_age = now - int(created_at)
 
         if status_age > STATUS_ACTIVITY_TIMEOUT:
-            prev_status = status  # Capture before changing
-            status = "inactive"
-            status_context = f"stale:{prev_status}"
-            age = status_age
+            # PTY instances have a Rust delivery thread that updates last_stop every ~30s
+            # regardless of Python-level status. If heartbeat is fresh, process is alive —
+            # don't mark stale just because no hook fired (e.g. long tool call, blocked prompt).
+            last_stop = pos_data.get("last_stop", 0)
+            if last_stop and (now - last_stop) < HEARTBEAT_THRESHOLD_TCP:
+                pass  # Heartbeat fresh — process alive, skip stale
+            else:
+                prev_status = status  # Capture before changing
+                status = "inactive"
+                status_context = f"stale:{prev_status}"
+                age = status_age
 
     # Build description from status and context
     description = get_status_description(status, status_context)
@@ -738,13 +817,23 @@ def set_status(
     if status == "listening":
         updates["last_stop"] = int(time.time())
 
+    # Check if status actually changed (for notify optimization)
+    old_status = current_data.get("status") if current_data else None
+    status_changed = old_status != status
+
     update_instance_position(instance_name, updates)
+
+    # Wake delivery loop if status changed (for terminal title update)
+    if status_changed:
+        from .runtime import notify_instance
+
+        notify_instance(instance_name)
 
     if is_new:
         try:
-            # Use explicit params if provided, else fall back to env vars
-            launcher = launcher or os.environ.get("HCOM_LAUNCHED_BY", "unknown")
-            batch_id = batch_id or os.environ.get("HCOM_LAUNCH_BATCH_ID")
+            # Use explicit params if provided, else fall back to env vars (thread-safe)
+            launcher = launcher or get_launched_by() or "unknown"
+            batch_id = batch_id or get_launch_batch_id()
 
             event_data = {
                 "action": "ready",
@@ -842,14 +931,16 @@ def set_status(
         if msg_ts:
             data["msg_ts"] = msg_ts
         log_event(event_type="status", instance=instance_name, data=data)
-        # Push immediately on exit so remote devices see final state
-        if status == "inactive":
-            from ..relay import notify_relay_tui, push
+        # Push to relay so remote devices see current state
+        if status in ("listening", "inactive"):
+            from ..relay import notify_relay, push
 
-            if not notify_relay_tui():
-                push(force=True)
-    except Exception:
-        pass  # Don't break hooks if event logging fails  # Don't break hooks if event logging fails
+            if not notify_relay():
+                push(force=status == "inactive")
+    except Exception as e:
+        from .log import log_error
+
+        log_error("instances", "set_status.event_log_fail", e)  # Don't break hooks
 
 
 def set_gate_status(instance_name: str, context: str, detail: str = ""):
@@ -1152,19 +1243,19 @@ def _build_name_pool(limit: int = 5000) -> list[_ScoredName]:
 _NAME_POOL: list[_ScoredName] = _build_name_pool()
 
 
-def _is_too_similar(name: str, existing: set[str]) -> bool:
-    """Reject names that are too similar to active instances (e.g., zavi vs zivi)."""
-    for other in existing:
+def _is_too_similar(name: str, alive_names: set[str]) -> bool:
+    """Check if name is too similar to currently alive instances (e.g., zavi vs zivi)."""
+    for other in alive_names:
         if len(other) != len(name):
             continue
-        if sum(1 for a, b in zip(name, other) if a != b) <= 1:
+        if sum(1 for a, b in zip(name, other) if a != b) <= 2:
             return True
     return False
 
 
 def _allocate_name(
     is_taken: Callable[[str], bool],
-    existing_names: set[str],
+    alive_names: set[str],
     attempts: int = 200,
     top_window: int = 1200,
     temperature: float = 900.0,
@@ -1174,8 +1265,13 @@ def _allocate_name(
     Uses softmax-like sampling from top-scored names to avoid
     always consuming gold names first while maintaining quality.
 
+    Similarity check (hamming ≤ 1) is applied against alive_names only,
+    and is a soft preference — the greedy fallback ignores it to avoid
+    pool exhaustion.
+
     Args:
-        is_taken: Callback to check if name is already used
+        is_taken: Callback to check if name is already used (alive + stopped)
+        alive_names: Currently alive instance names (for similarity check only)
         attempts: Max sampling attempts before greedy fallback
         top_window: Only sample from top N ranked names
         temperature: Higher = flatter distribution, lower = more greedy
@@ -1189,14 +1285,15 @@ def _allocate_name(
     # Softmax-like weights (numerically stable)
     weights = [math.exp((s - max_score) / temperature) for s in scores]
 
+    # Prefer dissimilar names, but similarity is soft (greedy fallback ignores it)
     for _ in range(attempts):
         choice = rng.choices(window, weights=weights, k=1)[0].name
-        if not is_taken(choice) and not _is_too_similar(choice, existing_names):
+        if not is_taken(choice) and not _is_too_similar(choice, alive_names):
             return choice
 
-    # Fallback: greedy scan (guarantees return if any available)
+    # Fallback: greedy scan, skip similarity check to guarantee allocation
     for item in _NAME_POOL:
-        if not is_taken(item.name) and not _is_too_similar(item.name, existing_names):
+        if not is_taken(item.name):
             return item.name
 
     raise RuntimeError("No available names left in pool")
@@ -1264,32 +1361,55 @@ def generate_unique_name(max_retries: int = 200) -> str:
     Collision handling: biased random sampling with greedy fallback.
     Checks both active instances AND stopped instances from events table
     to avoid name reuse within the same session.
-    DB UNIQUE constraint provides safety net for TOCTOU races.
+
+    Thread/process safety: Uses file lock to prevent parallel launches
+    from generating the same name. Lock is held only during name selection.
     """
+    import fcntl
     from .db import get_instance, iter_instances, get_db
+    from .paths import hcom_path
 
-    existing_names = {row.get("name", "") for row in iter_instances()}
+    # File lock to serialize name generation across parallel launches
+    lock_path = hcom_path(".tmp") / "name_gen.lock"
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
 
-    # Also check stopped instances from events to avoid name reuse
-    try:
-        db = get_db()
-        stopped_rows = db.execute(
-            """
-            SELECT DISTINCT instance FROM events
-            WHERE type = 'life'
-              AND json_extract(data, '$.action') = 'stopped'
-            """
-        ).fetchall()
-        stopped_names = {row["instance"] for row in stopped_rows}
-        existing_names.update(stopped_names)
-    except Exception:
-        pass  # Best-effort - continue with active names only
+    with open(lock_path, "w") as lock_file:
+        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+        try:
+            alive_names = {row.get("name", "") for row in iter_instances()}
+            taken_names = set(alive_names)
 
-    return _allocate_name(
-        is_taken=lambda n: bool(get_instance(n)) or n in existing_names,
-        existing_names=existing_names,
-        attempts=max_retries,
-    )
+            # Also check stopped instances from events to avoid name reuse
+            db = get_db()
+            stopped_rows = db.execute(
+                """
+                SELECT DISTINCT instance FROM events
+                WHERE type = 'life'
+                  AND json_extract(data, '$.action') = 'stopped'
+                """
+            ).fetchall()
+            taken_names.update(row["instance"] for row in stopped_rows)
+
+            name = _allocate_name(
+                is_taken=lambda n: bool(get_instance(n)) or n in taken_names,
+                alive_names=alive_names,
+                attempts=max_retries,
+            )
+
+            # Reserve name immediately with placeholder row (prevents TOCTOU race)
+            # initialize_instance_in_position_file will update this row with full data
+            import time
+            from .db import save_instance
+            save_instance(name, {
+                "name": name,
+                "status": "pending",
+                "status_context": "new",
+                "created_at": int(time.time()),
+            })
+
+            return name
+        finally:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
 
 
 def resolve_instance_name(session_id: str) -> tuple[str | None, dict | None]:
@@ -1329,7 +1449,7 @@ def resolve_instance_from_binding(
     Shared resolution logic for Claude/Codex/Gemini hooks. Tries in order:
     1. HCOM_PROCESS_ID env var → process_bindings → instance
     2. session_id parameter → session_bindings → instance
-    3. transcript_path → [HCOM:BIND:X] marker → create binding → instance
+    3. transcript_path → [hcom:X] marker → create binding → instance
 
     Args:
         session_id: Session ID from hook payload (thread-id for Codex, session_id for Gemini/Claude)
@@ -1341,9 +1461,9 @@ def resolve_instance_from_binding(
     """
     from .db import get_instance, get_process_binding, get_session_binding
 
-    # Use env var if process_id not provided
+    # Use thread-safe accessor if process_id not provided
     if process_id is None:
-        process_id = os.environ.get("HCOM_PROCESS_ID")
+        process_id = get_process_id()
 
     # Path 1: Process binding (hcom-launched instances)
     if process_id:
@@ -1475,7 +1595,7 @@ def bind_session_to_process(
                 if placeholder_data.get("launch_args"):
                     resume_updates["launch_args"] = placeholder_data["launch_args"]
                 # Reset status_context for ready event (HCOM-launched resumes)
-                if os.environ.get("HCOM_LAUNCHED") == "1":
+                if get_is_launched():
                     resume_updates["status_context"] = "new"
 
                 # Delete true placeholder (it was just a temporary identity)
@@ -1574,7 +1694,7 @@ def initialize_instance_in_position_file(
         existing = get_instance(instance_name)
         if existing:
             # Instance exists (possibly placeholder) - update with provided metadata
-            updates: dict[str, Any] = {}
+            updates: dict[str, Any] = {"directory": str(get_cwd())}
             if session_id is not None:
                 updates["session_id"] = session_id
             if parent_session_id is not None:
@@ -1599,7 +1719,7 @@ def initialize_instance_in_position_file(
             if SKIP_HISTORY and existing.get("last_event_id", 0) == 0 and is_true_placeholder:
                 current_max = get_last_event_id()
                 # Validate launch event ID isn't stale (higher than max = DB was reset)
-                launch_event_id_str = os.environ.get("HCOM_LAUNCH_EVENT_ID")
+                launch_event_id_str = get_launch_event_id()
                 if launch_event_id_str:
                     launch_event_id = int(launch_event_id_str)
                     if launch_event_id <= current_max:
@@ -1610,13 +1730,25 @@ def initialize_instance_in_position_file(
                     updates["last_event_id"] = current_max
 
             # Reset status_context for HCOM-launched resumed sessions (triggers ready event)
-            if os.environ.get("HCOM_LAUNCHED") == "1":
+            if get_is_launched():
                 updates["status_context"] = "new"
 
             if updates:
                 from .db import update_instance
 
                 update_instance(instance_name, updates)
+
+            # Auto-subscribe for existing instances (e.g., placeholder from launcher).
+            # Launched agents always hit this branch because generate_unique_name()
+            # creates a placeholder row first, so the new-instance branch never runs.
+            effective_tool = tool or existing.get("tool") or "claude"
+            try:
+                from .ops import auto_subscribe_defaults
+
+                auto_subscribe_defaults(instance_name, effective_tool)
+            except Exception:
+                pass
+
             return True
 
         # Determine starting event ID: skip history or read from beginning
@@ -1625,7 +1757,7 @@ def initialize_instance_in_position_file(
             current_max = get_last_event_id()
             # Use launch event ID if valid (for hcom-launched instances)
             # Validate it's not stale (higher than current max = DB was reset)
-            launch_event_id_str = os.environ.get("HCOM_LAUNCH_EVENT_ID")
+            launch_event_id_str = get_launch_event_id()
             if launch_event_id_str:
                 launch_event_id = int(launch_event_id_str)
                 if launch_event_id <= current_max:
@@ -1639,7 +1771,7 @@ def initialize_instance_in_position_file(
         data = {
             "name": instance_name,
             "last_event_id": initial_event_id,
-            "directory": str(Path.cwd()),
+            "directory": str(get_cwd()),
             "last_stop": 0,
             "created_at": time.time(),
             "session_id": session_id if session_id else None,  # NULL not empty string
@@ -1657,7 +1789,7 @@ def initialize_instance_in_position_file(
         # Set tag: use provided tag (for reclaimed instances), or config tag, or None
         if tag:
             data["tag"] = tag
-        elif session_id or parent_session_id or os.environ.get("HCOM_LAUNCHED") == "1":
+        elif session_id or parent_session_id or get_is_launched():
             try:
                 from .config import get_config
 
@@ -1693,9 +1825,9 @@ def initialize_instance_in_position_file(
                 try:
                     from .db import log_event
 
-                    # Determine who launched this instance
-                    launcher = os.environ.get("HCOM_LAUNCHED_BY", "unknown")
-                    is_hcom_launched = os.environ.get("HCOM_LAUNCHED") == "1"
+                    # Determine who launched this instance (thread-safe)
+                    launcher = get_launched_by() or "unknown"
+                    is_hcom_launched = get_is_launched()
 
                     log_event(
                         "life",
@@ -1842,6 +1974,7 @@ __all__ = [
     # Identity management
     "get_full_name",
     "generate_unique_name",
+    "resolve_display_name",
     "resolve_instance_name",
     "resolve_process_binding",
     "resolve_instance_from_binding",

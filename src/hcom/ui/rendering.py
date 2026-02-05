@@ -365,7 +365,7 @@ def get_message_pulse_colors(seconds_since: float) -> tuple[str, str]:
     eased = ease_out_quad(progress)
 
     # RGB interpolation for smooth gradients
-    # Background: white (255) → charcoal (48)
+    # Background: white (255) → charcoal (48, matches BG_CHARCOAL 236)
     bg_val = int(255 - (255 - 48) * eased)
     # Foreground: dark (18) → light gray (188)
     fg_val = int(18 + (188 - 18) * eased)
@@ -388,7 +388,7 @@ def get_device_sync_color(seconds_since: float) -> str:
         ANSI RGB foreground color code.
     """
     if seconds_since >= 30:
-        return "\033[38;5;245m"  # Gray baseline
+        return "\033[38;5;242m"  # Gray baseline (matches FG_GRAY)
 
     # Normalize to 0-1 range over 30 seconds
     t = min(seconds_since / 30.0, 1.0)

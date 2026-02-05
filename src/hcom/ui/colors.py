@@ -39,7 +39,7 @@ FG_YELLOW = "\033[33m"
 FG_RED = "\033[31m"
 
 # ===== 256-Color Foreground =====
-FG_GRAY = "\033[38;5;245m"  # Mid-gray (consistent across terminals)
+FG_GRAY = "\033[38;5;242m"  # Structure gray (dimmer, lets content lead)
 FG_BLUE = "\033[38;5;75m"  # Sky blue
 
 # TUI-specific foreground colors
@@ -64,7 +64,7 @@ BG_STALE = "\033[48;5;137m"  # Tan/brownish-grey for stale instances
 
 # TUI-specific background colors
 BG_ORANGE = "\033[48;5;208m"  # Launch button, active selection
-BG_CHARCOAL = "\033[48;5;236m"  # Selected row background
+BG_CHARCOAL = "\033[48;5;236m"  # Cursor row background
 BG_GOLD = "\033[48;5;220m"  # Warning/blocking state
 
 # ===== Terminal Control Sequences =====

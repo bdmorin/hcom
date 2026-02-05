@@ -137,6 +137,41 @@ def op_launch(
     }
 
 
+def cleanup_instance_subscriptions(instance_name: str) -> int:
+    """Remove all event subscriptions owned by an instance.
+
+    Called during instance stop and before re-subscribing on creation.
+    Subscriptions are stored as kv entries with key 'events_sub:sub-{hash}'
+    and caller stored in the JSON value.
+
+    Args:
+        instance_name: Instance whose subscriptions to remove
+
+    Returns:
+        Number of subscriptions deleted
+    """
+    import json
+    from .db import get_db, kv_set
+
+    conn = get_db()
+    deleted = 0
+
+    try:
+        rows = conn.execute("SELECT key, value FROM kv WHERE key LIKE 'events_sub:%'").fetchall()
+        for row in rows:
+            try:
+                sub = json.loads(row["value"])
+                if sub.get("caller") == instance_name:
+                    kv_set(row["key"], None)  # Delete
+                    deleted += 1
+            except (json.JSONDecodeError, TypeError):
+                pass
+    except Exception:
+        pass
+
+    return deleted
+
+
 def auto_subscribe_defaults(instance_name: str, tool: str) -> None:
     """Auto-subscribe instance to default event subscriptions from config.
 
@@ -149,14 +184,10 @@ def auto_subscribe_defaults(instance_name: str, tool: str) -> None:
 
     try:
         from .config import get_config
-        from .db import get_db
         from ..commands.events import _events_sub
 
         # Clean up stale subscriptions for this instance name (from reused names)
-        # Escape _ and % in instance name (they're LIKE wildcards)
-        escaped_name = instance_name.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
-        conn = get_db()
-        conn.execute("DELETE FROM kv WHERE key LIKE ? ESCAPE '\\'", (f"events_sub:%\\_{escaped_name}",))
+        cleanup_instance_subscriptions(instance_name)
 
         config = get_config()
         if not config.auto_subscribe:
@@ -185,4 +216,11 @@ def auto_subscribe_defaults(instance_name: str, tool: str) -> None:
         pass
 
 
-__all__ = ["op_send", "op_stop", "op_start", "op_launch", "auto_subscribe_defaults"]
+__all__ = [
+    "op_send",
+    "op_stop",
+    "op_start",
+    "op_launch",
+    "auto_subscribe_defaults",
+    "cleanup_instance_subscriptions",
+]

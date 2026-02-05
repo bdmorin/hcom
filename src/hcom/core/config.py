@@ -6,6 +6,7 @@ import os
 import sys
 import re
 import shlex
+import threading
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -143,7 +144,7 @@ class HcomConfig:
             )
 
         # Validate terminal
-        from ..shared import TERMINAL_PRESETS
+        from .settings import get_merged_presets
 
         if not isinstance(self.terminal, str):
             set_error(
@@ -155,7 +156,12 @@ class HcomConfig:
         else:
             # 'print' mode shows script content without executing (for debugging)
             # 'here' mode forces running in current terminal (internal/debug)
-            if self.terminal not in ("default", "print", "here") and self.terminal not in TERMINAL_PRESETS:
+            merged_presets = get_merged_presets()
+            # Resolve old casing (WezTerm→wezterm, Alacritty→alacritty)
+            lower_map = {k.lower(): k for k in merged_presets}
+            if self.terminal not in merged_presets and self.terminal.lower() in lower_map:
+                self.terminal = lower_map[self.terminal.lower()]
+            if self.terminal not in ("default", "print", "here") and self.terminal not in merged_presets:
                 if "{script}" not in self.terminal:
                     set_error(
                         "terminal",
@@ -291,10 +297,9 @@ class HcomConfig:
             try:
                 data["timeout"] = int(timeout_str)
             except (ValueError, TypeError):
-                print(
-                    f"Warning: HCOM_TIMEOUT='{timeout_str}' is not a valid integer, using default",
-                    file=sys.stderr,
-                )
+                from .log import log_warn
+                log_warn("config", "invalid_timeout",
+                        f"HCOM_TIMEOUT='{timeout_str}' is not a valid integer, using default")
 
         # Load subagent_timeout (requires int conversion)
         subagent_timeout_str = get_var("HCOM_SUBAGENT_TIMEOUT")
@@ -302,10 +307,9 @@ class HcomConfig:
             try:
                 data["subagent_timeout"] = int(subagent_timeout_str)
             except (ValueError, TypeError):
-                print(
-                    f"Warning: HCOM_SUBAGENT_TIMEOUT='{subagent_timeout_str}' is not a valid integer, using default",
-                    file=sys.stderr,
-                )
+                from .log import log_warn
+                log_warn("config", "invalid_subagent_timeout",
+                        f"HCOM_SUBAGENT_TIMEOUT='{subagent_timeout_str}' is not a valid integer, using default")
 
         # Load string values
         terminal = get_var("HCOM_TERMINAL")
@@ -519,7 +523,6 @@ def dict_to_hcom_config(data: dict[str, str]) -> HcomConfig:
         kwargs["auto_subscribe"] = data["HCOM_AUTO_SUBSCRIBE"]
     if "HCOM_NAME_EXPORT" in data:
         kwargs["name_export"] = data["HCOM_NAME_EXPORT"]
-
     if errors:
         raise HcomConfigError(errors)
 
@@ -622,12 +625,23 @@ def _write_default_config(config_path: Path) -> None:
 # ==================== Global Config Cache ====================
 
 _config_cache: HcomConfig | None = None
+_config_cache_lock = threading.Lock()
 
 
 def get_config() -> HcomConfig:
-    """Get cached config, loading if needed"""
+    """Get cached config, loading if needed (thread-safe with double-checked locking)"""
     global _config_cache
-    if _config_cache is None:
+
+    # First check without lock (fast path for already-loaded config)
+    if _config_cache is not None:
+        return _config_cache
+
+    # Acquire lock for initialization
+    with _config_cache_lock:
+        # Double-check inside lock (another thread may have initialized while we waited)
+        if _config_cache is not None:
+            return _config_cache
+
         # Detect if running as hook handler (called via 'hcom pre', 'hcom post', etc.)
         is_hook_context = len(sys.argv) >= 2 and sys.argv[1] in (
             "pre",
@@ -648,11 +662,12 @@ def get_config() -> HcomConfig:
             else:
                 raise
 
-    return _config_cache
+        return _config_cache
 
 
 def reload_config() -> HcomConfig:
-    """Clear cached config so next access reflects latest file/env values."""
+    """Clear cached config so next access reflects latest file/env values (thread-safe)."""
     global _config_cache
-    _config_cache = None
+    with _config_cache_lock:
+        _config_cache = None
     return get_config()

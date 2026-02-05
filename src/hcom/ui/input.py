@@ -109,7 +109,7 @@ class KeyboardInput:
     - "BACKSPACE": Backspace/Delete
     - "SPACE": Spacebar
     - "TAB": Tab key
-    - "CTRL_C", "CTRL_D", "CTRL_K", "CTRL_G", "CTRL_R": Control combinations
+    - "CTRL_C", "CTRL_D", "CTRL_K", "CTRL_G", "CTRL_R", "CTRL_F", "CTRL_T": Control combinations
     - Single character: Printable characters
     - "\\n": Pasted newline (part of multi-character paste)
 
@@ -256,6 +256,26 @@ class KeyboardInput:
                             keys = {"A": "UP", "B": "DOWN", "C": "RIGHT", "D": "LEFT"}
                             if next2 in keys:
                                 return keys[next2]
+                            # Home/End alternate forms: ESC [ H / ESC [ F
+                            if next2 == "H":
+                                return "HOME"
+                            if next2 == "F":
+                                return "END"
+                            # Extended sequences: ESC [ <number> ~
+                            if next2.isdigit():
+                                seq = next2
+                                try:
+                                    while len(seq) < 6:
+                                        next_ch = os.read(self.fd, 1).decode("utf-8", errors="ignore")
+                                        if next_ch == "~":
+                                            break
+                                        seq += next_ch
+                                    else:
+                                        return None  # Sequence too long
+                                except (OSError, UnicodeDecodeError):
+                                    return None
+                                ext_keys = {"1": "HOME", "3": "DELETE", "4": "END", "5": "PGUP", "6": "PGDN"}
+                                return ext_keys.get(seq)
                     except (OSError, UnicodeDecodeError):
                         pass
                 return "ESC"
@@ -286,6 +306,14 @@ class KeyboardInput:
                 return "CTRL_G"
             if ch == "\x12":
                 return "CTRL_R"
+            if ch == "\x01":
+                return "CTRL_A"
+            if ch == "\x05":
+                return "CTRL_E"
+            if ch == "\x06":
+                return "CTRL_F"
+            if ch == "\x14":
+                return "CTRL_T"
             return ch
 
 
@@ -327,6 +355,21 @@ def text_input_backspace(buffer: str, cursor: int) -> tuple[str, int]:
         new_buffer = buffer[: cursor - 1] + buffer[cursor:]
         new_cursor = cursor - 1
         return new_buffer, new_cursor
+    return buffer, cursor
+
+
+def text_input_delete(buffer: str, cursor: int) -> tuple[str, int]:
+    """Delete character at cursor position (forward delete).
+
+    Args:
+        buffer: Current text buffer.
+        cursor: Current cursor position.
+
+    Returns:
+        (new_buffer, new_cursor) tuple. No change if cursor is at end.
+    """
+    if cursor < len(buffer):
+        return buffer[:cursor] + buffer[cursor + 1 :], cursor
     return buffer, cursor
 
 

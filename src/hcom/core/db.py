@@ -45,12 +45,13 @@ def get_db() -> sqlite3.Connection:
                     # DB file changed - close stale connection
                     try:
                         _thread_local.conn.close()
-                    except Exception:
-                        pass
+                    except Exception as _e:
+                        from .log import log_warn
+                        log_warn("db", "close_stale.error", error=str(_e))
                     _thread_local.conn = None
                     _thread_local.db_inode = None
             except Exception:
-                pass
+                pass  # stat() can fail transiently, not worth logging
 
     if not hasattr(_thread_local, "conn") or _thread_local.conn is None:
         _thread_local.conn = sqlite3.connect(str(db_path))
@@ -70,8 +71,9 @@ def get_db() -> sqlite3.Connection:
             result = _thread_local.conn.execute("PRAGMA journal_mode=WAL").fetchone()
             if result and result[0].upper() == "WAL":
                 _thread_local.conn.execute("PRAGMA wal_autocheckpoint=1000")
-        except Exception:
-            pass  # WAL not supported, use default DELETE mode
+        except Exception as _e:
+            from .log import log_warn
+            log_warn("db", "wal.unsupported", error=str(_e))
         _thread_local.conn.execute("PRAGMA busy_timeout=5000")
 
         # Check schema version - archives and reconnects if outdated
@@ -141,8 +143,9 @@ def archive_db(reason: str = "schema") -> str | None:
             temp_conn = sqlite3.connect(str(db_file))
             temp_conn.execute("PRAGMA wal_checkpoint(PASSIVE)")
             temp_conn.close()
-        except Exception:
-            pass  # Checkpoint optional
+        except Exception as _e:
+            from .log import log_warn
+            log_warn("db", "archive.checkpoint_failed", error=str(_e))
 
         # Copy all DB files to archive (copy before delete - archive safe even if delete fails)
         shutil.copy2(db_file, session_archive / DB_FILE)
@@ -237,24 +240,12 @@ def check_schema_version(conn: sqlite3.Connection) -> bool:
         return True
 
     # Check version matches
-    if version > SCHEMA_VERSION:
-        # DB is newer than this code - we're outdated, go quiet
-        # (Don't archive - that would destroy data from newer hcom)
-        import sys
-
-        if not getattr(_thread_local, "_warned_outdated", False):
-            print(
-                f"hcom: Session outdated (v{SCHEMA_VERSION}, current v{version}). Restart this session to use hcom.",
-                file=sys.stderr,
-            )
-            _thread_local._warned_outdated = True
-        raise RuntimeError("hcom: outdated")
-    elif version < SCHEMA_VERSION:
-        # DB is older - archive and upgrade
+    if version != SCHEMA_VERSION:
+        # Version mismatch - archive and recreate
         import sys
 
         print(
-            f"hcom: Upgrading DB schema from v{version} to v{SCHEMA_VERSION}, archiving old data...",
+            f"hcom: DB version mismatch (DB v{version}, code v{SCHEMA_VERSION}), archiving...",
             file=sys.stderr,
         )
         conn.close()
@@ -311,7 +302,7 @@ def check_schema_version(conn: sqlite3.Connection) -> bool:
 # ==================== Schema Management ====================
 
 
-def init_db(conn: Optional[sqlite3.Connection] = None) -> None:
+def init_db(conn: Optional[sqlite3.Connection] = None, _attempt: int = 0) -> None:
     """Create database schema if not exists. Idempotent.
 
     Schema versioning: check_schema_version() handles incompatible changes by archiving.
@@ -325,8 +316,14 @@ def init_db(conn: Optional[sqlite3.Connection] = None) -> None:
     if conn is None:
         conn = get_db()
 
-    # Create events table
-    conn.execute("""
+    def _init_db_inner(connection: sqlite3.Connection) -> None:
+        """Create all tables, indexes, and views for hcom database.
+
+        Tables: events, notify_endpoints, process_bindings, session_bindings,
+        instances, kv. Also creates events_v view for flattened JSON field access.
+        """
+        # Create events table
+        connection.execute("""
         CREATE TABLE IF NOT EXISTS events (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             timestamp TEXT NOT NULL,
@@ -336,9 +333,9 @@ def init_db(conn: Optional[sqlite3.Connection] = None) -> None:
         )
     """)
 
-    # Notify endpoints: multiple concurrent waiters per instance (pty wrappers, `hcom listen`, hooks).
-    # This avoids clobbering a single instances.notify_port when multiple listeners coexist.
-    conn.execute("""
+        # Notify endpoints: multiple concurrent waiters per instance (pty wrappers, `hcom listen`, hooks).
+        # This avoids clobbering a single instances.notify_port when multiple listeners coexist.
+        connection.execute("""
         CREATE TABLE IF NOT EXISTS notify_endpoints (
             instance TEXT NOT NULL,
             kind TEXT NOT NULL,
@@ -347,11 +344,11 @@ def init_db(conn: Optional[sqlite3.Connection] = None) -> None:
             PRIMARY KEY (instance, kind)
         )
     """)
-    conn.execute("CREATE INDEX IF NOT EXISTS idx_notify_endpoints_instance ON notify_endpoints(instance)")
-    conn.execute("CREATE INDEX IF NOT EXISTS idx_notify_endpoints_port ON notify_endpoints(port)")
+        connection.execute("CREATE INDEX IF NOT EXISTS idx_notify_endpoints_instance ON notify_endpoints(instance)")
+        connection.execute("CREATE INDEX IF NOT EXISTS idx_notify_endpoints_port ON notify_endpoints(port)")
 
-    # Process bindings: map process_id -> canonical instance/session
-    conn.execute("""
+        # Process bindings: map process_id -> canonical instance/session
+        connection.execute("""
         CREATE TABLE IF NOT EXISTS process_bindings (
             process_id TEXT PRIMARY KEY,
             session_id TEXT,
@@ -359,12 +356,12 @@ def init_db(conn: Optional[sqlite3.Connection] = None) -> None:
             updated_at REAL NOT NULL
         )
     """)
-    conn.execute("CREATE INDEX IF NOT EXISTS idx_process_bindings_instance ON process_bindings(instance_name)")
-    conn.execute("CREATE INDEX IF NOT EXISTS idx_process_bindings_session ON process_bindings(session_id)")
+        connection.execute("CREATE INDEX IF NOT EXISTS idx_process_bindings_instance ON process_bindings(instance_name)")
+        connection.execute("CREATE INDEX IF NOT EXISTS idx_process_bindings_session ON process_bindings(session_id)")
 
-    # Session bindings: map session_id -> canonical instance for hook gating
-    # Binding existence = hook participation. No binding = ad-hoc only.
-    conn.execute("""
+        # Session bindings: map session_id -> canonical instance for hook gating
+        # Binding existence = hook participation. No binding = ad-hoc only.
+        connection.execute("""
         CREATE TABLE IF NOT EXISTS session_bindings (
             session_id TEXT PRIMARY KEY,
             instance_name TEXT NOT NULL,
@@ -372,12 +369,12 @@ def init_db(conn: Optional[sqlite3.Connection] = None) -> None:
             FOREIGN KEY (instance_name) REFERENCES instances(name) ON DELETE CASCADE
         )
     """)
-    conn.execute("CREATE INDEX IF NOT EXISTS idx_session_bindings_instance ON session_bindings(instance_name)")
+        connection.execute("CREATE INDEX IF NOT EXISTS idx_session_bindings_instance ON session_bindings(instance_name)")
 
-    # Create instances table
-    # Row exists = participating. No enabled flag.
-    # Status: 'active', 'listening', 'inactive'
-    conn.execute("""
+        # Create instances table
+        # Row exists = participating. No enabled flag.
+        # Status: 'active', 'listening', 'inactive'
+        connection.execute("""
         CREATE TABLE IF NOT EXISTS instances (
             name TEXT PRIMARY KEY,
             session_id TEXT UNIQUE,
@@ -414,30 +411,30 @@ def init_db(conn: Optional[sqlite3.Connection] = None) -> None:
         )
     """)
 
-    # KV table for relay state and config
-    conn.execute("CREATE TABLE IF NOT EXISTS kv (key TEXT PRIMARY KEY, value TEXT)")
+        # KV table for relay state and config
+        connection.execute("CREATE TABLE IF NOT EXISTS kv (key TEXT PRIMARY KEY, value TEXT)")
 
-    # Create indexes for common query patterns
-    conn.execute("CREATE INDEX IF NOT EXISTS idx_timestamp ON events(timestamp)")
-    conn.execute("CREATE INDEX IF NOT EXISTS idx_type ON events(type)")
-    conn.execute("CREATE INDEX IF NOT EXISTS idx_instance ON events(instance)")
-    conn.execute("CREATE INDEX IF NOT EXISTS idx_type_instance ON events(type, instance)")
+        # Create indexes for common query patterns
+        connection.execute("CREATE INDEX IF NOT EXISTS idx_timestamp ON events(timestamp)")
+        connection.execute("CREATE INDEX IF NOT EXISTS idx_type ON events(type)")
+        connection.execute("CREATE INDEX IF NOT EXISTS idx_instance ON events(instance)")
+        connection.execute("CREATE INDEX IF NOT EXISTS idx_type_instance ON events(type, instance)")
 
-    # Create instance indexes
-    conn.execute("CREATE INDEX IF NOT EXISTS idx_session_id ON instances(session_id)")
-    conn.execute("CREATE INDEX IF NOT EXISTS idx_parent_session_id ON instances(parent_session_id)")
-    conn.execute("CREATE INDEX IF NOT EXISTS idx_parent_name ON instances(parent_name)")
-    conn.execute("CREATE INDEX IF NOT EXISTS idx_created_at ON instances(created_at DESC)")
-    conn.execute("CREATE INDEX IF NOT EXISTS idx_status ON instances(status)")
-    conn.execute(
-        "CREATE UNIQUE INDEX IF NOT EXISTS idx_agent_id_unique ON instances(agent_id) WHERE agent_id IS NOT NULL"
-    )
-    conn.execute("CREATE INDEX IF NOT EXISTS idx_instances_origin ON instances(origin_device_id)")
+        # Create instance indexes
+        connection.execute("CREATE INDEX IF NOT EXISTS idx_session_id ON instances(session_id)")
+        connection.execute("CREATE INDEX IF NOT EXISTS idx_parent_session_id ON instances(parent_session_id)")
+        connection.execute("CREATE INDEX IF NOT EXISTS idx_parent_name ON instances(parent_name)")
+        connection.execute("CREATE INDEX IF NOT EXISTS idx_created_at ON instances(created_at DESC)")
+        connection.execute("CREATE INDEX IF NOT EXISTS idx_status ON instances(status)")
+        connection.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_agent_id_unique ON instances(agent_id) WHERE agent_id IS NOT NULL"
+        )
+        connection.execute("CREATE INDEX IF NOT EXISTS idx_instances_origin ON instances(origin_device_id)")
 
-    # Create flattened events view for simpler SQL queries
-    # DROP first to ensure schema changes are applied (CREATE VIEW IF NOT EXISTS won't update)
-    conn.execute("DROP VIEW IF EXISTS events_v")
-    conn.execute("""
+        # Create flattened events view for simpler SQL queries
+        # DROP first to ensure schema changes are applied (CREATE VIEW IF NOT EXISTS won't update)
+        connection.execute("DROP VIEW IF EXISTS events_v")
+        connection.execute("""
         CREATE VIEW IF NOT EXISTS events_v AS
         SELECT
             id, timestamp, type, instance, data,
@@ -475,9 +472,20 @@ def init_db(conn: Optional[sqlite3.Connection] = None) -> None:
         FROM events
     """)
 
-    # Set schema version
-    conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
-    conn.commit()
+        # Set schema version
+        connection.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
+        connection.commit()
+
+    try:
+        _init_db_inner(conn)
+    except sqlite3.OperationalError as e:
+        msg = str(e).lower()
+        if "database is locked" in msg or "database table is locked" in msg:
+            if _attempt < 4:
+                time.sleep(0.1 * (_attempt + 1))
+                return init_db(conn, _attempt=_attempt + 1)
+            raise RuntimeError(DB_LOCK_ERROR) from e
+        raise
 
 
 # ==================== Notify Endpoints ====================
@@ -1213,24 +1221,29 @@ def _aggregate_batches(batches: list[dict], launcher: str) -> dict:
 
 
 def get_launch_batch(batch_id: str) -> dict | None:
-    """Get single batch status by ID prefix."""
+    """Get batch status by ID prefix.
+
+    Supports shared batch_ids: multiple launch() calls with the same batch_id
+    have their expected counts summed.
+    """
     conn = get_db()
 
     row = conn.execute(
         """
-        SELECT e.timestamp, e.instance as launcher,
+        SELECT MIN(e.timestamp) as timestamp,
+               e.instance as launcher,
                json_extract(e.data, '$.batch_id') as batch_id,
-               json_extract(e.data, '$.launched') as expected
+               SUM(json_extract(e.data, '$.launched')) as expected
         FROM events e
         WHERE e.type = 'life'
           AND json_extract(e.data, '$.action') = 'batch_launched'
           AND json_extract(e.data, '$.batch_id') LIKE ?
-        ORDER BY e.id DESC LIMIT 1
+        GROUP BY json_extract(e.data, '$.batch_id')
     """,
         (f"{batch_id}%",),
     ).fetchone()
 
-    if not row:
+    if not row or not row["batch_id"]:
         return None
 
     ready_rows = conn.execute(
@@ -1287,16 +1300,22 @@ def _log_sub_error(sub_id: str, error: str, exc: Exception | None = None) -> Non
         log_warn("core", "subscription.error", error, sub_id=sub_id)
 
 
-def _format_sub_notification(sub_id: str, event_id: int, event_type: str, instance: str, data: dict[str, Any]) -> str:
+def _format_sub_notification(
+    sub_id: str,
+    event_id: int,
+    event_type: str,
+    instance: str,
+    data: dict[str, Any],
+    filters: dict[str, Any] | None = None,
+) -> str:
     """Format event notification - concise pipe-delimited for readability.
 
     Note: @mentions in quoted text are escaped to prevent routing to unintended recipients.
     """
-    # Preset-specific prefixes
-    if sub_id.startswith("collision"):
-        prefix = "COLLISION WARNING: "
-    else:
-        prefix = ""
+    # Preset-specific prefixes based on subscription filters
+    prefix = ""
+    if filters and "collision" in filters:
+        prefix = "⚠️ COLLISION: "
 
     parts = [f"[sub:{sub_id}]", f"#{event_id}", event_type, instance]
 
@@ -1390,7 +1409,9 @@ def _check_event_subscriptions(
                 _log_sub_error(sub_id, "no caller")
                 continue
 
-            notification = _format_sub_notification(sub_id, event_id, event_type, instance, data)
+            notification = _format_sub_notification(
+                sub_id, event_id, event_type, instance, data, filters=sub.get("filters")
+            )
             notify_result = _send_sub_notification(caller, notification)
             if notify_result == "dead":
                 _log_sub_error(sub_id, f"caller {caller} no longer exists")
@@ -1436,7 +1457,8 @@ def _send_sub_notification(caller: str, message: str) -> bool | str:
     try:
         result = send_system_message("[hcom-events]", f"@{full_name} {message}")
         return result is not None
-    except Exception:
+    except Exception as _e:
+        _log_sub_error(caller, f"send failed: {_e}")
         return False
 
 

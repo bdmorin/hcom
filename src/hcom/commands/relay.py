@@ -245,7 +245,7 @@ def _relay_pull() -> int:
 def _relay_poll(argv: list[str]) -> int:
     """Long-poll for changes, exit when data arrives or timeout.
 
-    Used by TUI subprocess for efficient cross-device sync.
+    Used for manual long-polling or background workers.
     Returns 0 if new data arrived, 1 on timeout.
     """
     from ..relay import relay_wait

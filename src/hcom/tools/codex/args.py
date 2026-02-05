@@ -40,6 +40,9 @@ from ..args_common import (
     extract_flag_name_from_token as _extract_flag_name_from_token,
     deduplicate_boolean_flags as _deduplicate_boolean_flags_base,
     toggle_flag as _toggle_flag,
+    looks_like_flag as _looks_like_flag_base,
+    set_positional as _set_positional,
+    remove_positional as _remove_positional,
 )
 
 # Type aliases (Codex-specific)
@@ -341,7 +344,7 @@ class CodexArgsSpec(BaseArgsSpec):
             if prompt == "":
                 tokens = _remove_positional(tokens, self.positional_indexes)
             else:
-                tokens = _set_prompt(tokens, prompt, self.positional_indexes)
+                tokens = _set_positional(tokens, prompt, self.positional_indexes)
 
         # Developer instructions via -c flag - PREPEND for precedence
         if developer_instructions is not None:
@@ -687,54 +690,18 @@ def _looks_like_flag(token_lower: str) -> bool:
     this function receives lowercased tokens. The parsing loop handles -V
     case-sensitively before calling _looks_like_flag.
     """
-    if token_lower in _BOOLEAN_FLAGS:
-        return True
-    if token_lower in _VALUE_FLAGS:
-        return True
-    if token_lower in _SUBCOMMANDS:
-        return True
-    if token_lower == "--":
-        return True
-    if any(token_lower.startswith(p) for p in _VALUE_FLAG_PREFIXES):
-        return True
-    return False
+    return _looks_like_flag_base(
+        token_lower,
+        boolean_flags=_BOOLEAN_FLAGS,
+        value_flags=_VALUE_FLAGS,
+        value_flag_prefixes=_VALUE_FLAG_PREFIXES,
+        extra_flags=_SUBCOMMANDS,
+    )
 
 
 def _deduplicate_boolean_flags(tokens: Sequence[str]) -> TokenList:
     """Remove duplicate boolean flags, keeping first occurrence."""
     return _deduplicate_boolean_flags_base(tokens, _BOOLEAN_FLAGS)
-
-
-def _set_prompt(tokens: Sequence[str], value: str, positional_indexes: Sequence[int] = ()) -> TokenList:
-    """Set or replace positional prompt.
-
-    Args:
-        tokens: Token list (clean_tokens from spec)
-        value: New prompt value
-        positional_indexes: Indexes of actual positional tokens in the list
-    """
-    tokens_list: TokenList = list(tokens)
-    if positional_indexes:
-        # Replace first positional
-        tokens_list[positional_indexes[0]] = value
-        return tokens_list
-    # No existing positional, append
-    tokens_list.append(value)
-    return tokens_list
-
-
-def _remove_positional(tokens: Sequence[str], positional_indexes: Sequence[int] = ()) -> TokenList:
-    """Remove first positional argument.
-
-    Args:
-        tokens: Token list (clean_tokens from spec)
-        positional_indexes: Indexes of actual positional tokens
-    """
-    if not positional_indexes:
-        return list(tokens)  # Nothing to remove
-    # Remove first positional
-    idx: int = positional_indexes[0]
-    return list(tokens[:idx]) + list(tokens[idx + 1 :])
 
 
 # ==================== Codex Args Preprocessing ====================

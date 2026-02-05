@@ -3,7 +3,7 @@
 import sys
 import json
 import re
-from .utils import format_error
+from .utils import format_error, parse_flag_bool, parse_last_flag, CLIError
 from ..shared import CommandContext
 
 
@@ -15,7 +15,7 @@ def cmd_transcript(argv: list[str], *, ctx: CommandContext | None = None) -> int
         append_unread_messages,
         resolve_identity,
     )
-    from ..core.instances import load_instance_position
+    from ..core.instances import load_instance_position, resolve_display_name
     from ..core.transcript import get_thread, format_thread, format_thread_detailed
     from ..core.db import get_db
 
@@ -57,31 +57,26 @@ def cmd_transcript(argv: list[str], *, ctx: CommandContext | None = None) -> int
             return (int(match.group(1)), int(match.group(2)))
         return None
 
-    # Parse arguments
+    # Parse boolean flags first (removes from argv)
+    json_output, argv = parse_flag_bool(argv, "--json")
+    full_output, argv = parse_flag_bool(argv, "--full")
+    detailed_output, argv = parse_flag_bool(argv, "--detailed")
+
+    # Parse --last flag
+    try:
+        last, argv = parse_last_flag(argv, default=10)
+    except CLIError as e:
+        print(format_error(str(e)), file=sys.stderr)
+        return 1
+
+    # Parse remaining arguments
     target = None
-    last = 10
-    json_output = False
-    full_output = False
-    detailed_output = False
     range_tuple = None
 
     i = 0
     while i < len(argv):
         arg = argv[i]
-        if arg == "--json":
-            json_output = True
-        elif arg == "--full":
-            full_output = True
-        elif arg == "--detailed":
-            detailed_output = True
-        elif arg == "--last" and i + 1 < len(argv):
-            try:
-                last = int(argv[i + 1])
-                i += 1
-            except ValueError:
-                print(format_error("--last requires a number"), file=sys.stderr)
-                return 1
-        elif arg == "--range" and i + 1 < len(argv):
+        if arg == "--range" and i + 1 < len(argv):
             parsed = parse_position_or_range(argv[i + 1])
             if not parsed:
                 print(
@@ -118,7 +113,10 @@ def cmd_transcript(argv: list[str], *, ctx: CommandContext | None = None) -> int
 
     # Resolve target instance
     if target:
-        # Look up by name
+        # Try tag-name resolution first, then direct lookup
+        resolved = resolve_display_name(target)
+        if resolved:
+            target = resolved
         data = load_instance_position(target)
         if not data:
             # Try prefix match
@@ -204,9 +202,14 @@ def cmd_transcript(argv: list[str], *, ctx: CommandContext | None = None) -> int
 
     # Output
     if json_output:
+        thread_data["transcript_path"] = transcript_path
         print(json.dumps(thread_data, indent=2))
     elif detailed_output:
         print(format_thread_detailed(thread_data, instance_name))
+        print(f"\n[transcript: {transcript_path}]")
+    elif full_output:
+        print(format_thread(thread_data, instance_name, full=full_output))
+        print(f"\n[transcript: {transcript_path}]")
     else:
         print(format_thread(thread_data, instance_name, full=full_output))
 
@@ -226,29 +229,21 @@ def _cmd_transcript_timeline(argv: list[str]) -> int:
     )
     from ..core.db import get_db
 
-    # Parse arguments
-    last = 10
-    json_output = False
-    full_output = False
-    detailed_output = False
+    # Parse boolean flags first (removes from argv)
+    json_output, argv = parse_flag_bool(argv, "--json")
+    full_output, argv = parse_flag_bool(argv, "--full")
+    detailed_output, argv = parse_flag_bool(argv, "--detailed")
 
-    i = 0
-    while i < len(argv):
-        arg = argv[i]
-        if arg == "--json":
-            json_output = True
-        elif arg == "--full":
-            full_output = True
-        elif arg == "--detailed":
-            detailed_output = True
-        elif arg == "--last" and i + 1 < len(argv):
-            try:
-                last = int(argv[i + 1])
-                i += 1
-            except ValueError:
-                print(format_error("--last requires a number"), file=sys.stderr)
-                return 1
-        elif arg == "--range" or re.match(r"^\d+-\d+$", arg) or re.match(r"^\d+$", arg):
+    # Parse --last flag
+    try:
+        last, argv = parse_last_flag(argv, default=10)
+    except CLIError as e:
+        print(format_error(str(e)), file=sys.stderr)
+        return 1
+
+    # Check for unsupported flags/args
+    for arg in argv:
+        if arg == "--range" or re.match(r"^\d+-\d+$", arg) or re.match(r"^\d+$", arg):
             # Range not supported for timeline
             print(format_error("Range not supported for timeline"), file=sys.stderr)
             print(
@@ -258,9 +253,8 @@ def _cmd_transcript_timeline(argv: list[str]) -> int:
             print("  hcom transcript @name N", file=sys.stderr)
             return 1
         elif arg.startswith("-"):
-            print(f"Error: Unknown flag '{arg}'", file=sys.stderr)
+            print(format_error(f"Unknown flag '{arg}'"), file=sys.stderr)
             return 1
-        i += 1
 
     # Get all instances with transcript paths (active + stopped from snapshots)
     conn = get_db()

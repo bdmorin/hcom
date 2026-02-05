@@ -55,6 +55,9 @@ _SHIM_ADMIN_FLAGS = frozenset(
     }
 )
 
+# Note: Daemon imports cli.py but won't trigger this block - daemon's argv[0] is
+# "hcom-daemon" or similar, not in _SHIM_TOOLS. Only direct claude/gemini/codex
+# invocations (via symlink) enter here.
 _invoked_as = os.path.basename(sys.argv[0]) if sys.argv else ""
 if _invoked_as in _SHIM_TOOLS:
     import shutil
@@ -155,17 +158,19 @@ _GEMINI_HOOKS = frozenset(
 
 
 def _hook_gate_check() -> bool:
-    """Fast gate: should hooks proceed? Uses only stdlib."""
+    """Fast gate: should hooks proceed? Uses context-aware accessors."""
+    # Import context accessors
+    from .core.thread_context import get_process_id, get_is_launched, get_hcom_dir
+    from pathlib import Path
+
     # Fast path: hcom-launched always proceed
-    if os.environ.get("HCOM_PROCESS_ID") or os.environ.get("HCOM_LAUNCHED") == "1":
+    if get_process_id() or get_is_launched():
         return True
 
     # Check if DB exists
-    from pathlib import Path
-
-    hcom_dir = os.environ.get("HCOM_DIR")
+    hcom_dir = get_hcom_dir()
     if hcom_dir:
-        db_path = Path(hcom_dir) / "hcom.db"
+        db_path = hcom_dir / "hcom.db"
     else:
         db_path = Path.home() / ".hcom" / "hcom.db"
 
@@ -202,7 +207,7 @@ def _route_hook_early() -> bool:
 
     # Gate passed - import and run dispatcher
     if cmd in _CLAUDE_HOOKS:
-        from .hooks.dispatcher import handle_hook
+        from .tools.claude.dispatcher import handle_hook
 
         handle_hook(cmd)
         sys.exit(0)
@@ -254,6 +259,7 @@ IDENTITY_ALLOWLIST = frozenset(
         "help",  # No identity needed
         "reset",  # Admin command
         "stop",  # Admin command (stop all/name works without identity, self-stop validated in cmd)
+        "kill",  # Admin command (kill by name/all, uses identity only for logging)
         "run",  # Scripts handle their own identity requirements
         "status",  # Diagnostic command
         "relay",  # Works without identity
@@ -265,6 +271,8 @@ IDENTITY_ALLOWLIST = frozenset(
         "shim",  # System setup, no identity needed
         "hooks",  # Hook management, no identity needed
         "bundle",  # Query-only without identity
+        "daemon",  # Daemon management, no identity needed
+        "term",  # PTY admin (screen query, inject, debug toggle)
     }
 )
 
@@ -363,7 +371,7 @@ from .core.paths import (
     atomic_write,
     FLAGS_DIR,
 )
-from .hooks import (
+from .tools.claude.settings import (
     get_claude_settings_path,
     load_claude_settings,
     setup_claude_hooks,
@@ -381,6 +389,7 @@ from .commands import (
     cmd_stop,  # noqa: F401 (used dynamically via globals())
     cmd_start,  # noqa: F401 (used dynamically via globals())
     cmd_kill,  # noqa: F401 (used dynamically via globals())
+    cmd_daemon,  # noqa: F401 (used dynamically via globals())
     cmd_send,  # noqa: F401 (used dynamically via globals())
     cmd_listen,  # noqa: F401 (used dynamically via globals())
     cmd_events,  # noqa: F401 (used dynamically via globals())
@@ -395,6 +404,7 @@ from .commands import (
     cmd_shim,  # noqa: F401 (used dynamically via globals())
     cmd_hooks,  # noqa: F401 (used dynamically via globals())
     cmd_bundle,  # noqa: F401 (used dynamically via globals())
+    cmd_term,  # noqa: F401 (used dynamically via globals())
     CLIError,
     format_error,
 )
@@ -441,6 +451,7 @@ COMMANDS = (
     "stop",
     "start",
     "kill",
+    "daemon",
     "reset",
     "list",
     "config",
@@ -451,6 +462,7 @@ COMMANDS = (
     "status",
     "shim",
     "hooks",
+    "term",
 )
 
 # Commands that should NOT trigger status update (handled internally or lifecycle)
@@ -522,7 +534,8 @@ def _run_command(name: str, argv: list[str], *, ctx: CommandContext | None = Non
     if name == "run":
         result = cmd_run(argv, ctx=ctx)
     else:
-        result = globals()[f"cmd_{name}"](argv, ctx=ctx)
+        func_name = f"cmd_{name.replace('-', '_')}"
+        result = globals()[func_name](argv, ctx=ctx)
     _maybe_deliver_pending_messages(argv, ctx=ctx)
     return result
 
@@ -787,7 +800,8 @@ def ensure_hooks_current() -> bool:
     if needs_update:
         try:
             setup_claude_hooks(include_permissions=include_permissions)
-            if os.environ.get("CLAUDECODE") == "1":
+            from .core.thread_context import get_is_claude
+            if get_is_claude():
                 print(
                     "hcom hooks updated. Please restart Claude Code to apply changes.",
                     file=sys.stderr,
@@ -883,7 +897,7 @@ def main(argv: list[str] | None = None) -> int | None:
         ctx = CommandContext(explicit_name=None, identity=None)
 
     # Launch commands: numeric (hcom 1) or tool names (hcom gemini, hcom codex, hcom claude) - always allowed
-    is_launch_cmd = cmd and (cmd.isdigit() or cmd in ("gemini", "codex", "claude"))
+    is_launch_cmd = cmd and (cmd.isdigit() or cmd in ("gemini", "codex", "claude", "r", "f"))
 
     # Gate: require identity unless allowlisted, bypass flag, or explicit identity provided
     if cmd and not is_launch_cmd and cmd not in IDENTITY_ALLOWLIST and cmd not in IDENTITY_BYPASS_FLAGS:
@@ -958,16 +972,17 @@ def main(argv: list[str] | None = None) -> int | None:
     # Subagent context: require explicit --name for all commands
     # Both subagents (--name <uuid>) and parent (--name parent) must identify
     # Skip for version/help flags and allowlisted commands - they don't need identity
+    from .core.thread_context import get_is_claude as _get_is_claude
     if (
         cmd
         and not explicit_name
         and cmd not in IDENTITY_ALLOWLIST
         and cmd not in ("-v", "--version", "-h", "--help")
-        and os.environ.get("CLAUDECODE") == "1"
+        and _get_is_claude()
     ):
         try:
             from .core.identity import resolve_identity
-            from .hooks.subagent import in_subagent_context, cleanup_dead_subagents
+            from .tools.claude.subagent import in_subagent_context, cleanup_dead_subagents
             from .core.instances import load_instance_position
 
             identity = ctx.identity if ctx else None
@@ -1004,17 +1019,19 @@ def main(argv: list[str] | None = None) -> int | None:
         # Handle --new-terminal flag: force launch TUI in new terminal window
         if cmd == "--new-terminal":
             from .core.tool_utils import build_hcom_command
+            from .core.thread_context import get_cwd
 
             env = build_claude_env()
             hcom_cmd = build_hcom_command()
-            success = launch_terminal(hcom_cmd, env, cwd=os.getcwd())
+            success = launch_terminal(hcom_cmd, env, cwd=str(get_cwd()))
             _maybe_deliver_pending_messages(ctx=ctx)
             return 0 if success else 1
 
         if not cmd:
             # TTY detection: launch TUI if interactive, otherwise launch in new terminal
             # If inside AI tool (Gemini/Claude), force new terminal to avoid hijacking the session
-            if sys.stdin.isatty() and sys.stdout.isatty() and not is_inside_ai_tool():
+            from .commands.utils import is_interactive
+            if is_interactive() and not is_inside_ai_tool():
                 # Check for updates and prompt before TUI launch
                 latest, update_cmd = get_update_info()
                 if latest and update_cmd:
@@ -1028,10 +1045,11 @@ def main(argv: list[str] | None = None) -> int | None:
             else:
                 # No TTY (pipe, redirect, etc) - launch in new terminal window
                 from .core.tool_utils import build_hcom_command
+                from .core.thread_context import get_cwd
 
                 env = build_claude_env()
                 hcom_cmd = build_hcom_command()
-                success = launch_terminal(hcom_cmd, env, cwd=os.getcwd())
+                success = launch_terminal(hcom_cmd, env, cwd=str(get_cwd()))
                 _maybe_deliver_pending_messages(ctx=ctx)
                 return 0 if success else 1
         elif cmd in ("help", "--help", "-h"):
@@ -1086,6 +1104,22 @@ def main(argv: list[str] | None = None) -> int | None:
                 result = cmd_launch(_strip_identity_flags(argv), launcher_name=launcher_name, ctx=ctx)
                 _maybe_deliver_pending_messages(ctx=ctx)
                 return result
+        elif cmd == "r":
+            # Resume shortcut: hcom r NAME
+            from .commands.lifecycle import cmd_resume
+
+            cmd_args = _get_command_args(argv, cmd)
+            result = cmd_resume(cmd_args, ctx=ctx)
+            _maybe_deliver_pending_messages(ctx=ctx)
+            return result
+        elif cmd == "f":
+            # Fork shortcut: hcom f NAME
+            from .commands.lifecycle import cmd_fork
+
+            cmd_args = _get_command_args(argv, cmd)
+            result = cmd_fork(cmd_args, ctx=ctx)
+            _maybe_deliver_pending_messages(ctx=ctx)
+            return result
         elif cmd == "claude":
             # hcom claude [args]
             if "--help" in argv or "-h" in argv:
@@ -1113,9 +1147,52 @@ def main(argv: list[str] | None = None) -> int | None:
 # Command functions (cmd_launch, cmd_start, cmd_stop, cmd_reset) now in commands/ package
 # Utility functions (should_show_in_watch) now in commands/admin.py
 
+# Type hints for daemon entry point (avoid circular imports at module level)
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from .core.hcom_context import HcomContext
+    from .core.hook_result import HookResult
+
+def main_with_context(argv: list[str], ctx: "HcomContext") -> "HookResult":
+    """Daemon entry point for CLI commands - context already built.
+
+    Thread-safe: uses contextvars for cwd/env, daemon captures stdout via thread-local.
+
+    Args:
+        argv: Command-line arguments (without 'hcom' prefix).
+        ctx: Immutable execution context (replaces os.environ reads).
+
+    Returns:
+        HookResult with exit_code (stdout/stderr captured by daemon).
+    """
+    from .core.thread_context import with_context
+    from .core.hook_result import HookResult
+
+    exit_code = 0
+
+    try:
+        # with_context() sets contextvars - all code uses get_cwd() etc.
+        # No os.chdir() needed - cwd is accessed via contextvar, not process state.
+        # stdout/stderr capture handled by daemon.py via thread-local streams.
+        with with_context(ctx):
+            result = main(argv)
+            exit_code = result if result is not None else 0
+    except SystemExit as e:
+        exit_code = e.code if isinstance(e.code, int) else (1 if e.code else 0)
+    except Exception as e:
+        from .core.log import log_error
+
+        log_error("cli", "main_with_context.error", e, argv=argv)
+        return HookResult.error(str(e))
+
+    return HookResult(exit_code=exit_code, stdout="", stderr="")
+
+
 __all__ = [
     # CLI entry points
     "main",
+    "main_with_context",
     "ensure_hooks_current",
     # Hook management (from hooks/settings.py)
     "setup_claude_hooks",

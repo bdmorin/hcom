@@ -7,13 +7,13 @@ import time
 from pathlib import Path
 from typing import Any
 
-from .utils import format_error
+from .utils import format_error, parse_flag_bool, parse_last_flag, CLIError
 from ..core.paths import hcom_path, ARCHIVE_DIR
 from ..core.instances import (
     get_instance_status,
     get_status_icon,
-    is_launching_placeholder,
     get_full_name,
+    resolve_display_name,
 )
 from ..shared import format_age, shorten_path, HcomError, CommandContext
 
@@ -27,12 +27,13 @@ def _list_archives(here_filter: bool = False, limit: int = 0) -> list[dict]:
     """
     from ..core.db import DB_FILE
     import sqlite3
+    from hcom.core.thread_context import get_cwd
 
     archive_dir = hcom_path(ARCHIVE_DIR)
     if not archive_dir.exists():
         return []
 
-    cwd = os.getcwd() if here_filter else None
+    cwd = str(get_cwd()) if here_filter else None
     archives: list[dict[str, Any]] = []
 
     for session_dir in sorted(archive_dir.glob("session-*"), reverse=True):
@@ -205,31 +206,28 @@ def cmd_archive(argv: list[str], *, ctx: CommandContext | None = None) -> int:
         print(format_error(error), file=sys.stderr)
         return 1
 
-    # Parse arguments
-    json_output = "--json" in argv
-    here_filter = "--here" in argv
-    sql_filter = None
-    last_count = 20  # Default
+    # Parse boolean flags first (removes from argv)
+    json_output, argv = parse_flag_bool(argv, "--json")
+    here_filter, argv = parse_flag_bool(argv, "--here")
 
-    # Extract flag values
-    clean_argv = []
-    i = 0
-    while i < len(argv):
-        if argv[i] == "--sql" and i + 1 < len(argv):
-            sql_filter = argv[i + 1]
-            i += 2
-        elif argv[i] == "--last" and i + 1 < len(argv):
-            try:
-                last_count = int(argv[i + 1])
-            except ValueError:
-                print(format_error("--last requires a number"), file=sys.stderr)
-                return 1
-            i += 2
-        elif argv[i].startswith("--"):
-            i += 1
-        else:
-            clean_argv.append(argv[i])
-            i += 1
+    # Parse --last flag
+    try:
+        last_count, argv = parse_last_flag(argv, default=20)
+    except CLIError as e:
+        print(format_error(str(e)), file=sys.stderr)
+        return 1
+
+    # Parse --sql flag
+    from .utils import parse_flag_value
+    sql_filter = None
+    try:
+        sql_filter, argv = parse_flag_value(argv, "--sql")
+    except CLIError as e:
+        print(format_error(str(e)), file=sys.stderr)
+        return 1
+
+    # Remaining args are positional
+    clean_argv = [a for a in argv if not a.startswith("--")]
 
     # Get archives list
     archives = _list_archives(here_filter)
@@ -373,9 +371,9 @@ def cmd_list(argv: list[str], *, ctx: CommandContext | None = None) -> int:
 
     # Pull remote state for fresh instance list
     try:
-        from ..relay import is_relay_handled_by_tui, pull
+        from ..relay import is_relay_handled_by_daemon, pull
 
-        if not is_relay_handled_by_tui():
+        if not is_relay_handled_by_daemon():
             pull()
     except Exception:
         pass
@@ -391,15 +389,21 @@ def cmd_list(argv: list[str], *, ctx: CommandContext | None = None) -> int:
 
         remaining = [a for a in argv if a not in ("--stopped", "--all") and not a.startswith("-")]
         show_all = "--all" in argv
+        default_limit = 20
         if remaining:
             # hcom list --stopped NAME → events for specific instance
             instance_name = remaining[0]
+            print(json.dumps({"meta": {"type": "stopped_events", "instance": instance_name}}))
             return cmd_events(
                 ["--sql", f"life_action='stopped' AND instance='{instance_name}'", "--last", "10000"], ctx=ctx
             )
         else:
             # hcom list --stopped → recent stopped (--all removes limit)
-            limit = ["--last", "10000"] if show_all else ["--last", "20"]
+            limit = ["--last", "10000"] if show_all else ["--last", str(default_limit)]
+            meta = {"meta": {"type": "stopped_events", "limit": None if show_all else default_limit}}
+            if not show_all:
+                meta["meta"]["hint"] = "use --all to see all stopped events"
+            print(json.dumps(meta))
             return cmd_events(["--sql", "life_action='stopped'"] + limit, ctx=ctx)
 
     # Identity (instance-only): CLI supplies ctx (preferred). Direct calls may still pass --name.
@@ -407,23 +411,17 @@ def cmd_list(argv: list[str], *, ctx: CommandContext | None = None) -> int:
     if ctx is None:
         from_value, argv = parse_name_flag(argv)
 
-    # Parse arguments
-    json_output = False
-    verbose_output = False
-    sh_output = False
+    # Parse boolean flags first (removes from argv)
+    json_output, argv = parse_flag_bool(argv, "--json")
+    verbose_output, argv = parse_flag_bool(argv, "-v")
+    verbose_v2, argv = parse_flag_bool(argv, "--verbose")
+    verbose_output = verbose_output or verbose_v2
+    sh_output, argv = parse_flag_bool(argv, "--sh")
+
+    # Remaining non-flag args are positional
     target_name = None  # 'self' or instance name
     field_name = None  # Optional field to extract
-
-    positionals = []
-    for arg in argv:
-        if arg == "--json":
-            json_output = True
-        elif arg in ["-v", "--verbose"]:
-            verbose_output = True
-        elif arg == "--sh":
-            sh_output = True
-        elif not arg.startswith("-"):
-            positionals.append(arg)
+    positionals = [a for a in argv if not a.startswith("-")]
 
     # Parse positionals: [target] [field]
     if positionals:
@@ -480,7 +478,10 @@ def cmd_list(argv: list[str], *, ctx: CommandContext | None = None) -> int:
                     payload["agent_id"] = current_data.get("agent_id", "")
                     payload["tool"] = current_data.get("tool", "claude")
         else:
-            # Named instance - must exist
+            # Named instance - must exist (accept tag-name or base name)
+            resolved = resolve_display_name(target_name)
+            if resolved:
+                target_name = resolved
             data = load_instance_position(target_name)
             if not data:
                 print(format_error(f"Not found: {target_name}"), file=sys.stderr)
@@ -634,8 +635,7 @@ def cmd_list(argv: list[str], *, ctx: CommandContext | None = None) -> int:
 
         for data in sorted_instances:
             # Use full display name ({tag}-{name} or {name})
-            # Mask name for launching placeholders (temp name that will change during resume)
-            name = "· · ·" if is_launching_placeholder(data) else get_full_name(data)
+            name = get_full_name(data)
             status, age_str, description, age_seconds, _ = get_instance_status(data)
             icon = get_status_icon(data, status)
             # "now" special case (listening status uses age=0)
@@ -818,6 +818,21 @@ def cmd_list(argv: list[str], *, ctx: CommandContext | None = None) -> int:
 
                     print()  # Blank line between instances
 
+        # Show orphan processes (running hcom processes not in active instances)
+        from ..core.pidtrack import get_orphan_processes
+
+        active_pids: set[int] = {data["pid"] for data in sorted_instances if data.get("pid")}
+        orphans = get_orphan_processes(active_pids=active_pids)
+        if orphans:
+            print("\nRunning processes (stopped):")
+            for o in orphans:
+                names = ", ".join(o.get("names", []))
+                names_str = f" ({names})" if names else ""
+                age = format_age(time.time() - o["launched_at"]) if o.get("launched_at") else ""
+                age_str = f" · {age}" if age else ""
+                print(f"  ◌ pid:{o['pid']}{names_str} · {o['tool']}{age_str}")
+            print("  → hcom kill <name>")
+
         # Show recently stopped summary (last 10 minutes)
         from ..core.db import get_recently_stopped, RECENTLY_STOPPED_MINUTES
 
@@ -828,7 +843,7 @@ def cmd_list(argv: list[str], *, ctx: CommandContext | None = None) -> int:
             if len(recently_stopped) > 5:
                 names += f" +{len(recently_stopped) - 5}"
             print(f"\nRecently stopped ({RECENTLY_STOPPED_MINUTES}m): {names}")
-            print("  → hcom events --sql \"life_action='stopped'\" --last 5")
+            print("  → hcom list --stopped [name]")
 
         # If no instances at all, hint about archives
         total_instances = db.execute("SELECT COUNT(*) FROM instances").fetchone()[0]
@@ -842,6 +857,12 @@ def cmd_list(argv: list[str], *, ctx: CommandContext | None = None) -> int:
     # For adhoc instances (--name with instance), append unread messages
     if from_value and sender_identity and sender_identity.kind == "instance" and current_name:
         append_unread_messages(current_name, json_output=json_output)
+
+    # Show one-time tip for first list command
+    if current_name:
+        from ..core.tips import maybe_show_tip
+
+        maybe_show_tip(current_name, "list", json_output=json_output)
 
     return 0
 
@@ -857,7 +878,7 @@ def cmd_status(argv: list[str], *, ctx: CommandContext | None = None) -> int:
     from ..core.paths import hcom_path, get_project_root, is_hcom_dir_override
     from ..core.db import get_db, init_db
     from ..core.config import get_config
-    from ..hooks.settings import verify_claude_hooks_installed, get_claude_settings_path
+    from ..tools.claude.settings import verify_claude_hooks_installed, get_claude_settings_path
     from ..tools.gemini.settings import (
         verify_gemini_hooks_installed,
         get_gemini_settings_path,
@@ -871,8 +892,8 @@ def cmd_status(argv: list[str], *, ctx: CommandContext | None = None) -> int:
     from ..shared import get_status_counts
     from ..core.log import get_log_summary, get_recent_logs, get_log_path
 
-    json_output = "--json" in argv
-    show_logs = "--logs" in argv
+    json_output, argv = parse_flag_bool(argv, "--json")
+    show_logs, argv = parse_flag_bool(argv, "--logs")
 
     # Gather status info
     hcom_dir = hcom_path()
@@ -963,6 +984,11 @@ def cmd_status(argv: list[str], *, ctx: CommandContext | None = None) -> int:
     if show_logs:
         log_entries = get_recent_logs(hours=1.0, levels=("ERROR", "WARN"), limit=20)
 
+    # Daemon status with stats if showing logs
+    from ..daemon import get_daemon_info, get_delivery_stats
+    daemon_info = get_daemon_info(include_stats=show_logs)
+    delivery_info = get_delivery_stats(hours=1.0) if show_logs else {}
+
     # Version/update status
     from ..cli import get_update_info
     from ..shared import __version__
@@ -1004,6 +1030,8 @@ def cmd_status(argv: list[str], *, ctx: CommandContext | None = None) -> int:
         "terminal": {"config": terminal_config, "available": terminal_available},
         "instances": instance_counts,
         "relay": relay_info,
+        "daemon": daemon_info,
+        "delivery": delivery_info if show_logs else {},
         "logs": {
             "error_count": log_summary["error_count"],
             "warn_count": log_summary["warn_count"],
@@ -1091,6 +1119,32 @@ def cmd_status(argv: list[str], *, ctx: CommandContext | None = None) -> int:
                 print("relay:     disabled")
         else:
             print("relay:     not configured")
+
+        # Daemon
+        if daemon_info["running"]:
+            if daemon_info["responsive"]:
+                print(f"daemon:    running (PID {daemon_info['pid']})")
+            else:
+                print(f"daemon:    running but unresponsive (PID {daemon_info['pid']})")
+            # Show stats if available
+            if show_logs and "stats" in daemon_info:
+                stats = daemon_info["stats"]
+                if stats["request_count"] > 0:
+                    print(f"           {stats['request_count']} req/hr, avg {stats['avg_ms']}ms, max {stats['max_ms']}ms")
+        else:
+            print("daemon:    not running")
+
+        # Delivery (only with --logs)
+        if show_logs and delivery_info:
+            delivered = delivery_info.get("delivered", 0)
+            failed = delivery_info.get("failed", 0)
+            if delivered > 0 or failed > 0:
+                if failed > 0:
+                    reasons = delivery_info.get("failure_reasons", {})
+                    reason_str = ", ".join(f"{k}:{v}" for k, v in reasons.items())
+                    print(f"delivery:  {delivered} ok, {failed} failed ({reason_str})")
+                else:
+                    print(f"delivery:  {delivered} ok")
 
         # Logs
         err_count = log_summary["error_count"]

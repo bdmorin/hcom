@@ -13,8 +13,7 @@ VALID_SCOPES = {"broadcast", "mentions"}
 # - request: Response expected from recipient
 # - inform: FYI, no action needed
 # - ack: Explicit acknowledgment (requires reply_to)
-# - error: Terminal failure, stop retrying
-VALID_INTENTS = {"request", "inform", "ack", "error"}
+VALID_INTENTS = {"request", "inform", "ack"}
 
 
 def get_group_session_id(instance_data: dict[str, Any] | None) -> str | None:

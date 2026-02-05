@@ -275,3 +275,101 @@ def split_env_tokens(env_value: str) -> TokenList:
         ValueError: If the string has unbalanced quotes
     """
     return shlex.split(env_value)
+
+
+def looks_like_flag(
+    token_lower: str,
+    *,
+    boolean_flags: frozenset[str],
+    value_flags: frozenset[str],
+    value_flag_prefixes: frozenset[str],
+    optional_value_flags: frozenset[str] = frozenset(),
+    flag_aliases: Mapping[str, str] | None = None,
+    optional_value_flag_prefixes: frozenset[str] = frozenset(),
+    canonical_prefixes: Mapping[str, str] | None = None,
+    extra_flags: frozenset[str] = frozenset(),
+) -> bool:
+    """Check if token looks like a flag (not a value).
+
+    Used to detect when a value flag is missing its value (next token is another flag).
+    Takes tool-specific flag configuration as parameters.
+
+    Args:
+        token_lower: Lowercase token to check
+        boolean_flags: Known boolean flags (e.g., '--verbose')
+        value_flags: Known value flags (e.g., '--model')
+        value_flag_prefixes: Prefixes for --flag=value syntax (e.g., '--model=')
+        optional_value_flags: Flags with optional values (e.g., '--resume')
+        flag_aliases: Short-to-long flag mappings (e.g., {'-m': '--model'})
+        optional_value_flag_prefixes: Prefixes for optional value flags (e.g., '--resume=')
+        canonical_prefixes: Alias prefixes to canonical form (e.g., {'--allowedtools=': '--allowedTools'})
+        extra_flags: Additional flags to check (e.g., background switches)
+
+    Returns:
+        True if token looks like a flag, False otherwise
+    """
+    if token_lower in extra_flags:
+        return True
+    if token_lower in boolean_flags:
+        return True
+    if token_lower in value_flags:
+        return True
+    if token_lower in optional_value_flags:
+        return True
+    if flag_aliases and token_lower in flag_aliases:
+        return True
+    if token_lower == "--":
+        return True
+    if any(token_lower.startswith(prefix) for prefix in optional_value_flag_prefixes):
+        return True
+    if any(token_lower.startswith(prefix) for prefix in value_flag_prefixes):
+        return True
+    if canonical_prefixes and any(token_lower.startswith(prefix) for prefix in canonical_prefixes):
+        return True
+    return False
+
+
+def set_positional(
+    tokens: Sequence[str],
+    value: str,
+    positional_indexes: Sequence[int],
+) -> TokenList:
+    """Set or replace the first positional argument.
+
+    If a positional exists, replaces it. Otherwise appends the value.
+
+    Args:
+        tokens: Token list to modify
+        value: New positional value
+        positional_indexes: Indexes of positional tokens in the list
+
+    Returns:
+        Modified token list
+    """
+    tokens_list: TokenList = list(tokens)
+    if positional_indexes:
+        # Replace first positional
+        tokens_list[positional_indexes[0]] = value
+        return tokens_list
+    # No existing positional, append
+    tokens_list.append(value)
+    return tokens_list
+
+
+def remove_positional(
+    tokens: Sequence[str],
+    positional_indexes: Sequence[int],
+) -> TokenList:
+    """Remove the first positional argument.
+
+    Args:
+        tokens: Token list to modify
+        positional_indexes: Indexes of positional tokens
+
+    Returns:
+        Token list with first positional removed
+    """
+    if not positional_indexes:
+        return list(tokens)  # Nothing to remove
+    idx: int = positional_indexes[0]
+    return list(tokens[:idx]) + list(tokens[idx + 1 :])

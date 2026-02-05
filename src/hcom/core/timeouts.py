@@ -7,8 +7,7 @@ Centralizes all timing thresholds for:
 - Status timeouts
 - Instance cleanup
 
-Rationale for key values:
- - dont make up fake reasons
+Rationale for key values are documented inline.
 """
 
 from __future__ import annotations

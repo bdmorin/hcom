@@ -429,6 +429,7 @@ Examples:
             my_folder=my_folder,
         )
 
+        is_last_coder = i == args.agents - 1
         launch(
             1,
             tool=args.tool,
@@ -447,6 +448,7 @@ Examples:
             background=not args.interactive,
             system_prompt=system_prompt,
             cwd=workspace,
+            wait=is_last_coder,
         )
         print(f"  Launched coder{i} ({style['name']} style, {args.tool}) → {my_folder}/")
 

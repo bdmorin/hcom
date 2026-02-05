@@ -12,12 +12,13 @@ See .davia/assets/ for architecture details.
 
 from .hooks import (
     handle_gemini_hook,
+    handle_gemini_hook_with_context,
     handle_sessionstart,
     handle_beforeagent,
     handle_aftertool,
     handle_beforetool,
     handle_sessionend,
-    GEMINI_HOOK_HANDLERS,
+    GEMINI_HANDLERS,
 )
 from .settings import (
     setup_gemini_hooks,
@@ -32,12 +33,13 @@ from .settings import (
 __all__ = [
     # Hook handlers
     "handle_gemini_hook",
+    "handle_gemini_hook_with_context",
     "handle_sessionstart",
     "handle_beforeagent",
     "handle_aftertool",
     "handle_beforetool",
     "handle_sessionend",
-    "GEMINI_HOOK_HANDLERS",
+    "GEMINI_HANDLERS",
     # Settings management
     "setup_gemini_hooks",
     "verify_gemini_hooks_installed",

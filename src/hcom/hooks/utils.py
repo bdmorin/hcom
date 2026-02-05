@@ -19,15 +19,18 @@ Re-exports (for backward compatibility):
 
 Identity Resolution Flow:
     1. Look up session_id in session_bindings table
-    2. If not found, check transcript for [HCOM:BIND:X] marker
+    2. If not found, check transcript for [hcom:X] marker
     3. If marker found and instance pending, create binding
     4. Return instance_name or None (non-participant)
 """
 
 from __future__ import annotations
-from typing import Any
+
 from pathlib import Path
-import os
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from ..core.hcom_context import HcomContext
 import sys
 import socket  # noqa: F401 (re-export)
 
@@ -56,8 +59,68 @@ from ..core.tool_utils import (
 IS_WINDOWS = sys.platform == "win32"
 
 
+def find_last_bind_marker(transcript_path: str) -> str | None:
+    """Find last [hcom:xxx] or [HCOM:BIND:xxx] marker in transcript using chunked backwards search.
+
+    Reads file backwards in 64MB chunks to find marker efficiently.
+    For 1.3GB file: ~0.08s if marker near end, ~1.6s if absent.
+
+    Args:
+        transcript_path: Path to transcript file
+
+    Returns:
+        Instance name from marker, or None if not found
+    """
+    from ..shared import BIND_MARKER_RE
+
+    # Search for both new [hcom:name] and legacy [HCOM:BIND:name] formats
+    marker_prefixes = [b"[hcom:", b"[HCOM:BIND:"]
+    chunk_size = 64 * 1024 * 1024  # 64MB chunks
+    overlap = 20 + 50  # max prefix len + max instance name
+
+    try:
+        file_path = Path(transcript_path)
+        file_size = file_path.stat().st_size
+
+        with open(file_path, "rb") as f:
+            pos = file_size
+            carry = b""
+
+            while pos > 0:
+                read_size = min(chunk_size, pos)
+                pos -= read_size
+                f.seek(pos)
+                data = f.read(read_size)
+
+                buf = data + carry
+                # Find the last occurrence of any marker prefix
+                best_idx = -1
+                for prefix in marker_prefixes:
+                    idx = buf.rfind(prefix)
+                    if idx > best_idx:
+                        best_idx = idx
+                if best_idx != -1:
+                    end_idx = buf.find(b"]", best_idx)
+                    if end_idx != -1:
+                        marker_bytes = buf[best_idx : end_idx + 1]
+                        try:
+                            marker_str = marker_bytes.decode("utf-8")
+                            m = BIND_MARKER_RE.search(marker_str)
+                            if m:
+                                return m.group(1)
+                        except UnicodeDecodeError:
+                            pass
+
+                carry = data[:overlap] if overlap > 0 else b""
+
+    except Exception:
+        pass
+
+    return None
+
+
 def _try_bind_from_transcript(session_id: str, transcript_path: str) -> str | None:
-    """Check transcript for [HCOM:BIND:X] marker and create session binding.
+    """Check transcript for [hcom:X] marker and create session binding.
 
     Fallback binding mechanism for vanilla Claude instances that used the
     `!hcom start` bash shortcut (which bypasses PostToolUse hook detection).
@@ -95,28 +158,13 @@ def _try_bind_from_transcript(session_id: str, transcript_path: str) -> str | No
         log_info("hooks", "transcript.bind.skip", reason="no pending instances")
         return None
 
-    try:
-        content = Path(transcript_path).read_text()
-        log_info(
-            "hooks",
-            "transcript.bind.read",
-            content_len=len(content),
-            has_hcom_bind="HCOM:BIND" in content,
-        )
-    except Exception as e:
-        log_info("hooks", "transcript.bind.read_error", error=str(e))
-        return None
+    # Search backwards in chunks for marker (efficient for large files)
+    instance_name = find_last_bind_marker(transcript_path)
+    log_info("hooks", "transcript.bind.search", found=instance_name)
 
-    from ..shared import BIND_MARKER_RE
-
-    matches = BIND_MARKER_RE.findall(content)
-    log_info("hooks", "transcript.bind.search", matches=matches)
-
-    if not matches:
+    if not instance_name:
         log_info("hooks", "transcript.bind.skip", reason="no marker matches")
         return None
-
-    instance_name = matches[-1]  # Last match = most recent
 
     # Only bind if instance is in pending list (avoids binding to wrong session)
     if instance_name not in pending:
@@ -200,7 +248,9 @@ def inject_bootstrap_once(
 
 
 def init_hook_context(
-    hook_data: dict[str, Any], hook_type: str | None = None
+    ctx: "HcomContext",
+    hook_data: dict[str, Any],
+    hook_type: str | None = None,  # noqa: ARG001 - kept for API compatibility
 ) -> tuple[str | None, dict[str, Any], bool]:
     """Initialize instance context from hook_data via session binding lookup.
 
@@ -208,6 +258,7 @@ def init_hook_context(
     via session_bindings table. If not bound, falls back to transcript marker.
 
     Args:
+        ctx: Execution context with cwd and background info.
         hook_data: Claude hook payload containing session_id, transcript_path, etc.
         hook_type: Hook type string (unused, kept for API compatibility)
 
@@ -222,33 +273,55 @@ def init_hook_context(
         2. If not found, try transcript marker fallback
         3. If still not found → (None, {}, False) - non-participant
     """
+    import time as _time
     from ..core.db import get_session_binding, get_instance
 
+    start = _time.perf_counter()
     session_id = hook_data.get("session_id", "")
     transcript_path = hook_data.get("transcript_path", "")
 
     # Session binding is the sole gate for hook participation
+    binding_start = _time.perf_counter()
     instance_name = get_session_binding(session_id)
+    binding_ms = (_time.perf_counter() - binding_start) * 1000
+
+    transcript_ms = 0.0
     if not instance_name:
         # Fallback: check transcript for binding marker (handles !hcom start)
+        transcript_start = _time.perf_counter()
         instance_name = _try_bind_from_transcript(session_id, transcript_path)
+        transcript_ms = (_time.perf_counter() - transcript_start) * 1000
         if not instance_name:
+            total_ms = (_time.perf_counter() - start) * 1000
+            log_info("hooks", "init_hook_context.timing",
+                     binding_ms=round(binding_ms, 2),
+                     transcript_ms=round(transcript_ms, 2),
+                     total_ms=round(total_ms, 2),
+                     result="no_instance")
             return None, {}, False
 
+    instance_start = _time.perf_counter()
     instance_data = get_instance(instance_name)
+    instance_ms = (_time.perf_counter() - instance_start) * 1000
 
     updates: dict[str, Any] = {
-        "directory": str(Path.cwd()),
+        "directory": str(ctx.cwd),
     }
 
     if transcript_path:
         updates["transcript_path"] = transcript_path
 
-    bg_env = os.environ.get("HCOM_BACKGROUND")
-    if bg_env:
+    if ctx.is_background and ctx.background_name:
         updates["background"] = True
-        updates["background_log_file"] = str(hcom_path(LOGS_DIR, bg_env))
+        updates["background_log_file"] = str(hcom_path(LOGS_DIR, ctx.background_name))
 
     is_matched_resume = bool(instance_data and instance_data.get("session_id") == session_id)
+
+    total_ms = (_time.perf_counter() - start) * 1000
+    log_info("hooks", "init_hook_context.timing",
+             instance=instance_name, binding_ms=round(binding_ms, 2),
+             transcript_ms=round(transcript_ms, 2),
+             instance_ms=round(instance_ms, 2),
+             total_ms=round(total_ms, 2))
 
     return instance_name, updates, is_matched_resume

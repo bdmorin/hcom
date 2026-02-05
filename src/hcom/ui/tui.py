@@ -3,9 +3,8 @@
 This module contains the HcomTUI class which orchestrates the entire TUI:
 - Main event loop (keyboard input, updates, rendering)
 - Screen switching (Manage ↔ Launch)
-- State management (loading, saving, syncing)
+- State management (loading, saving)
 - Flash notifications
-- Relay server for cross-device sync
 
 Architecture
 ------------
@@ -29,14 +28,15 @@ Terminal Handling
 """
 
 import os
+import select as select_mod
 import shlex
 import shutil
-import socket
+import signal
 import subprocess
 import sys
 import time
 from pathlib import Path
-from typing import List, Optional
+from typing import Optional
 
 # Import types
 from .types import Mode, UIState
@@ -49,6 +49,7 @@ from .rendering import (
     get_message_pulse_colors,
     separator_line,
     suppress_output,
+    bg_ljust,
 )
 from .input import KeyboardInput
 
@@ -68,8 +69,6 @@ from .colors import (
     FG_LIGHTGRAY,
     FG_BLUE,
     BG_ORANGE,
-    BG_CHARCOAL,
-    BG_YELLOW,
     CLEAR_SCREEN,
     CURSOR_HOME,
     HIDE_CURSOR,
@@ -80,12 +79,13 @@ from ..shared import (
     DEFAULT_CONFIG_HEADER,
     STATUS_ORDER,
     STATUS_BG_MAP,
+    STATUS_FG,
     format_timestamp,
     get_status_counts,
     parse_iso_timestamp,
-    resolve_claude_args,
-    resolve_gemini_args,
 )
+from ..tools.claude import resolve_claude_args
+from ..tools.gemini.args import resolve_gemini_args
 from ..tools.codex.args import resolve_codex_args
 from ..core.instances import get_instance_status
 from ..core.paths import hcom_path, ensure_hcom_directories
@@ -155,12 +155,6 @@ class HcomTUI:
         self.last_status_update = 0.0
         self.last_config_check = 0.0
         self.first_render = True
-
-        # Sync subprocess (for cross-device sync when no instances running)
-        self.sync_proc = None
-
-        # Relay notification listener (commands notify TUI to push)
-        self.relay_notify_server = None
 
         # Screen instances (pass state + self)
         self.manage_screen = ManageScreen(self.state, self)
@@ -342,8 +336,9 @@ class HcomTUI:
         sys.stdout.write("\033[?1049h")
         sys.stdout.flush()
 
-        # Initialize relay notification listener
-        self._setup_relay_notify_server()
+        # Install SIGWINCH handler for immediate resize response
+        old_sigwinch = signal.getsignal(signal.SIGWINCH)
+        signal.signal(signal.SIGWINCH, lambda *_: setattr(self.state, "frame_dirty", True))
 
         try:
             with KeyboardInput() as kbd:
@@ -352,11 +347,23 @@ class HcomTUI:
                     if not kbd.has_input():
                         self.update()
                         self.render()
-                        time.sleep(0.01)  # Only sleep when idle
+
+                    # Block until input arrives or timeout for next update cycle
+                    pulse_active = (
+                        self.state.last_message_time > 0
+                        and time.time() - self.state.last_message_time < 5.0
+                    )
+                    timeout = 0.05 if pulse_active else 0.1
+                    try:
+                        ready = select_mod.select([kbd.fd], [], [], timeout)[0]
+                    except (InterruptedError, OSError):
+                        continue  # SIGWINCH or other signal — re-loop
+
+                    if not ready:
+                        continue  # Timeout — loop will call update/render
 
                     key = kbd.get_key()
                     if not key:
-                        time.sleep(0.01)  # Also sleep when no key available
                         continue
 
                     if key == "CTRL_D":
@@ -367,6 +374,11 @@ class HcomTUI:
                         # Save state when switching modes
                         if self.mode == Mode.LAUNCH:
                             self.save_launch_state()
+                        # Cancel tag edit if active
+                        if self.state.manage.tag_edit_target:
+                            self.state.manage.tag_edit_target = None
+                            self.state.manage.message_buffer = self.state.manage.tag_edit_original_buffer
+                            self.state.manage.tag_edit_original_buffer = ""
                         self.handle_tab()
                         self.state.frame_dirty = True
                     else:
@@ -390,16 +402,8 @@ class HcomTUI:
             traceback.print_exc()
             return 1
         finally:
-            # Cleanup relay notification server
-            self._cleanup_relay_notify_server()
-
-            # Cleanup sync subprocess
-            if self.sync_proc:
-                try:
-                    self.sync_proc.terminate()
-                except Exception:
-                    pass
-                self.sync_proc = None
+            # Restore SIGWINCH handler
+            signal.signal(signal.SIGWINCH, old_sigwinch)
 
             # Ensure terminal restored (idempotent)
             sys.stdout.write("\033[?1049l")
@@ -515,59 +519,6 @@ class HcomTUI:
             self.state.relay.enabled = status["enabled"]
             self.state.relay.status = status["status"]
             self.state.relay.error = status["error"]
-        except Exception:
-            pass
-
-    def _setup_relay_notify_server(self):
-        """Initialize TCP listener for relay push notifications from commands."""
-        try:
-            from ..core.db import kv_set
-
-            self.relay_notify_server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            self.relay_notify_server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-            self.relay_notify_server.bind(("127.0.0.1", 0))
-            self.relay_notify_server.listen(16)
-            self.relay_notify_server.setblocking(False)
-            relay_port = self.relay_notify_server.getsockname()[1]
-            kv_set("relay_tui_port", str(relay_port))
-        except Exception:
-            self.relay_notify_server = None
-
-    def _cleanup_relay_notify_server(self):
-        """Clean up relay notification server."""
-        try:
-            from ..core.db import kv_set
-
-            kv_set("relay_tui_port", None)
-        except Exception:
-            pass
-        if self.relay_notify_server:
-            try:
-                self.relay_notify_server.close()
-            except Exception:
-                pass
-            self.relay_notify_server = None
-
-    def _check_relay_notifications(self):
-        """Check for incoming relay push notifications and trigger push."""
-        if not self.relay_notify_server:
-            return
-        try:
-            conn, _ = self.relay_notify_server.accept()
-            conn.close()
-            # Notification received - trigger immediate push
-            self._trigger_relay_push()
-        except BlockingIOError:
-            pass  # No pending connections
-        except Exception:
-            pass
-
-    def _trigger_relay_push(self):
-        """Immediate push in response to notification."""
-        try:
-            from ..relay import push
-
-            push(force=True)
         except Exception:
             pass
 
@@ -920,33 +871,6 @@ class HcomTUI:
         update_interval = 0.1 if pulse_active else 0.5
 
         if now - self.last_status_update >= update_interval:
-            # Check if sync subprocess finished (non-blocking)
-            if self.sync_proc and self.sync_proc.poll() is not None:
-                if self.sync_proc.returncode == 0:
-                    self.state.frame_dirty = True  # New data arrived
-                self.sync_proc = None
-
-            # Check for relay notifications (commands request push)
-            self._check_relay_notifications()
-
-            # Start sync subprocess if not already running (always poll when relay enabled)
-            if self.sync_proc is None:
-                try:
-                    from ..relay import is_relay_enabled
-
-                    if is_relay_enabled():  # Only if relay configured AND enabled
-                        # HCOM_TUI_WORKER=1 tells relay_wait() to actually poll
-                        # (otherwise it would see relay_tui_port and short-circuit)
-                        worker_env = {**os.environ, "HCOM_TUI_WORKER": "1"}
-                        self.sync_proc = subprocess.Popen(
-                            [sys.executable, "-m", "hcom", "relay", "poll", "25"],
-                            stdout=subprocess.DEVNULL,
-                            stderr=subprocess.DEVNULL,
-                            env=worker_env,
-                        )
-                except Exception:
-                    pass  # Ignore sync errors
-
             self.load_status()
             self.last_status_update = now
             self.state.frame_dirty = True
@@ -1066,56 +990,40 @@ class HcomTUI:
             seconds_since_msg = 9999.0  # No messages yet - use quiet state
         log_bg_color, log_fg_color = get_message_pulse_colors(seconds_since_msg)
 
-        # Build status display (colored blocks for unselected, orange for selected)
+        # Build status display (inline foreground-colored counts, no bg blocks)
         is_manage_selected = highlight_tab == "MANAGE"
-        status_parts = []
+        status_parts_selected = []
+        status_parts_inactive = []
 
-        # Use shared status configuration (background colors for statusline blocks)
         for status_type in STATUS_ORDER:
             count = self.state.manage.status_counts.get(status_type, 0)
             if count > 0:
-                color, symbol = STATUS_BG_MAP[status_type]
-                if is_manage_selected:
-                    # Selected: orange bg + black text (v1 style)
-                    part = f"{FG_BLACK}{BOLD}{BG_ORANGE} {count} {symbol} {RESET}"
-                else:
-                    # Unselected: colored blocks (hcom watch style)
-                    text_color = FG_BLACK if color == BG_YELLOW else FG_WHITE
-                    part = f"{text_color}{BOLD}{color} {count} {symbol} {RESET}"
-                status_parts.append(part)
+                _, symbol = STATUS_BG_MAP[status_type]
+                fg_color = STATUS_FG.get(status_type, FG_WHITE)
+                # Selected: bold + semantic color. Inactive: dim semantic color.
+                status_parts_selected.append(f"{BOLD}{fg_color}{count} {symbol}{RESET}")
+                status_parts_inactive.append(f"{DIM}{fg_color}{count} {symbol}{RESET}")
 
-        # No instances - show MANAGE text instead of 0
-        if status_parts:
-            status_display = "".join(status_parts)
-        elif is_manage_selected:
-            status_display = f"{FG_BLACK}{BOLD}{BG_ORANGE} MANAGE {RESET}"
-        else:
-            status_display = f"{BG_CHARCOAL}{FG_WHITE} MANAGE {RESET}"
-
-        # Build tabs: MANAGE, LAUNCH, and EVENTS (EVENTS only shown in native view)
+        # Build tabs: MANAGE, LAUNCH, and EVENTS
         tab_names = ["MANAGE", "LAUNCH", "EVENTS"]
         tabs = []
 
         for tab_name in tab_names:
-            # MANAGE tab shows status counts instead of text
             if tab_name == "MANAGE":
-                label = status_display
+                if is_manage_selected:
+                    manage_label = " ".join(status_parts_selected) if status_parts_selected else f"{FG_ORANGE}{BOLD}MANAGE{RESET}"
+                else:
+                    manage_label = " ".join(status_parts_inactive) if status_parts_inactive else f"{FG_GRAY}MANAGE{RESET}"
+                tabs.append(f" {manage_label}")
+            elif tab_name == highlight_tab:
+                # Selected non-MANAGE tab: orange text, bold
+                tabs.append(f" {FG_ORANGE}{BOLD}{tab_name}{RESET}")
+            elif tab_name == "EVENTS" and seconds_since_msg < 5.0:
+                # EVENTS tab with recent activity: pulse colors (white→dim fade)
+                tabs.append(f"{log_bg_color}{log_fg_color} {tab_name} {RESET}")
             else:
-                label = tab_name
-
-            # Highlight current tab (non-MANAGE tabs get orange bg)
-            if tab_name == highlight_tab and tab_name != "MANAGE":
-                # Selected tab: always orange bg + black fg (EVENTS and LAUNCH same)
-                tabs.append(f"{BG_ORANGE}{FG_BLACK}{BOLD} {label} {RESET}")
-            elif tab_name == "MANAGE":
-                # MANAGE tab is just status blocks (already has color/bg)
-                tabs.append(f" {label}")
-            elif tab_name == "EVENTS":
-                # EVENTS tab when not selected: use pulse colors (white→charcoal fade)
-                tabs.append(f"{log_bg_color}{log_fg_color} {label} {RESET}")
-            else:
-                # LAUNCH when not selected: charcoal bg (milder than black)
-                tabs.append(f"{BG_CHARCOAL}{FG_WHITE} {label} {RESET}")
+                # Inactive tab: dim text, no background
+                tabs.append(f" {FG_GRAY}{tab_name}{RESET}")
 
         tab_display = " ".join(tabs)
 
@@ -1152,6 +1060,9 @@ class HcomTUI:
             return f"{BOLD}{color_code}• {msg}{RESET}"
         return None
 
+    # Layout: left/right margin so content doesn't hug terminal edges
+    MARGIN = 0
+
     def render(self):
         """Render current screen"""
         # Skip rebuild if nothing changed
@@ -1161,24 +1072,27 @@ class HcomTUI:
         cols, rows = get_terminal_size()
         # Adapt to any terminal size
         rows = max(10, rows)
+        # Content width: leave margin on left and right
+        cw = cols - self.MARGIN * 2
+        pad = " " * self.MARGIN
 
         frame = []
 
         # Header (compact - no separator)
         header = self.build_status_bar()
-        frame.append(ansi_ljust(header, cols))
+        frame.append(f"{pad}{ansi_ljust(header, cw)}")
 
         # Flash row with separator line
         flash = self.build_flash()
         if flash:
             # Flash message on left, separator line fills rest of row
             flash_len = ansi_len(flash)
-            remaining = cols - flash_len - 1  # -1 for space
+            remaining = cw - flash_len - 1  # -1 for space
             sep = separator_line(remaining) if remaining > 0 else ""
-            frame.append(f"{flash} {sep}")
+            frame.append(f"{pad}{flash} {sep}")
         else:
             # Just separator line when no flash message
-            frame.append(separator_line(cols))
+            frame.append(f"{pad}{separator_line(cw)}")
 
         # Welcome message on first render
         if self.first_render:
@@ -1189,19 +1103,21 @@ class HcomTUI:
         body_rows = rows - 3
 
         if self.mode == Mode.MANAGE:
-            manage_lines = self.manage_screen.build(body_rows, cols)
+            manage_lines = self.manage_screen.build(body_rows, cw)
             for line in manage_lines:
-                frame.append(ansi_ljust(line, cols))
+                frame.append(f"{pad}{ansi_ljust(line, cw)}")
         elif self.mode == Mode.LAUNCH:
-            form_lines = self.launch_screen.build(body_rows, cols)
+            form_lines = self.launch_screen.build(body_rows, cw)
             for line in form_lines:
-                frame.append(ansi_ljust(line, cols))
+                frame.append(f"{pad}{ansi_ljust(line, cw)}")
 
         # Footer - compact help text
         footer = ""
         if self.mode == Mode.MANAGE:
             # Contextual footer based on state
-            if self.state.manage.message_buffer.strip():
+            if self.state.manage.tag_edit_target:
+                footer = f"{FG_GRAY}enter: save tag  esc: cancel{RESET}"
+            elif self.state.manage.message_buffer.strip():
                 footer = f"{FG_GRAY}tab: switch  @: mention  enter: send  esc: clear{RESET}"
             elif self.state.confirm.pending_stop_all:
                 footer = f"{FG_GRAY}ctrl+k: confirm stop all  esc: cancel{RESET}"
@@ -1216,7 +1132,7 @@ class HcomTUI:
                 )
         elif self.mode == Mode.LAUNCH:
             footer = self.launch_screen.get_footer()
-        frame.append(truncate_ansi(footer, cols))
+        frame.append(f"{pad}{truncate_ansi(footer, cw)}")
 
         # Repaint if changed
         if frame != self.last_frame:
@@ -1240,35 +1156,6 @@ class HcomTUI:
             self.show_events_native()
             # After returning from native view, go to MANAGE
             self.mode = Mode.MANAGE
-
-    def format_multiline_event(
-        self,
-        display_time: str,
-        sender: str,
-        message: str,
-        type_prefix: str = "",
-        sender_padded: str = "",
-    ) -> List[str]:
-        """Format event with multiline support (indented continuation lines)
-        Format: time name: [type] content
-        """
-        display_sender = sender_padded if sender_padded else sender
-
-        if "\n" not in message:
-            return [
-                f"{DIM}{FG_GRAY}{display_time}{RESET} {BOLD}{FG_ORANGE}{display_sender}{RESET}: {type_prefix}{message}"
-            ]
-
-        lines = message.split("\n")
-        result = [
-            f"{DIM}{FG_GRAY}{display_time}{RESET} {BOLD}{FG_ORANGE}{display_sender}{RESET}: {type_prefix}{lines[0]}"
-        ]
-        # Calculate indent: time + sender + ": [message] "
-        # type_prefix is "[message] " (10 chars)
-        type_prefix_len = len(type_prefix)
-        indent = " " * (len(display_time) + len(display_sender) + 2 + type_prefix_len)
-        result.extend(indent + line for line in lines[1:])
-        return result
 
     def render_status_with_separator(self, highlight_tab: str = "EVENTS"):
         """Render separator line and status bar (extracted helper)"""
@@ -1335,104 +1222,21 @@ class HcomTUI:
             return False
 
     def render_event(self, event: dict):
-        """Render event by type with defensive defaults
+        """Render event by type with defensive defaults.
         Format: time name: [type] content
         """
-        event_type = event.get("type", "unknown")
-        timestamp = event.get("timestamp", "")
-        instance = event.get("instance", "?")
-        data = event.get("data", {})
-
-        # Always show type label in brackets
-        type_labels = {"message": "message", "status": "status", "life": "life"}
-        type_label = type_labels.get(event_type, event_type)
-
-        if event_type == "message":
-            # Format: time name [envelope]\ncontent
-            # Envelope: [intent→thread ↩reply_to] or [message] if no envelope
-            sender = data.get("from", "?")
-            message = data.get("text", "")
-            display_time = format_timestamp(timestamp)
-
-            # Build envelope label from intent/thread/reply_to
-            intent = data.get("intent")
-            thread = data.get("thread")
-            reply_to = data.get("reply_to")
-
-            if intent or thread or reply_to:
-                # Intent colors (the main semantic signal)
-                intent_colors = {
-                    "request": FG_ORANGE,
-                    "inform": FG_LIGHTGRAY,
-                    "ack": FG_GREEN,
-                    "error": FG_RED,
-                }
-                intent_color = intent_colors.get(intent, FG_GRAY)
-
-                # Build parts with visual hierarchy:
-                # - Intent: colored and prominent
-                # - Thread: blue (cyan used by status sender)
-                # - Reply_to: dim reference
-                parts = []
-                if intent:
-                    parts.append(f"{intent_color}{intent}{RESET}")
-                if thread:
-                    # Truncate long thread names
-                    t = thread[:12] + ".." if len(thread) > 14 else thread
-                    parts.append(f"{DIM}→ {RESET}{FG_BLUE}{t}{RESET}")
-                if reply_to:
-                    parts.append(f"{DIM}↩ {FG_LIGHTGRAY}{reply_to}{RESET}")
-
-                envelope = f"{DIM}[{RESET}{' '.join(parts)}{DIM}]{RESET}"
-            else:
-                envelope = f"{DIM}[{type_label}]{RESET}"
-
-            print(f"{DIM}{FG_GRAY}{display_time}{RESET} {BOLD}{FG_ORANGE}{sender}{RESET} {envelope}")
-            print(message)
-            print()  # Empty line between events
-
-        elif event_type == "status":
-            # Format: time name: [status] status, context: detail
-            status = data.get("status", "?")
-            context = data.get("context", "")
-            detail = data.get("detail", "")
-            # Add comma before context if present
-            ctx = f", {context}" if context else ""
-            # Add detail after colon if present (truncate long details, preserve filename)
-            if detail:
-                max_detail = 60
-                detail_display = truncate_path(detail, max_detail)
-                ctx += f": {detail_display}"
-            print(
-                f"{DIM}{FG_GRAY}{format_timestamp(timestamp)}{RESET} "
-                f"{BOLD}{FG_CYAN}{instance}{RESET}: {FG_GRAY}[{type_label}]{RESET} {status}{ctx}"
-            )
-            print()  # Empty line between events
-
-        elif event_type == "life":
-            # Format: time name: [life] action
-            action = data.get("action", "?")
-            print(
-                f"{DIM}{FG_GRAY}{format_timestamp(timestamp)}{RESET} "
-                f"{BOLD}{FG_YELLOW}{instance}{RESET}: {FG_GRAY}[{type_label}]{RESET} {action}"
-            )
-            print()  # Empty line between events
-
-        else:
-            # Unknown type - generic fallback
-            print(
-                f"{DIM}{FG_GRAY}{format_timestamp(timestamp)}{RESET} "
-                f"{BOLD}{instance}{RESET}: {FG_GRAY}[{event_type}]{RESET} {data}"
-            )
-            print()  # Empty line between events
+        pad = " " * self.MARGIN
+        for line in self._format_event_lines_inner(event):
+            print(f"{pad}{line}")
 
     def render_event_safe(self, event: dict):
         """Render event with fallback for malformed data"""
+        pad = " " * self.MARGIN
         try:
             self.render_event(event)
         except Exception:
             event_id = event.get("id", "?")
-            print(f"{FG_GRAY}[malformed event {event_id}]{RESET}")
+            print(f"{pad}{FG_GRAY}[malformed event {event_id}]{RESET}")
             print()
 
     def _format_event_lines(self, event: dict) -> list[str]:
@@ -1556,6 +1360,8 @@ class HcomTUI:
 
         Pads all output to full width to avoid flicker (overwrite instead of clear).
         """
+        cw = cols - self.MARGIN * 2
+        pad = " " * self.MARGIN
         text_filter_active = bool(self.state.events.filter.strip())
         type_filter_active = self.state.events.type_filter != "all"
 
@@ -1572,7 +1378,7 @@ class HcomTUI:
 
             # Text query with cursor
             if text_filter_active or type_filter_active:
-                available = cols - 30  # Reserve space for prefix, chip, count
+                available = cw - 30  # Reserve space for prefix, chip, count
                 filter_text = (
                     self.state.events.filter[:available]
                     if len(self.state.events.filter) > available
@@ -1591,18 +1397,18 @@ class HcomTUI:
             # Fill remaining space with separator line (like flash line)
             filter_content = "".join(parts)
             filter_len = ansi_len(filter_content)
-            remaining = cols - filter_len - 1
+            remaining = cw - filter_len - 1
             sep = separator_line(remaining) if remaining > 0 else ""
-            first_line = f"{filter_content} {sep}"
+            first_line = f"{pad}{filter_content} {sep}"
         else:
             flash = self.build_flash()
             if flash:
                 flash_len = ansi_len(flash)
-                remaining = cols - flash_len - 1
+                remaining = cw - flash_len - 1
                 sep = separator_line(remaining) if remaining > 0 else ""
-                first_line = f"{flash} {sep}"
+                first_line = f"{pad}{flash} {sep}"
             else:
-                first_line = separator_line(cols)
+                first_line = f"{pad}{separator_line(cw)}"
 
         # Output first line (already full width from separator or ljust)
         if use_write:
@@ -1637,11 +1443,13 @@ class HcomTUI:
                 view_suffix = f"  {FG_GRAY}←→: type  enter: instances{esc_hint}{RESET}"
         status = self.build_status_bar(highlight_tab="EVENTS") + archive_indicator + view_suffix
         # Pad to full width to overwrite old content without clearing
-        sys.stdout.write(ansi_ljust(truncate_ansi(status, cols), cols))
+        sys.stdout.write(f"{pad}{ansi_ljust(truncate_ansi(status, cw), cw)}")
         sys.stdout.flush()
 
     def _build_events_bottom_lines(self, cols: int, matched: int, total: int) -> list[str]:
         """Build bottom rows as list of strings (for buffered output)."""
+        cw = cols - self.MARGIN * 2
+        pad = " " * self.MARGIN
         text_filter_active = bool(self.state.events.filter.strip())
         type_filter_active = self.state.events.type_filter != "all"
 
@@ -1651,7 +1459,7 @@ class HcomTUI:
             if type_filter_active:
                 parts.append(f"[{self.state.events.type_filter}] ")
             if text_filter_active or type_filter_active:
-                available = cols - 30
+                available = cw - 30
                 filter_text = (
                     self.state.events.filter[:available]
                     if len(self.state.events.filter) > available
@@ -1666,17 +1474,17 @@ class HcomTUI:
                 parts.append(filter_display)
             parts.append(f" [{matched}/{total}]")
             filter_content = "".join(parts)
-            remaining = cols - ansi_len(filter_content) - 1
+            remaining = cw - ansi_len(filter_content) - 1
             sep = separator_line(remaining) if remaining > 0 else ""
-            first_line = f"{filter_content} {sep}"
+            first_line = f"{pad}{filter_content} {sep}"
         else:
             flash = self.build_flash()
             if flash:
-                remaining = cols - ansi_len(flash) - 1
+                remaining = cw - ansi_len(flash) - 1
                 sep = separator_line(remaining) if remaining > 0 else ""
-                first_line = f"{flash} {sep}"
+                first_line = f"{pad}{flash} {sep}"
             else:
-                first_line = separator_line(cols)
+                first_line = f"{pad}{separator_line(cw)}"
 
         # Second row: status bar
         archive_indicator = ""
@@ -1701,7 +1509,7 @@ class HcomTUI:
                 view_suffix = f"  {FG_GRAY}←→: type  enter: instances{esc_hint}{RESET}"
 
         status = self.build_status_bar(highlight_tab="EVENTS") + archive_indicator + view_suffix
-        second_line = ansi_ljust(truncate_ansi(status, cols), cols)
+        second_line = f"{pad}{ansi_ljust(truncate_ansi(status, cw), cw)}"
 
         return [first_line, second_line]
 
@@ -1735,9 +1543,10 @@ class HcomTUI:
             if name not in instances_data:
                 instances_data[name] = {"name": name, "started": None, "stopped": None}
 
-            # 'created' is the first lifecycle event, use it as start time
-            if action == "created":
-                instances_data[name]["started"] = ts
+            # Use 'created' or 'ready' as start time (whichever comes first)
+            if action in ("created", "ready"):
+                if instances_data[name]["started"] is None:
+                    instances_data[name]["started"] = ts
                 instances_data[name]["stopped"] = None  # Reset stopped on new start
             elif action == "stopped":
                 instances_data[name]["stopped"] = ts
@@ -1855,11 +1664,13 @@ class HcomTUI:
 
         Returns (last_pos, cols, matched_count, total_count) for consistency with redraw_all.
         """
+        cw = cols - self.MARGIN * 2
+        pad = " " * self.MARGIN
         archives = self.state.events.archive_list
         total = len(archives)
 
         if not archives:
-            print(f"{FG_GRAY}(no archives found){RESET}")
+            print(f"{pad}{FG_GRAY}(no archives found){RESET}")
             print()
             return 0, cols, 0, 0
 
@@ -1893,7 +1704,7 @@ class HcomTUI:
         scroll_indicator = ""
         if start_idx > 0:
             scroll_indicator = f" {FG_GRAY}↑{start_idx} more{RESET}"
-        print(f"{BOLD}Select Archive:{RESET}{scroll_indicator}")
+        print(f"{pad}{BOLD}Select Archive:{RESET}{scroll_indicator}")
         print()
 
         displayed = 0
@@ -1907,16 +1718,16 @@ class HcomTUI:
             instances = archive.get("instances", "?")
 
             # Truncate name if needed
-            max_name_len = cols - 30
+            max_name_len = cw - 30
             if len(name) > max_name_len:
                 name = name[: max_name_len - 3] + "..."
 
             content = f" {archive['index']:>2}. {name}  {events} events  {instances} instances"
 
             if is_selected:
-                row = f"{BG_ORANGE}{FG_BLACK}{content:<{cols - 1}}{RESET}"
+                row = f"{pad}{BG_ORANGE}{FG_BLACK}{content:<{cw - 1}}{RESET}"
             else:
-                row = f"{FG_GRAY}{content}{RESET}"
+                row = f"{pad}{FG_GRAY}{content}{RESET}"
             print(row)
             displayed += 1
 
@@ -1924,21 +1735,21 @@ class HcomTUI:
         remaining = len(archives) - end_idx
         if remaining > 0:
             limit_note = "  (use 'hcom archive' for full list)" if len(archives) >= 50 else ""
-            print(f"{FG_GRAY}↓{remaining} more{limit_note}{RESET}")
+            print(f"{pad}{FG_GRAY}↓{remaining} more{limit_note}{RESET}")
         elif len(archives) >= 50:
-            print(f"{FG_GRAY}(use 'hcom archive' for full list){RESET}")
+            print(f"{pad}{FG_GRAY}(use 'hcom archive' for full list){RESET}")
         else:
             print()
 
         # Position cursor at bottom for separator + status bar
         sys.stdout.write(f"\033[{rows - 1};1H\033[K")  # Row for separator
-        sys.stdout.write(separator_line(cols) + "\n")
+        sys.stdout.write(f"{pad}{separator_line(cw)}\n")
         sys.stdout.write("\033[K")  # Clear status line
 
         # Render status bar for picker mode
         status = self.build_status_bar(highlight_tab="EVENTS")
         hints = f"  {FG_GRAY}↑↓: select  enter: view  esc: back{RESET}"
-        sys.stdout.write(truncate_ansi(status + hints, cols))
+        sys.stdout.write(f"{pad}{truncate_ansi(status + hints, cw)}")
         sys.stdout.flush()
 
         return 0, cols, displayed, total
@@ -1946,6 +1757,9 @@ class HcomTUI:
     def _render_instances_view(self, cols: int, rows: int = 24) -> tuple[int, int]:
         """Render instances summary view. Returns (displayed_count, total_count)."""
         from ..shared import format_age
+
+        cw = cols - self.MARGIN * 2
+        pad = " " * self.MARGIN
 
         # Use archive or live data source
         if self.state.events.archive_mode:
@@ -1958,9 +1772,9 @@ class HcomTUI:
             self.state.events.instances_list = []
             self.state.events.instances_data = []
             if self.state.events.archive_mode:
-                print(f"{FG_GRAY}(archive empty){RESET}")
+                print(f"{pad}{FG_GRAY}(archive empty){RESET}")
             else:
-                print(f"{FG_GRAY}(none in session){RESET}")
+                print(f"{pad}{FG_GRAY}(none in session){RESET}")
             print()
             return 0, 0
 
@@ -2003,9 +1817,10 @@ class HcomTUI:
         name_width = min(max(max_name, 8), 20)  # 8-20 chars
 
         # Header
-        print(f"{BOLD}{'NAME':<{name_width}}  {'STARTED':<16}  STOPPED{RESET}")
+        header = f"{BOLD}{'NAME':<{name_width}}  {'STARTED':<16}  STOPPED{RESET}"
+        print(f"{pad}{truncate_ansi(header, cw)}")
         if start_idx > 0:
-            print(f"{FG_GRAY}↑{start_idx} more{RESET}")
+            print(f"{pad}{FG_GRAY}↑{start_idx} more{RESET}")
         else:
             print()
 
@@ -2054,15 +1869,18 @@ class HcomTUI:
             # Cursor highlight: orange bg stretches full row width
             if is_selected:
                 row = f"{BG_ORANGE}{FG_BLACK}{content}{RESET}"
+                row = truncate_ansi(row, cw)
+                row = bg_ljust(row, cw, BG_ORANGE)
             else:
                 row = f"{color}{content}{RESET}"
-            print(row)
+                row = truncate_ansi(row, cw)
+            print(f"{pad}{row}")
             displayed += 1
 
         # Show more indicator at bottom
         remaining = len(instances) - end_idx
         if remaining > 0:
-            print(f"{FG_GRAY}↓{remaining} more{RESET}")
+            print(f"{pad}{FG_GRAY}↓{remaining} more{RESET}")
         else:
             print()
 
@@ -2123,6 +1941,7 @@ class HcomTUI:
             # Events view (uses native buffer for scrollback)
             else:
                 # Buffer all output to write atomically (prevents flash)
+                pad = " " * self.MARGIN
                 output_lines = []
 
                 try:
@@ -2140,20 +1959,20 @@ class HcomTUI:
                         # Filter and render all matching events to buffer
                         for event in events:
                             if self.matches_filter_safe(event, self.state.events.filter):
-                                output_lines.extend(self._format_event_lines(event))
+                                output_lines.extend(f"{pad}{line}" for line in self._format_event_lines(event))
                                 matched_count += 1
 
                         # Show message if no matches when filtering
                         if matched_count == 0 and self.state.events.filter.strip():
-                            output_lines.append(f"{FG_GRAY}(no matching events) - Esc to clear | ←→ change type{RESET}")
+                            output_lines.append(f"{pad}{FG_GRAY}(no matching events) - Esc to clear | ←→ change type{RESET}")
                             output_lines.append("")
                     else:
                         # Show appropriate message
                         if self.state.events.archive_mode:
-                            output_lines.append(f"{FG_GRAY}(no events in archive){RESET}")
+                            output_lines.append(f"{pad}{FG_GRAY}(no events in archive){RESET}")
                         output_lines.append("")
                 except Exception as e:
-                    output_lines.append(f"{FG_RED}Failed to load events: {e}{RESET}")
+                    output_lines.append(f"{pad}{FG_RED}Failed to load events: {e}{RESET}")
                     output_lines.append("")
 
                 # Build bottom rows into buffer too (prevents flash between events and status)

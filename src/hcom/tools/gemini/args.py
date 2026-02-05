@@ -41,6 +41,7 @@ from ..args_common import (
     toggle_flag as _toggle_flag,
     set_value_flag as _set_value_flag,
     remove_flag_with_value as _remove_flag_with_value,
+    looks_like_flag as _looks_like_flag_base,
 )
 
 # Type aliases (Gemini-specific)
@@ -719,18 +720,14 @@ def _looks_like_flag(token_lower: str) -> bool:
     They are only meaningful at position 0 and are valid values for flags
     like --model or --prompt (e.g., `gemini --prompt "explain mcp"`).
     """
-    if token_lower in _BOOLEAN_FLAGS:
-        return True
-    if token_lower in _VALUE_FLAGS:
-        return True
-    if token_lower in _OPTIONAL_VALUE_FLAGS:
-        return True
-    # Note: _SUBCOMMANDS intentionally NOT checked - they're valid flag values
-    if token_lower == "--":
-        return True
-    if any(token_lower.startswith(p) for p in _VALUE_FLAG_PREFIXES):
-        return True
-    return False
+    # Note: _SUBCOMMANDS intentionally NOT passed - they're valid flag values
+    return _looks_like_flag_base(
+        token_lower,
+        boolean_flags=_BOOLEAN_FLAGS,
+        value_flags=_VALUE_FLAGS,
+        value_flag_prefixes=_VALUE_FLAG_PREFIXES,
+        optional_value_flags=_OPTIONAL_VALUE_FLAGS,
+    )
 
 
 def _looks_like_session_id(token: str) -> bool:

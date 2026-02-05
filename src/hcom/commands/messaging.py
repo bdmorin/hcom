@@ -84,8 +84,8 @@ def get_recipient_feedback(delivered_to: list[str]) -> str:
     from ..core.instances import get_full_name
 
     if not delivered_to:
-        # No agents will receive, but bigboss (human at TUI) can see all messages
-        return f"Sent to: {SENDER} (no other active agents)"
+        # No agent instances in delivery list (e.g., sent to bigboss only, or broadcast with no active agents)
+        return f"Sent to: {SENDER}"
 
     # Format recipients with status icons
     if len(delivered_to) > 10:
@@ -107,29 +107,42 @@ def get_recipient_feedback(delivered_to: list[str]) -> str:
 
 
 def cmd_send(argv: list[str], quiet: bool = False, *, ctx: CommandContext | None = None) -> int:
-    """Send message to hcom: hcom send "message" [--name NAME] [--from NAME]"""
+    """Send message to hcom: hcom send @target -- message [flags before --]"""
     if not ensure_hcom_directories():
         print(format_error("Failed to create HCOM directories"), file=sys.stderr)
         return 1
 
     init_db()
 
-    # Validate: reject unknown flags (common hallucination: -t, -m, -a, etc.)
-    if error := validate_flags("send", argv):
+    # ==================== Split at -- FIRST ====================
+    # Everything after -- is literal message text (no flag parsing)
+    # All flags must come before --
+    message_parts: list[str] = []
+    has_separator = False
+
+    if "--" in argv:
+        sep_idx = argv.index("--")
+        pre_sep = argv[:sep_idx]
+        message_parts = argv[sep_idx + 1:]
+        has_separator = True
+    else:
+        pre_sep = argv
+
+    # Validate flags in pre_sep only (not message text after --)
+    if error := validate_flags("send", pre_sep):
         print(format_error(error), file=sys.stderr)
         return 1
 
-    # Parse --from flag (external sender identity)
-    # -b is alias for --from bigboss (human override)
+    # ==================== Parse flags from pre_sep ====================
     from ..shared import SenderIdentity
 
-    # Handle -b alias for --from bigboss (parse_flag_bool copies argv internally)
-    has_bigboss, argv = parse_flag_bool(argv, "-b")
+    # -b is alias for --from bigboss (human override)
+    has_bigboss, pre_sep = parse_flag_bool(pre_sep, "-b")
     from_name: str | None = "bigboss" if has_bigboss else None
 
-    # Parse --from (overrides -b if both present)
+    # --from (overrides -b if both present)
     try:
-        from_val, argv = parse_flag_value(argv, "--from")
+        from_val, pre_sep = parse_flag_value(pre_sep, "--from")
         if from_val:
             from_name = from_val
     except CLIError as e:
@@ -144,7 +157,7 @@ def cmd_send(argv: list[str], quiet: bool = False, *, ctx: CommandContext | None
             print(format_error(error), file=sys.stderr)
             return 1
 
-    # Guard: subagents must not spoof external sender identities.
+    # Guard: subagents must not spoof external sender identities
     if from_name:
         actor = ctx.identity if (ctx and ctx.identity) else None
         if actor is None:
@@ -159,7 +172,7 @@ def cmd_send(argv: list[str], quiet: bool = False, *, ctx: CommandContext | None
             )
             return 1
 
-    # Identity (instance-only): CLI supplies ctx (preferred). Direct calls may still pass --name.
+    # --name (instance identity)
     explicit_name = ctx.explicit_name if ctx else None
     if ctx is None:
         from .utils import parse_name_flag
@@ -170,13 +183,10 @@ def cmd_send(argv: list[str], quiet: bool = False, *, ctx: CommandContext | None
             validate_name_input,
         )
 
-        explicit_name, argv = parse_name_flag(argv)
+        explicit_name, pre_sep = parse_name_flag(pre_sep)
 
-        # If --name provided, validate (instance identity)
         if explicit_name:
-            # Skip validation for UUIDs (agent_id format)
             if not _looks_like_uuid(explicit_name):
-                # Validate length and dangerous characters
                 if error := validate_name_input(explicit_name, allow_at=True):
                     print(format_error(error), file=sys.stderr)
                     return 1
@@ -184,12 +194,41 @@ def cmd_send(argv: list[str], quiet: bool = False, *, ctx: CommandContext | None
                     print(format_error(base_name_error(explicit_name)), file=sys.stderr)
                     return 1
 
-    # Extract envelope flags (optional structured messaging)
+    # --stdin flag
+    use_stdin, pre_sep = parse_flag_bool(pre_sep, "--stdin")
+
+    # --file <path>
+    try:
+        file_path, pre_sep = parse_flag_value(pre_sep, "--file")
+    except CLIError:
+        print(format_error("--file requires a file path"), file=sys.stderr)
+        return 1
+
+    # --base64 <encoded>
+    try:
+        base64_val, pre_sep = parse_flag_value(pre_sep, "--base64")
+    except CLIError:
+        print(format_error("--base64 requires a base64-encoded string"), file=sys.stderr)
+        return 1
+
+    # Mutual exclusivity: only one message source allowed
+    source_count = sum(bool(x) for x in [use_stdin, file_path, base64_val, has_separator])
+    if source_count > 1:
+        print(format_error("Only one of --, --stdin, --file, --base64 can be used"), file=sys.stderr)
+        return 1
+
+    # Envelope flags
     envelope: MessageEnvelope = {}
 
-    # --intent {request|inform|ack|error}
+    def _read_stdin() -> str:
+        try:
+            return sys.stdin.read()
+        except OSError:
+            return ""
+
+    # --intent {request|inform|ack}
     try:
-        intent_val, argv = parse_flag_value(argv, "--intent")
+        intent_val, pre_sep = parse_flag_value(pre_sep, "--intent")
         if intent_val:
             from ..core.helpers import validate_intent
 
@@ -199,15 +238,14 @@ def cmd_send(argv: list[str], quiet: bool = False, *, ctx: CommandContext | None
             except ValueError as e:
                 print(format_error(str(e)), file=sys.stderr)
                 return 1
-            # Cast is safe - validate_intent() ensures it's a valid MessageIntent
             envelope["intent"] = intent_val  # type: ignore[typeddict-item]
     except CLIError:
-        print(format_error("--intent requires a value (request|inform|ack|error)"), file=sys.stderr)
+        print(format_error("--intent requires a value (request|inform|ack)"), file=sys.stderr)
         return 1
 
     # --reply-to <id> or <id:DEVICE>
     try:
-        reply_to_val, argv = parse_flag_value(argv, "--reply-to")
+        reply_to_val, pre_sep = parse_flag_value(pre_sep, "--reply-to")
         if reply_to_val:
             envelope["reply_to"] = reply_to_val
     except CLIError:
@@ -216,9 +254,8 @@ def cmd_send(argv: list[str], quiet: bool = False, *, ctx: CommandContext | None
 
     # --thread <name>
     try:
-        thread_val, argv = parse_flag_value(argv, "--thread")
+        thread_val, pre_sep = parse_flag_value(pre_sep, "--thread")
         if thread_val:
-            # Validate thread name
             if len(thread_val) > 64:
                 print(format_error(f"Thread name too long ({len(thread_val)} chars, max 64)"), file=sys.stderr)
                 return 1
@@ -235,7 +272,7 @@ def cmd_send(argv: list[str], quiet: bool = False, *, ctx: CommandContext | None
 
     bundle_data = None
     try:
-        inline_bundle, argv = parse_inline_bundle_flags(argv)
+        inline_bundle, pre_sep = parse_inline_bundle_flags(pre_sep)
     except ValueError as e:
         print(format_error(str(e)), file=sys.stderr)
         return 1
@@ -245,7 +282,7 @@ def cmd_send(argv: list[str], quiet: bool = False, *, ctx: CommandContext | None
 
     # Validation: ack requires reply_to
     if envelope.get("intent") == "ack" and "reply_to" not in envelope:
-        print(format_error("Intent 'ack' requires --reply-to"), file=sys.stderr)
+        print(format_error("Intent 'ack' requires --reply-to <id (e.g. 42 or 42:BOXE)>"), file=sys.stderr)
         return 1
 
     # Validate reply_to exists and inherit thread if not explicit
@@ -256,53 +293,201 @@ def cmd_send(argv: list[str], quiet: bool = False, *, ctx: CommandContext | None
         if error:
             print(format_error(f"Invalid --reply-to: {error}"), file=sys.stderr)
             return 1
-        # Thread inheritance: if reply_to without explicit thread, inherit from parent
         if "thread" not in envelope and local_id:
             parent_thread = get_thread_from_event(local_id)
             if parent_thread:
                 envelope["thread"] = parent_thread
 
-    # Resolve message from args or stdin
-    use_stdin, argv = parse_flag_bool(argv, "--stdin")
-
-    def _read_stdin() -> str:
-        try:
-            return sys.stdin.read()
-        except OSError:
-            return ""
-
+    # Resolve message based on syntax used
+    explicit_targets: list[str] = []
     message: str | None = None
-    if use_stdin:
-        if argv:
-            print(
-                format_error("--stdin cannot be combined with message arguments"),
-                file=sys.stderr,
-            )
+
+    if has_separator:
+        # Has -- separator: extract @targets from pre_sep, message is everything after --
+        for arg in pre_sep:
+            if arg.startswith("@"):
+                target = arg[1:]  # Strip @ prefix
+                if not target:
+                    print(format_error("Empty target '@' is not allowed"), file=sys.stderr)
+                    return 1
+                explicit_targets.append(target)
+            else:
+                # Non-@ arg before -- that isn't a flag
+                print(
+                    format_error(
+                        f"Unexpected argument before --: '{arg}'\n"
+                        "Put flags first, then @targets, then -- message.\n"
+                        "Example: hcom send --intent request @luna -- hello"
+                    ),
+                    file=sys.stderr,
+                )
+                return 1
+
+        if message_parts:
+            message = " ".join(message_parts)
+        else:
+            # -- with nothing after = error
+            print(format_error("No message after --"), file=sys.stderr)
             return 1
+
+    elif use_stdin:
+        # Explicit --stdin flag - extract @targets from pre_sep
+        for arg in pre_sep:
+            if arg.startswith("@"):
+                target = arg[1:]
+                if not target:
+                    print(format_error("Empty target '@' is not allowed"), file=sys.stderr)
+                    return 1
+                explicit_targets.append(target)
+            else:
+                print(
+                    format_error("--stdin cannot be combined with message arguments"),
+                    file=sys.stderr,
+                )
+                return 1
         message = _read_stdin()
         if not message:
             print(format_error("No input received on stdin"), file=sys.stderr)
             return 1
-    elif not argv and not sys.stdin.isatty():
-        message = _read_stdin()
-        if not message:
-            print(format_error("No input received on stdin"), file=sys.stderr)
+
+    elif file_path:
+        # --file <path> - extract @targets from pre_sep, read message from file
+        for arg in pre_sep:
+            if arg.startswith("@"):
+                target = arg[1:]
+                if not target:
+                    print(format_error("Empty target '@' is not allowed"), file=sys.stderr)
+                    return 1
+                explicit_targets.append(target)
+            else:
+                print(
+                    format_error("--file cannot be combined with message arguments"),
+                    file=sys.stderr,
+                )
+                return 1
+        from pathlib import Path
+        from ..core.thread_context import get_cwd
+
+        resolved = Path(file_path) if Path(file_path).is_absolute() else get_cwd() / file_path
+        try:
+            with open(resolved) as f:
+                message = f.read()
+        except FileNotFoundError:
+            print(format_error(f"File not found: {file_path}"), file=sys.stderr)
             return 1
-    elif len(argv) > 1:
-        print(
-            format_error("Message must be a single argument or piped via stdin"),
-            file=sys.stderr,
-        )
-        return 1
+        except OSError as e:
+            print(format_error(f"Cannot read file: {e}"), file=sys.stderr)
+            return 1
+        if not message:
+            print(format_error(f"File is empty: {file_path}"), file=sys.stderr)
+            return 1
+
+    elif base64_val:
+        # --base64 <encoded> - extract @targets from pre_sep, decode message
+        import base64 as b64
+
+        for arg in pre_sep:
+            if arg.startswith("@"):
+                target = arg[1:]
+                if not target:
+                    print(format_error("Empty target '@' is not allowed"), file=sys.stderr)
+                    return 1
+                explicit_targets.append(target)
+            else:
+                print(
+                    format_error("--base64 cannot be combined with message arguments"),
+                    file=sys.stderr,
+                )
+                return 1
+        try:
+            message = b64.b64decode(base64_val).decode("utf-8")
+        except Exception:
+            print(format_error("Invalid base64 encoding"), file=sys.stderr)
+            return 1
+        if not message:
+            print(format_error("Base64 decoded to empty string"), file=sys.stderr)
+            return 1
+
+    elif not pre_sep:
+        # No args at all - check if stdin is a pipe
+        from ..core.thread_context import get_stdin_is_tty
+
+        stdin_tty = get_stdin_is_tty()
+        is_pipe = not stdin_tty if stdin_tty is not None else not sys.stdin.isatty()
+
+        if is_pipe:
+            message = _read_stdin()
+            if not message:
+                print(format_error("No input received on stdin"), file=sys.stderr)
+                return 1
+
     else:
-        message = unescape_bash(argv[0]) if argv else None
+        # Has args but no -- separator
+        # Check for backward compat: "@name message" as single quoted arg
+        # If single arg starts with @ AND contains whitespace, it's the old format
+        if len(pre_sep) == 1 and pre_sep[0].startswith("@") and " " in pre_sep[0]:
+            # Old format: "@name message" - treat entire arg as message with embedded @mention
+            message = unescape_bash(pre_sep[0])
+        else:
+            # New format: extract @targets, then check for message
+            remaining = []
+            for arg in pre_sep:
+                if arg.startswith("@"):
+                    target = arg[1:]
+                    if not target:
+                        print(format_error("Empty target '@' is not allowed"), file=sys.stderr)
+                        return 1
+                    explicit_targets.append(target)
+                else:
+                    remaining.append(arg)
+
+            if remaining:
+                if len(remaining) > 1:
+                    # Multiple non-@ args without -- separator
+                    print(
+                        format_error(
+                            "Use -- separator for multi-word messages: "
+                            "hcom send @target -- message text here"
+                        ),
+                        file=sys.stderr,
+                    )
+                    return 1
+                message = unescape_bash(remaining[0])
+            else:
+                # Only @targets, no message - read from stdin
+                from ..core.thread_context import get_stdin_is_tty
+
+                stdin_tty = get_stdin_is_tty()
+                is_pipe = not stdin_tty if stdin_tty is not None else not sys.stdin.isatty()
+
+                if is_pipe:
+                    message = _read_stdin()
+                    if not message:
+                        print(format_error("No input received on stdin"), file=sys.stderr)
+                        return 1
 
     # Check message provided
     if not message:
-        from .utils import get_command_help
-
-        print(format_error("No message provided") + "\n", file=sys.stderr)
-        print(get_command_help("send"), file=sys.stderr)
+        if explicit_targets:
+            # Has @targets but no message - give pipe hint
+            targets_str = " ".join(f"@{t}" for t in explicit_targets[:3])
+            print(
+                format_error(
+                    f"No message provided.\n"
+                    f"Use: hcom send {targets_str} -- your message\n"
+                    f" Or: echo 'msg' | hcom send {targets_str}"
+                ),
+                file=sys.stderr,
+            )
+        else:
+            print(
+                format_error(
+                    "No message provided.\n"
+                    "Use: hcom send @target -- your message\n"
+                    " Or: echo 'msg' | hcom send @target"
+                ),
+                file=sys.stderr,
+            )
         return 1
 
     # Only validate and send if message is provided
@@ -328,9 +513,9 @@ def cmd_send(argv: list[str], quiet: bool = False, *, ctx: CommandContext | None
             identity = resolve_identity()
 
         # Guard: Block sends from vanilla Claude before opt-in
-        import os
+        from ..core.thread_context import get_is_claude
 
-        if identity.kind == "instance" and not identity.instance_data and os.environ.get("CLAUDECODE") == "1":
+        if identity.kind == "instance" and not identity.instance_data and get_is_claude():
             print(format_error("Cannot send without identity."), file=sys.stderr)
             print("Run 'hcom start' first, then use 'hcom send'.", file=sys.stderr)
             return 1
@@ -342,9 +527,9 @@ def cmd_send(argv: list[str], quiet: bool = False, *, ctx: CommandContext | None
 
         # Pull remote state to ensure delivered_to includes cross-device instances
         try:
-            from ..relay import is_relay_handled_by_tui, pull
+            from ..relay import is_relay_handled_by_daemon, pull
 
-            if not is_relay_handled_by_tui():
+            if not is_relay_handled_by_daemon():
                 pull()  # relay.py logs errors internally
         except Exception:
             pass  # Best-effort - local send still works
@@ -366,6 +551,13 @@ def cmd_send(argv: list[str], quiet: bool = False, *, ctx: CommandContext | None
             bundle_instance = get_bundle_instance_name(identity)
 
             bundle_id = create_bundle_event(bundle_data, instance=bundle_instance, created_by=identity.name)
+            try:
+                from ..relay import notify_relay, push
+
+                if not notify_relay():
+                    push()
+            except Exception:
+                pass
             envelope["bundle_id"] = bundle_id
             # Append bundle payload to message text
             refs = bundle_data.get("refs", {})
@@ -419,8 +611,16 @@ def cmd_send(argv: list[str], quiet: bool = False, *, ctx: CommandContext | None
                 return 1
 
         # Send message and get delivered_to list
+        # When -- separator was used, pass explicit_targets (even if empty = broadcast)
+        # When old format, pass None to fall back to @mention parsing in message
+        targets_to_pass = explicit_targets if has_separator else (explicit_targets if explicit_targets else None)
         try:
-            delivered_to = send_message(identity, message, envelope if envelope else None)
+            delivered_to = send_message(
+                identity,
+                message,
+                envelope if envelope else None,
+                targets_to_pass,
+            )
         except HcomError as e:
             print(f"Error: {e}", file=sys.stderr)
             return 1
@@ -474,6 +674,12 @@ def cmd_send(argv: list[str], quiet: bool = False, *, ctx: CommandContext | None
         else:
             # External sender - just show feedback
             print(recipient_feedback)
+
+        # Show intent tip on first use (per intent type)
+        if envelope.get("intent") and identity.kind == "instance":
+            from ..core.tips import maybe_show_tip
+
+            maybe_show_tip(identity.name, f"send:intent:{envelope['intent']}")
 
     # For adhoc instances (--name with instance), append unread messages
     # This delivers pending messages to external tools using hcom send --name <name>
